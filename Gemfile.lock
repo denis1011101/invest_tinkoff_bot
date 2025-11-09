@@ -1,0 +1,114 @@
+PATH
+  remote: /home/denis/my/invest_tinkoff
+  specs:
+    invest_tinkoff_grpc (0.9.6.7)
+      google-protobuf (~> 4.31, >= 4.31.1)
+      grpc (~> 1.74, >= 1.74.1)
+      httparty (~> 0.23.1)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    bigdecimal (3.3.1)
+    csv (3.3.5)
+    diff-lcs (1.6.2)
+    dotenv (3.1.8)
+    google-protobuf (4.33.0)
+      bigdecimal
+      rake (>= 13)
+    google-protobuf (4.33.0-aarch64-linux-gnu)
+      bigdecimal
+      rake (>= 13)
+    google-protobuf (4.33.0-aarch64-linux-musl)
+      bigdecimal
+      rake (>= 13)
+    google-protobuf (4.33.0-arm64-darwin)
+      bigdecimal
+      rake (>= 13)
+    google-protobuf (4.33.0-x86-linux-gnu)
+      bigdecimal
+      rake (>= 13)
+    google-protobuf (4.33.0-x86-linux-musl)
+      bigdecimal
+      rake (>= 13)
+    google-protobuf (4.33.0-x86_64-darwin)
+      bigdecimal
+      rake (>= 13)
+    google-protobuf (4.33.0-x86_64-linux-gnu)
+      bigdecimal
+      rake (>= 13)
+    google-protobuf (4.33.0-x86_64-linux-musl)
+      bigdecimal
+      rake (>= 13)
+    googleapis-common-protos-types (1.22.0)
+      google-protobuf (~> 4.26)
+    grpc (1.76.0)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.76.0-aarch64-linux-gnu)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.76.0-aarch64-linux-musl)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.76.0-arm64-darwin)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.76.0-x86-linux-gnu)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.76.0-x86-linux-musl)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.76.0-x86_64-darwin)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.76.0-x86_64-linux-gnu)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.76.0-x86_64-linux-musl)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    httparty (0.23.2)
+      csv
+      mini_mime (>= 1.0.0)
+      multi_xml (>= 0.5.2)
+    mini_mime (1.1.5)
+    multi_xml (0.7.2)
+      bigdecimal (~> 3.1)
+    rake (13.3.1)
+    rspec (3.13.2)
+      rspec-core (~> 3.13.0)
+      rspec-expectations (~> 3.13.0)
+      rspec-mocks (~> 3.13.0)
+    rspec-core (3.13.6)
+      rspec-support (~> 3.13.0)
+    rspec-expectations (3.13.5)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.13.0)
+    rspec-mocks (3.13.6)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.13.0)
+    rspec-support (3.13.6)
+
+PLATFORMS
+  aarch64-linux-gnu
+  aarch64-linux-musl
+  arm64-darwin
+  ruby
+  x86-linux-gnu
+  x86-linux-musl
+  x86_64-darwin
+  x86_64-linux-gnu
+  x86_64-linux-musl
+
+DEPENDENCIES
+  dotenv (~> 3.0)
+  invest_tinkoff_grpc!
+  rspec (~> 3.0)
+
+RUBY VERSION
+   ruby 3.4.6p54
+
+BUNDLED WITH
+   2.7.2
