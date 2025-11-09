@@ -77,9 +77,13 @@ begin
     }.find(&:itself)
   end
 
+  puts "DEBUG: index_figi=#{index_figi.inspect}"
+
   trend = logic.trend(index_figi)
+  puts "DEBUG: trend=#{trend.inspect}"
 
   universe = logic.build_universe
+  puts "DEBUG: universe=#{universe.map { |u| { ticker: u[:ticker], price: u[:price], lot: u[:lot], price_per_lot: u[:price_per_lot] } }.inspect}"
   if universe.empty?
     puts 'no instruments under 1000 RUB per lot'
     exit 0
@@ -123,6 +127,9 @@ begin
   when :up
     puts 'Trend: UP — intraday dip BUY (max once per ticker per day)'
     universe.each do |it|
+      cur = logic.last_price_for(it[:figi])
+      today_high = logic.today_high(it[:figi]) rescue nil
+      puts "DEBUG: #{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} dip_threshold=#{(today_high ? (today_high * (1.0 - DIP_PCT)) : nil).inspect} should_buy=#{logic.should_buy?(it)}"
       next if acted_today?(state, 'last_buy', it[:ticker])
       next unless logic.should_buy?(it)
 
