@@ -120,7 +120,19 @@ module TradingLogic
     def confirm_and_place_order(account_id:, figi:, quantity:, price:, direction:, order_type:)
       side = (direction == ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY) ? 'BUY' : 'SELL'
       prompt = "*Confirm #{side}*\nfigi: #{figi}\nqty: #{quantity}\nprice: #{price}\naccount: #{account_id}"
-      return nil unless @telegram.confirm?(prompt, timeout: 120)
+
+      # Если переменная окружения AUTO_CONFIRM установлена в "1" или "true",
+      # пропускаем подтверждение и сразу размещаем ордер.
+      if ENV['AUTO_CONFIRM'] == '1' || ENV['AUTO_CONFIRM'] == 'true'
+        confirmed = true
+      elsif @telegram && @telegram.respond_to?(:confirm?)
+        confirmed = @telegram.confirm?(prompt, timeout: 120)
+      else
+        # Если нет Telegram-клиента, и AUTO_CONFIRM не включён — считаем как не подтверждённое.
+        confirmed = false
+      end
+
+      return nil unless confirmed
 
       @client.grpc_orders.post_order(
         account_id: account_id,
