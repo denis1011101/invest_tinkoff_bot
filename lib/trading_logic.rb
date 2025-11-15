@@ -3,6 +3,7 @@ require 'time'
 require 'net/http'
 require 'json'
 require_relative 'telegram_confirm'
+require_relative 'market_cache'
 
 module TradingLogic
   class Runner
@@ -15,6 +16,15 @@ module TradingLogic
       @max_lot = max_lot_rub
       @dip_pct = dip_pct
       @telegram = TelegramConfirm.new(bot_token: telegram_bot_token, chat_id: telegram_chat_id)
+      @market_cache = MarketCache.new(@client)
+    end
+
+    def refresh_market_cache(force: false)
+      @market_cache.refresh_market_cache(force: force)
+    end
+
+    def load_market_cache
+      @market_cache.load_market_cache
     end
 
     def q_to_decimal(q)
