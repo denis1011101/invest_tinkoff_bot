@@ -4,16 +4,19 @@ require 'net/http'
 require 'json'
 require_relative 'telegram_confirm'
 require_relative 'market_cache'
+require_relative 'strategy_helpers'
+require_relative 'utils'
 
 module TradingLogic
   class Runner
     DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
     MIN_5 = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_5_MIN
 
-    def initialize(client, tickers:, max_lot_rub: 1_000.0, dip_pct: 0.01, telegram_bot_token: nil, telegram_chat_id: nil)
+    def initialize(client, tickers:, max_lot_rub: 500.0, max_lot_count: 1, dip_pct: 0.01, telegram_bot_token: nil, telegram_chat_id: nil)
       @client = client
       @tickers = tickers
       @max_lot = max_lot_rub
+      @max_lot_count = max_lot_count
       @dip_pct = dip_pct
       @telegram = TelegramConfirm.new(bot_token: telegram_bot_token, chat_id: telegram_chat_id)
       @market_cache = MarketCache.new(@client)
@@ -27,52 +30,36 @@ module TradingLogic
       @market_cache.load_market_cache
     end
 
-    def q_to_decimal(q)
-      return nil unless q
-      q.units.to_i + q.nano.to_i / 1_000_000_000.0
-    end
-
-    def now_utc
-      Time.now.utc
-    end
-
-    def today_utc_start
-      t = now_utc
-      Time.utc(t.year, t.month, t.day)
-    end
-
-    def days_ago(n)
-      Time.at(now_utc.to_i - n * 86_400).utc
-    end
-
     def figi_and_lot(ticker, class_code: 'TQBR')
-      resp = @client.grpc_instruments.share_by_ticker(ticker: ticker, class_code: class_code)
-      [resp.instrument.figi, resp.instrument.lot]
-    rescue InvestTinkoff::GRPC::Error
-      resp = @client.grpc_instruments.share_by_ticker(ticker: ticker)
+      resp = Utils.safe_share_by_ticker(@client, ticker, class_code: class_code)
+      return [nil, nil] unless resp && resp.instrument
+
       [resp.instrument.figi, resp.instrument.lot]
     end
 
     def last_price_for(figi)
       lp = @client.grpc_market_data.last_prices(figis: [figi])
       return nil if lp.last_prices.empty?
-      q_to_decimal(lp.last_prices.first.price)
+
+      Utils.q_to_decimal(lp.last_prices.first.price)
     end
 
     def prev_close_for(figi)
-      resp = @client.grpc_market_data.candles(figi: figi, from: days_ago(3), to: now_utc, interval: DAY)
-      candles = resp.candles
-      return nil if candles.size < 2
-      q_to_decimal(candles[-2].close)
+      resp = Utils.fetch_candles(@client, figi: figi, from: Utils.days_ago(3), to: Utils.now_utc, interval: DAY)
+      candles = resp && resp.candles
+      return nil unless candles && candles.size >= 2
+
+      Utils.q_to_decimal(candles[-2].close)
     end
 
     # Сегодняшний intraday максимум по 5-мин свечам
     def today_high(figi)
-      from = today_utc_start
-      resp = @client.grpc_market_data.candles(figi: figi, from: from, to: now_utc, interval: MIN_5)
-      highs = resp.candles.map { |c| q_to_decimal(c.high) }.compact
-      return nil if highs.empty?
-      highs.max
+      from = Utils.today_utc_start
+      resp = Utils.fetch_candles(@client, figi: figi, from: from, to: Utils.now_utc, interval: MIN_5)
+      highs = resp && resp.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.high) }.compact : []
+       return nil if highs.empty?
+
+       highs.max
     end
 
     # Покупать только на «дневной просадке»: текущая цена <= (сегодняшний максимум * (1 - @dip_pct))
@@ -80,6 +67,7 @@ module TradingLogic
       cur = last_price_for(figi)
       th = today_high(figi)
       return false unless cur && th
+
       cur <= th * (1.0 - @dip_pct)
     end
 
@@ -87,13 +75,16 @@ module TradingLogic
     # Возвращает :up, :down или :side
     def trend(index_figi)
       return :side unless index_figi
-      resp = @client.grpc_market_data.candles(figi: index_figi, from: days_ago(6), to: now_utc, interval: DAY)
-      closes = resp.candles.map { |c| q_to_decimal(c.close) }.compact
+
+      resp = Utils.fetch_candles(@client, figi: index_figi, from: Utils.days_ago(6), to: Utils.now_utc, interval: DAY)
+      closes = resp && resp.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.close) }.compact : []
       return :side if closes.size < 4
+
       # последние 4 закрытия => последние 3 изменения
       a, b, c, d = closes[-4], closes[-3], closes[-2], closes[-1]
       return :up   if a < b && b < c && c < d
       return :down if a > b && b > c && c > d
+
       :side
     end
 
@@ -101,9 +92,15 @@ module TradingLogic
       @tickers.map do |t|
         begin
           figi, lot = figi_and_lot(t)
+          # skip if API lot count exceeds configured max_lot_count
+          if @max_lot_count && lot.to_i > @max_lot_count.to_i
+            warn "build_universe: skipping #{t} — lot=#{lot} > max_lot_count=#{@max_lot_count}"
+            next
+          end
           price = last_price_for(figi)
           next unless price && lot
-          h = { ticker: t, figi: figi, lot: lot, price: price, price_per_lot: price * lot }
+
+          h = { ticker: t, figi: figi, lot: lot.to_i, price: price, price_per_lot: price * lot.to_i }
           # фильтр по цене лота, если нужен
           @max_lot ? (h if h[:price_per_lot] <= @max_lot) : h
         rescue InvestTinkoff::GRPC::Error
@@ -121,9 +118,11 @@ module TradingLogic
     def should_sell?(position, it)
       qty_units = position.quantity.units.to_i
       return false if qty_units <= 0
-      avg = q_to_decimal(position.average_position_price)
+
+      avg = Utils.q_to_decimal(position.average_position_price)
       cur = last_price_for(it[:figi])
       return false unless avg && cur
+
       cur >= (avg * 1.10)
     end
 
@@ -157,9 +156,10 @@ module TradingLogic
 
     # Мультипликатор профита (текущая / средняя). nil если не вычислить.
     def profit_multiple(position, figi)
-      avg = q_to_decimal(position.average_position_price)
+      avg = Utils.q_to_decimal(position.average_position_price)
       cur = last_price_for(figi)
       return nil unless avg && cur && avg > 0
+
       cur / avg
     end
 

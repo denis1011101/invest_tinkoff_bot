@@ -6,13 +6,16 @@ require 'securerandom'
 require 'time'
 require 'json'
 require 'fileutils'
+require_relative '../lib/strategy_helpers'
+include TradingLogic::StrategyHelpers
 
 token = ENV['TINKOFF_TOKEN'] || abort('Set TINKOFF_TOKEN')
 client = InvestTinkoff::V2::Client.new(token: token, sandbox: false)
 
 # параметры стратегии
 TICKERS = %w[SBER ROSN VTBR]
-MAX_LOT_RUB = 1_000.0
+MAX_LOT_RUB = 500.0
+MAX_LOT_COUNT = 1
 DIP_PCT = 0.01
 DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
 
@@ -20,6 +23,7 @@ logic = TradingLogic::Runner.new(
   client,
   tickers: TICKERS,
   max_lot_rub: MAX_LOT_RUB,
+  max_lot_count: MAX_LOT_COUNT,
   dip_pct: DIP_PCT,
   telegram_bot_token: ENV['TELEGRAM_BOT_TOKEN'],
   telegram_chat_id: ENV['TELEGRAM_CHAT_ID']
@@ -28,32 +32,8 @@ logic = TradingLogic::Runner.new(
 STATE_PATH = File.expand_path('../tmp/strategy_state.json', __dir__)
 FileUtils.mkdir_p(File.dirname(STATE_PATH))
 
-def load_state
-  return { 'last_buy' => {}, 'last_sell' => {} } unless File.exist?(STATE_PATH)
-  JSON.parse(File.read(STATE_PATH))
-rescue
-  { 'last_buy' => {}, 'last_sell' => {} }
-end
-
-def save_state(state)
-  File.write(STATE_PATH, JSON.pretty_generate(state))
-end
-
-def today_key
-  Time.now.utc.strftime('%Y-%m-%d')
-end
-
-def acted_today?(state, action, ticker)
-  day = today_key
-  ((state[action] || {})[day] || {})[ticker] == true
-end
-
-def mark_action!(state, action, ticker)
-  day = today_key
-  state[action] ||= {}
-  state[action][day] ||= {}
-  state[action][day][ticker] = true
-end
+MARKET_CACHE_PATH = File.expand_path('../tmp/market_instruments_cache.json', __dir__)
+MOEX_INDEX_CACHE_PATH = File.expand_path('../tmp/moex_index_cache.json', __dir__)
 
 begin
   accounts = client.grpc_users.accounts
@@ -79,17 +59,24 @@ begin
 
   puts "DEBUG: index_figi=#{index_figi.inspect}"
 
+  # numeric current index value
+  index_value = index_figi ? logic.last_price_for(index_figi) : nil
+  puts "DEBUG: index_value=#{index_value.inspect}"
+
   trend = logic.trend(index_figi)
   puts "DEBUG: trend=#{trend.inspect}"
 
   universe = logic.build_universe
-  puts "DEBUG: universe=#{universe.map { |u| { ticker: u[:ticker], price: u[:price], lot: u[:lot], price_per_lot: u[:price_per_lot] } }.inspect}"
+  puts "DEBUG: universe (count=#{universe.size}):"
+  universe.each do |u|
+    puts format("  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f", (u[:ticker] || ''), (u[:price] || 0.0), (u[:lot] || 0), (u[:price_per_lot] || 0.0))
+  end
   if universe.empty?
     puts 'no instruments under 1000 RUB per lot'
     exit 0
   end
 
-  state = load_state
+  state = load_state(STATE_PATH)
 
   # Принудительная продажа всех лотов при профите >= +30% (до основной логики)
   begin
@@ -178,12 +165,35 @@ begin
         puts "SELL #{it[:ticker]} skipped / not confirmed"
       end
     end
+    # доп. проход по позициям, чтобы учесть бумаги вне исходного TICKERS
+    try_sell_positions_with_logic!(client, logic, account_id, state)
+    # попытка одной покупки по сигналу "3 дневных закрытия вверх" из пересечения IMOEX∩market
+    puts 'DOWN: try momentum(3D up) BUY one per day from IMOEX∩market'
+    bought = TradingLogic::StrategyHelpers.buy_one_momentum_from_intersection!(
+      client, logic, state,
+      market_cache_path: MARKET_CACHE_PATH,
+      moex_index_cache_path: MOEX_INDEX_CACHE_PATH,
+      max_lot_rub: MAX_LOT_RUB,
+      account_id: account_id
+    )
+     puts 'DOWN: no momentum candidates' unless bought
 
   else
-    puts 'Trend: SIDE — do nothing'
+    puts 'Trend: SIDE — SELL by same rules, and try momentum(3D up) BUY one per day'
+    try_sell_positions_with_logic!(client, logic, account_id, state)
+    bought = TradingLogic::StrategyHelpers.buy_one_momentum_from_intersection!(
+      client, logic, state,
+      market_cache_path: MARKET_CACHE_PATH,
+      moex_index_cache_path: MOEX_INDEX_CACHE_PATH,
+      max_lot_rub: MAX_LOT_RUB,
+      account_id: account_id
+    )
+     puts 'SIDE: no momentum candidates' unless bought
   end
 
-  save_state(state)
+  save_state(STATE_PATH, state)
+
+  puts ''
 rescue InvestTinkoff::GRPC::Error => e
   puts "gRPC error: #{e.class} #{e.message}"
 end
