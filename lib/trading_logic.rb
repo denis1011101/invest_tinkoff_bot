@@ -57,9 +57,9 @@ module TradingLogic
       from = Utils.today_utc_start
       resp = Utils.fetch_candles(@client, figi: figi, from: from, to: Utils.now_utc, interval: MIN_5)
       highs = resp && resp.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.high) }.compact : []
-       return nil if highs.empty?
+      return nil if highs.empty?
 
-       highs.max
+      highs.max
     end
 
     # Покупать только на «дневной просадке»: текущая цена <= (сегодняшний максимум * (1 - @dip_pct))
@@ -163,10 +163,10 @@ module TradingLogic
       cur / avg
     end
 
-    # Принудительная продажа всего при +30% (>= 1.30)
+    # Принудительная продажа всего при +10% (>= 1.10)
     def should_force_exit?(position, figi)
       m = profit_multiple(position, figi)
-      m && m >= 1.30
+      m && m >= 1.10
     end
   end
 end

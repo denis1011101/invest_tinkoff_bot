@@ -78,7 +78,7 @@ begin
 
   state = load_state(STATE_PATH)
 
-  # Принудительная продажа всех лотов при профите >= +30% (до основной логики)
+  # Принудительная продажа всех лотов при профите >= +10% (до основной логики)
   begin
     port_force = client.grpc_operations.portfolio(account_id: account_id)
     positions_force = port_force.positions
@@ -100,7 +100,7 @@ begin
         order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
       if resp
-        puts "FORCE SELL +30% #{it[:ticker]} qty=#{qty} @#{cur_price} (order_id=#{resp.order_id})"
+        puts "FORCE SELL +10% #{it[:ticker]} qty=#{qty} @#{cur_price} (order_id=#{resp.order_id})"
         # mark_action! не обязателен: позиция обнулится, повтор не пройдёт
       else
         puts "FORCE SELL #{it[:ticker]} skipped / not confirmed"
@@ -137,7 +137,7 @@ begin
     end
 
   when :down
-    puts 'Trend: DOWN — SELL one lot if >= avg * 1.10 (max once per ticker per day)'
+    puts 'Trend: DOWN — SELL one lot if >= avg * 1.05 (max once per ticker per day)'
     port = client.grpc_operations.portfolio(account_id: account_id)
     positions = port.positions
 
