@@ -7,7 +7,7 @@ module TradingLogic
     CACHE_PATH = File.expand_path('../tmp/market_instruments_cache.json', __dir__)
     FileUtils.mkdir_p(File.dirname(CACHE_PATH))
     CACHE_TTL_DAYS = (ENV['INSTRUMENT_CACHE_DAYS'] || '7').to_i
-    CACHE_MAX_PRICE_PER_LOT = (ENV['SCAN_MAX_LOT_RUB'] || '100').to_f
+    CACHE_MAX_PRICE_PER_LOT = (ENV['SCAN_MAX_LOT_RUB'] || '300').to_f
 
     def initialize(client)
       @client = client
