@@ -70,7 +70,7 @@ module TradingLogic
     end
 
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
-    def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:, max_lot_rub:, account_id:)
+    def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:, max_lot_rub:, lots_per_order: 1, account_id:)
       market = load_cache_normalized(market_cache_path)
       index  = load_cache_normalized(moex_index_cache_path)
 
@@ -142,7 +142,7 @@ module TradingLogic
         price = logic.last_price_for(figi) || (item['raw'] && item['raw']['price'])
         warn "DEBUG: #{tk} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{(price && lot ? price * lot : nil).inspect}"
 
-        unless price && lot && (price * lot <= (max_lot_rub || 1_0_000))
+        unless price && lot && (price * lot * lots_per_order <= (max_lot_rub || 1_0_000))
           warn "DEBUG: skip #{tk} — price/lot missing or too expensive"
           next
         end
@@ -150,7 +150,7 @@ module TradingLogic
         resp_order = logic.confirm_and_place_order(
           account_id: account_id,
           figi: figi,
-          quantity: lot,
+          quantity: lot * lots_per_order,
           price: price,
           direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
           order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT

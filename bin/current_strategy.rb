@@ -14,8 +14,9 @@ client = InvestTinkoff::V2::Client.new(token: token, sandbox: false)
 
 # параметры стратегии
 TICKERS = %w[SBER ROSN VTBR]
-MAX_LOT_RUB = 500.0
+MAX_LOT_RUB = 1000.0
 MAX_LOT_COUNT = 1
+LOTS_PER_ORDER = 2
 DIP_PCT = 0.01
 DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
 
@@ -24,6 +25,7 @@ logic = TradingLogic::Runner.new(
   tickers: TICKERS,
   max_lot_rub: MAX_LOT_RUB,
   max_lot_count: MAX_LOT_COUNT,
+  lots_per_order: LOTS_PER_ORDER,
   dip_pct: DIP_PCT,
   telegram_bot_token: ENV['TELEGRAM_BOT_TOKEN'],
   telegram_chat_id: ENV['TELEGRAM_CHAT_ID']
@@ -72,7 +74,7 @@ begin
     puts format("  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f", (u[:ticker] || ''), (u[:price] || 0.0), (u[:lot] || 0), (u[:price_per_lot] || 0.0))
   end
   if universe.empty?
-    puts 'no instruments under 1000 RUB per lot'
+    puts "no instruments under limit: max_lot_rub=#{MAX_LOT_RUB}, lots_per_order=#{LOTS_PER_ORDER}"
     exit 0
   end
 
@@ -123,7 +125,7 @@ begin
       resp = logic.confirm_and_place_order(
         account_id: account_id,
         figi: it[:figi],
-        quantity: it[:lot],
+        quantity: it[:lot] * LOTS_PER_ORDER,
         price: it[:price],
         direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
         order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
@@ -174,6 +176,7 @@ begin
       market_cache_path: MARKET_CACHE_PATH,
       moex_index_cache_path: MOEX_INDEX_CACHE_PATH,
       max_lot_rub: MAX_LOT_RUB,
+      lots_per_order: LOTS_PER_ORDER,
       account_id: account_id
     )
      puts 'DOWN: no momentum candidates' unless bought
@@ -186,6 +189,7 @@ begin
       market_cache_path: MARKET_CACHE_PATH,
       moex_index_cache_path: MOEX_INDEX_CACHE_PATH,
       max_lot_rub: MAX_LOT_RUB,
+      lots_per_order: LOTS_PER_ORDER,
       account_id: account_id
     )
      puts 'SIDE: no momentum candidates' unless bought

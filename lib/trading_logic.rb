@@ -12,11 +12,12 @@ module TradingLogic
     DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
     MIN_5 = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_5_MIN
 
-    def initialize(client, tickers:, max_lot_rub: 500.0, max_lot_count: 1, dip_pct: 0.01, telegram_bot_token: nil, telegram_chat_id: nil)
+    def initialize(client, tickers:, max_lot_rub: 500.0, max_lot_count: 1, lots_per_order: 1, dip_pct: 0.01, telegram_bot_token: nil, telegram_chat_id: nil)
       @client = client
       @tickers = tickers
       @max_lot = max_lot_rub
       @max_lot_count = max_lot_count
+      @lots_per_order = lots_per_order
       @dip_pct = dip_pct
       @telegram = TelegramConfirm.new(bot_token: telegram_bot_token, chat_id: telegram_chat_id)
       @market_cache = MarketCache.new(@client)
@@ -102,7 +103,12 @@ module TradingLogic
 
           h = { ticker: t, figi: figi, lot: lot.to_i, price: price, price_per_lot: price * lot.to_i }
           # фильтр по цене лота, если нужен
-          @max_lot ? (h if h[:price_per_lot] <= @max_lot) : h
+          if @max_lot
+            total_price = h[:price_per_lot] * (@lots_per_order || 1)
+            h if total_price <= @max_lot
+          else
+            h
+          end
         rescue InvestTinkoff::GRPC::Error
           nil
         end
