@@ -13,11 +13,11 @@ token = ENV['TINKOFF_TOKEN'] || abort('Set TINKOFF_TOKEN')
 client = InvestTinkoff::V2::Client.new(token: token, sandbox: false)
 
 # параметры стратегии
-TICKERS = %w[SBER ROSN VTBR]
-MAX_LOT_RUB = 1000.0
-MAX_LOT_COUNT = 1
-LOTS_PER_ORDER = 2
-DIP_PCT = 0.01
+TICKERS = (ENV['TICKERS'] || 'SBER,ROSN,VTBR').split(',').map(&:strip)
+MAX_LOT_RUB = (ENV['MAX_LOT_RUB'] || '1000.0').to_f
+MAX_LOT_COUNT = (ENV['MAX_LOT_COUNT'] || '1').to_i
+LOTS_PER_ORDER = (ENV['LOTS_PER_ORDER'] || '2').to_i
+DIP_PCT = (ENV['DIP_PCT'] || '0.01').to_f
 DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
 
 logic = TradingLogic::Runner.new(
