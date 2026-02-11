@@ -56,6 +56,10 @@ module TradingLogic
       @market_cache.load_market_cache
     end
 
+    def q_to_decimal(q)
+      Utils.q_to_decimal(q)
+    end
+
     def figi_and_lot(ticker, class_code: 'TQBR')
       resp = Utils.safe_share_by_ticker(@client, ticker, class_code: class_code)
       return [nil, nil] unless resp && resp.instrument
@@ -199,7 +203,7 @@ module TradingLogic
           else
             h
           end
-        rescue InvestTinkoff::GRPC::Error
+        rescue StandardError
           nil
         end
       end.compact
@@ -233,9 +237,9 @@ module TradingLogic
 
       avg = Utils.q_to_decimal(position.average_position_price)
       cur = last_price_for(it[:figi])
-      return false unless avg && cur
+      return false unless avg && cur && avg.positive?
 
-      cur >= (avg * 1.10)
+      (cur / avg) >= 1.10
     end
 
     def confirm_and_place_order(account_id:, figi:, quantity:, price:, direction:, order_type:)

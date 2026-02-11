@@ -6,6 +6,17 @@ require 'time'
 
 module TradingLogic
   class TelegramConfirm
+    def self.send_message(bot_token:, chat_id:, text:)
+      uri = URI("https://api.telegram.org/bot#{bot_token}/sendMessage")
+      body = { chat_id: chat_id.to_s, text: text, parse_mode: 'Markdown' }.to_json
+      res = Net::HTTP.post(uri, body, 'Content-Type' => 'application/json')
+      return false unless res.code.to_i == 200
+
+      JSON.parse(res.body).fetch('ok', false) == true
+    rescue StandardError
+      false
+    end
+
     def initialize(bot_token:, chat_id:)
       @bot_token = bot_token
       @chat_id = chat_id.to_s
