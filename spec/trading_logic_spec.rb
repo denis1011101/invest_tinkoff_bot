@@ -93,4 +93,30 @@ RSpec.describe TradingLogic::Runner do
       expect(runner.build_universe).to eq([])
     end
   end
+
+  describe 'volume-aware buy filters' do
+    it 'requires relative volume spike when min_relative_volume is set' do
+      runner = described_class.new(client, tickers: %w[SBER], min_relative_volume: 1.5)
+      allow(runner).to receive(:dip_today?).and_return(true)
+      allow(runner).to receive(:relative_daily_volume).and_return(1.8)
+
+      expect(runner.should_buy?({ figi: 'F1' })).to be true
+
+      allow(runner).to receive(:relative_daily_volume).and_return(1.1)
+      expect(runner.should_buy?({ figi: 'F1' })).to be false
+    end
+
+    it 'can rank universe by relative volume or turnover' do
+      runner = described_class.new(client, tickers: %w[SBER VTBR], volume_compare_mode: 'relative')
+      universe = [
+        { ticker: 'SBER', relative_volume: 1.2, daily_turnover_rub: 500.0 },
+        { ticker: 'VTBR', relative_volume: 2.4, daily_turnover_rub: 100.0 }
+      ]
+
+      expect(runner.rank_universe_by_volume(universe).first[:ticker]).to eq('VTBR')
+
+      runner_turnover = described_class.new(client, tickers: %w[SBER VTBR], volume_compare_mode: 'turnover')
+      expect(runner_turnover.rank_universe_by_volume(universe).first[:ticker]).to eq('SBER')
+    end
+  end
 end

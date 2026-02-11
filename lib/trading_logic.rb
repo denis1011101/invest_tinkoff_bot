@@ -12,13 +12,28 @@ module TradingLogic
     DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
     MIN_5 = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_5_MIN
 
-    def initialize(client, tickers:, max_lot_rub: 500.0, max_lot_count: 1, lots_per_order: 1, dip_pct: 0.01, telegram_bot_token: nil, telegram_chat_id: nil)
+    def initialize(
+      client,
+      tickers:,
+      max_lot_rub: 500.0,
+      max_lot_count: 1,
+      lots_per_order: 1,
+      dip_pct: 0.01,
+      min_relative_volume: nil,
+      volume_lookback_days: 20,
+      volume_compare_mode: 'none',
+      telegram_bot_token: nil,
+      telegram_chat_id: nil
+    )
       @client = client
       @tickers = tickers
       @max_lot = max_lot_rub
       @max_lot_count = max_lot_count
       @lots_per_order = lots_per_order
       @dip_pct = dip_pct
+      @min_relative_volume = min_relative_volume
+      @volume_lookback_days = volume_lookback_days
+      @volume_compare_mode = volume_compare_mode
       @telegram = TelegramConfirm.new(bot_token: telegram_bot_token, chat_id: telegram_chat_id)
       @market_cache = MarketCache.new(@client)
     end
@@ -63,6 +78,54 @@ module TradingLogic
       highs.max
     end
 
+    # Оценка относительного дневного объёма:
+    # rvol = текущий дневной объём / средний объём предыдущих N дней
+    def relative_daily_volume(figi, lookback_days: @volume_lookback_days)
+      total_days = [lookback_days.to_i + 1, 3].max
+      resp = Utils.fetch_candles(
+        @client,
+        figi: figi,
+        from: Utils.days_ago(total_days + 2),
+        to: Utils.now_utc,
+        interval: DAY
+      )
+
+      candles = resp && resp.candles ? resp.candles : []
+      return nil if candles.size < 2
+
+      volumes = candles.map { |c| c.volume.to_f }.compact
+      return nil if volumes.size < 2
+
+      current = volumes[-1]
+      history = volumes[0...-1].last(lookback_days)
+      return nil if history.empty?
+
+      avg = history.sum / history.size
+      return nil if avg <= 0
+
+      current / avg
+    end
+
+    # Денежный объём за текущий день по дневной свече: close * volume
+    def daily_turnover_rub(figi)
+      resp = Utils.fetch_candles(@client, figi: figi, from: Utils.days_ago(3), to: Utils.now_utc, interval: DAY)
+      candle = resp && resp.candles ? resp.candles.last : nil
+      return nil unless candle
+
+      close = Utils.q_to_decimal(candle.close)
+      volume = candle.volume.to_f
+      return nil unless close && volume.positive?
+
+      close * volume
+    end
+
+    def volume_spike?(figi)
+      return true unless @min_relative_volume && @min_relative_volume.positive?
+
+      rvol = relative_daily_volume(figi)
+      rvol && rvol >= @min_relative_volume
+    end
+
     # Покупать только на «дневной просадке»: текущая цена <= (сегодняшний максимум * (1 - @dip_pct))
     def dip_today?(figi)
       cur = last_price_for(figi)
@@ -101,7 +164,15 @@ module TradingLogic
           price = last_price_for(figi)
           next unless price && lot
 
-          h = { ticker: t, figi: figi, lot: lot.to_i, price: price, price_per_lot: price * lot.to_i }
+          h = {
+            ticker: t,
+            figi: figi,
+            lot: lot.to_i,
+            price: price,
+            price_per_lot: price * lot.to_i,
+            relative_volume: relative_daily_volume(figi),
+            daily_turnover_rub: daily_turnover_rub(figi)
+          }
           # фильтр по цене лота, если нужен
           if @max_lot
             total_price = h[:price_per_lot] * (@lots_per_order || 1)
@@ -117,7 +188,19 @@ module TradingLogic
 
     # Покупаем на дневной просадке
     def should_buy?(it)
-      dip_today?(it[:figi])
+      dip_today?(it[:figi]) && volume_spike?(it[:figi])
+    end
+
+    # Сортировка кандидатов по объёмам между бумагами
+    def rank_universe_by_volume(universe)
+      case @volume_compare_mode
+      when 'relative'
+        universe.sort_by { |u| -(u[:relative_volume] || 0.0) }
+      when 'turnover'
+        universe.sort_by { |u| -(u[:daily_turnover_rub] || 0.0) }
+      else
+        universe
+      end
     end
 
     # Продаём, если текущая цена >= средней покупки * 1.10 и есть позиция

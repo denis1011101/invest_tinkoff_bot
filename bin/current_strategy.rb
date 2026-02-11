@@ -18,6 +18,9 @@ MAX_LOT_RUB = (ENV['MAX_LOT_RUB'] || '1000.0').to_f
 MAX_LOT_COUNT = (ENV['MAX_LOT_COUNT'] || '1').to_i
 LOTS_PER_ORDER = (ENV['LOTS_PER_ORDER'] || '2').to_i
 DIP_PCT = (ENV['DIP_PCT'] || '0.01').to_f
+MIN_RELATIVE_VOLUME = ENV['MIN_RELATIVE_VOLUME']&.to_f
+VOLUME_LOOKBACK_DAYS = (ENV['VOLUME_LOOKBACK_DAYS'] || '20').to_i
+VOLUME_COMPARE_MODE = (ENV['VOLUME_COMPARE_MODE'] || 'none').strip
 DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
 
 logic = TradingLogic::Runner.new(
@@ -27,6 +30,9 @@ logic = TradingLogic::Runner.new(
   max_lot_count: MAX_LOT_COUNT,
   lots_per_order: LOTS_PER_ORDER,
   dip_pct: DIP_PCT,
+  min_relative_volume: MIN_RELATIVE_VOLUME,
+  volume_lookback_days: VOLUME_LOOKBACK_DAYS,
+  volume_compare_mode: VOLUME_COMPARE_MODE,
   telegram_bot_token: ENV['TELEGRAM_BOT_TOKEN'],
   telegram_chat_id: ENV['TELEGRAM_CHAT_ID']
 )
@@ -68,10 +74,18 @@ begin
   trend = logic.trend(index_figi)
   puts "DEBUG: trend=#{trend.inspect}"
 
-  universe = logic.build_universe
+  universe = logic.rank_universe_by_volume(logic.build_universe)
   puts "DEBUG: universe (count=#{universe.size}):"
   universe.each do |u|
-    puts format("  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f", (u[:ticker] || ''), (u[:price] || 0.0), (u[:lot] || 0), (u[:price_per_lot] || 0.0))
+    puts format(
+      "  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f  rvol=%5.2f  turnover=%12.0f",
+      (u[:ticker] || ''),
+      (u[:price] || 0.0),
+      (u[:lot] || 0),
+      (u[:price_per_lot] || 0.0),
+      (u[:relative_volume] || 0.0),
+      (u[:daily_turnover_rub] || 0.0)
+    )
   end
   if universe.empty?
     puts "no instruments under limit: max_lot_rub=#{MAX_LOT_RUB}, lots_per_order=#{LOTS_PER_ORDER}"
