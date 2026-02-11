@@ -105,6 +105,21 @@ RSpec.describe TradingLogic::Runner do
     end
   end
 
+
+  describe '#relative_daily_volume' do
+    it 'uses exactly configured lookback window and returns nil if not enough daily candles' do
+      runner = described_class.new(client, tickers: %w[SBER], volume_lookback_days: 5)
+      short = 5.times.map { OpenStruct.new(volume: 100) }
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: short))
+      expect(runner.relative_daily_volume('F1')).to be_nil
+
+      enough = 6.times.map { OpenStruct.new(volume: 100) }
+      enough[-1] = OpenStruct.new(volume: 200)
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: enough))
+      expect(runner.relative_daily_volume('F1')).to be_within(0.001).of(2.0)
+    end
+  end
+
   describe 'volume-aware buy filters' do
     it 'requires relative volume spike when min_relative_volume is set' do
       runner = described_class.new(client, tickers: %w[SBER], min_relative_volume: 1.5)

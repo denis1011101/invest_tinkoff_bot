@@ -81,24 +81,27 @@ module TradingLogic
     # Оценка относительного дневного объёма:
     # rvol = текущий дневной объём / средний объём предыдущих N дней
     def relative_daily_volume(figi, lookback_days: @volume_lookback_days)
-      total_days = [lookback_days.to_i + 1, 3].max
+      lookback = [lookback_days.to_i, 1].max
+      # Берём заметно больший календарный диапазон, чтобы после выходных/праздников
+      # осталось не меньше lookback торговых свечей в истории.
+      calendar_days = [lookback * 3, lookback + 10].max
       resp = Utils.fetch_candles(
         @client,
         figi: figi,
-        from: Utils.days_ago(total_days + 2),
+        from: Utils.days_ago(calendar_days),
         to: Utils.now_utc,
         interval: DAY
       )
 
       candles = resp && resp.candles ? resp.candles : []
-      return nil if candles.size < 2
+      return nil if candles.size < (lookback + 1)
 
       volumes = candles.map { |c| c.volume.to_f }.compact
-      return nil if volumes.size < 2
+      return nil if volumes.size < (lookback + 1)
 
       current = volumes[-1]
-      history = volumes[0...-1].last(lookback_days)
-      return nil if history.empty?
+      history = volumes[0...-1].last(lookback)
+      return nil if history.size < lookback
 
       avg = history.sum / history.size
       return nil if avg <= 0
