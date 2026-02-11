@@ -92,5 +92,57 @@ RSpec.describe TradingLogic::Runner do
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
       expect(runner.build_universe).to eq([])
     end
+
+    it 'does not request volume metrics when volume features are disabled' do
+      runner = described_class.new(client, tickers: %w[SBER], volume_compare_mode: 'none')
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: OpenStruct.new(figi: 'F1', lot: 1)))
+      allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
+
+      expect(runner).not_to receive(:relative_daily_volume)
+      expect(runner).not_to receive(:daily_turnover_rub)
+
+      runner.build_universe
+    end
+  end
+
+
+  describe '#relative_daily_volume' do
+    it 'uses exactly configured lookback window and returns nil if not enough daily candles' do
+      runner = described_class.new(client, tickers: %w[SBER], volume_lookback_days: 5)
+      short = 5.times.map { OpenStruct.new(volume: 100) }
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: short))
+      expect(runner.relative_daily_volume('F1')).to be_nil
+
+      enough = 6.times.map { OpenStruct.new(volume: 100) }
+      enough[-1] = OpenStruct.new(volume: 200)
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: enough))
+      expect(runner.relative_daily_volume('F1')).to be_within(0.001).of(2.0)
+    end
+  end
+
+  describe 'volume-aware buy filters' do
+    it 'requires relative volume spike when min_relative_volume is set' do
+      runner = described_class.new(client, tickers: %w[SBER], min_relative_volume: 1.5)
+      allow(runner).to receive(:dip_today?).and_return(true)
+      allow(runner).to receive(:relative_daily_volume).and_return(1.8)
+
+      expect(runner.should_buy?({ figi: 'F1' })).to be true
+
+      allow(runner).to receive(:relative_daily_volume).and_return(1.1)
+      expect(runner.should_buy?({ figi: 'F1' })).to be false
+    end
+
+    it 'can rank universe by relative volume or turnover' do
+      runner = described_class.new(client, tickers: %w[SBER VTBR], volume_compare_mode: 'relative')
+      universe = [
+        { ticker: 'SBER', relative_volume: 1.2, daily_turnover_rub: 500.0 },
+        { ticker: 'VTBR', relative_volume: 2.4, daily_turnover_rub: 100.0 }
+      ]
+
+      expect(runner.rank_universe_by_volume(universe).first[:ticker]).to eq('VTBR')
+
+      runner_turnover = described_class.new(client, tickers: %w[SBER VTBR], volume_compare_mode: 'turnover')
+      expect(runner_turnover.rank_universe_by_volume(universe).first[:ticker]).to eq('SBER')
+    end
   end
 end

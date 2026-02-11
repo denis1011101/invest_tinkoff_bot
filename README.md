@@ -9,6 +9,9 @@ A small automated trading helper for MOEX using Tinkoff gRPC API. It implements 
   - From intersection of market universe and index constituents, buy one instrument showing 3 consecutive daily closes up. See [`TradingLogic::StrategyHelpers`](lib/strategy_helpers.rb).
 - Profit exit / force exit
   - Sell when current price >= average_buy * 1.10 (configurable checks in logic). See [`TradingLogic::Runner`](lib/trading_logic.rb).
+- Volume-aware filters and ranking
+  - Optional relative volume filter for entries: current day volume must be above average history (`MIN_RELATIVE_VOLUME`).
+  - Optional cross-sectional ranking by volume (`VOLUME_COMPARE_MODE=relative|turnover`) to prioritize strongest names by volume burst or by turnover.
 
 ## How it works (high level)
 - Market data and instruments are fetched via Invest Tinkoff gRPC client.
@@ -47,3 +50,9 @@ lib/market_cache.rb — instruments + price caching
 lib/telegram_confirm.rb — Telegram confirm/send helpers
 bin/current_strategy.rb — example main strategy runner
 bin/example.rb — basic gRPC examples and helpers
+
+
+## Volume parameters
+- `MIN_RELATIVE_VOLUME` — minimum ratio `today_volume / avg_volume_N_days` for BUY signals (disabled if unset).
+- `VOLUME_LOOKBACK_DAYS` — lookback length `N` for average volume (default `20`).
+- `VOLUME_COMPARE_MODE` — how to compare papers by volume in universe: `none` (default), `relative`, `turnover`.
