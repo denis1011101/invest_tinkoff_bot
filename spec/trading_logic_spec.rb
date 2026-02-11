@@ -92,6 +92,17 @@ RSpec.describe TradingLogic::Runner do
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
       expect(runner.build_universe).to eq([])
     end
+
+    it 'does not request volume metrics when volume features are disabled' do
+      runner = described_class.new(client, tickers: %w[SBER], volume_compare_mode: 'none')
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: OpenStruct.new(figi: 'F1', lot: 1)))
+      allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
+
+      expect(runner).not_to receive(:relative_daily_volume)
+      expect(runner).not_to receive(:daily_turnover_rub)
+
+      runner.build_universe
+    end
   end
 
   describe 'volume-aware buy filters' do

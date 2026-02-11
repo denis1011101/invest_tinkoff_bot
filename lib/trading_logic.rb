@@ -153,6 +153,8 @@ module TradingLogic
     end
 
     def build_universe
+      volume_enabled = volume_features_enabled?
+
       @tickers.map do |t|
         begin
           figi, lot = figi_and_lot(t)
@@ -169,10 +171,14 @@ module TradingLogic
             figi: figi,
             lot: lot.to_i,
             price: price,
-            price_per_lot: price * lot.to_i,
-            relative_volume: relative_daily_volume(figi),
-            daily_turnover_rub: daily_turnover_rub(figi)
+            price_per_lot: price * lot.to_i
           }
+
+          if volume_enabled
+            h[:relative_volume] = relative_daily_volume(figi)
+            h[:daily_turnover_rub] = daily_turnover_rub(figi)
+          end
+
           # фильтр по цене лота, если нужен
           if @max_lot
             total_price = h[:price_per_lot] * (@lots_per_order || 1)
@@ -201,6 +207,10 @@ module TradingLogic
       else
         universe
       end
+    end
+
+    def volume_features_enabled?
+      (@min_relative_volume && @min_relative_volume.positive?) || %w[relative turnover].include?(@volume_compare_mode)
     end
 
     # Продаём, если текущая цена >= средней покупки * 1.10 и есть позиция
