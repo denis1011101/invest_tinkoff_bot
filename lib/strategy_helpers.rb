@@ -147,22 +147,30 @@ module TradingLogic
           next
         end
 
-        resp_order = logic.confirm_and_place_order(
+        if pending_order_active?(state, tk)
+          warn "DEBUG: BUY skipped for #{tk} — active pending order cooldown"
+          next
+        end
+
+        result = logic.confirm_and_place_order_with_result(
           account_id: account_id,
           figi: figi,
           quantity: lot * lots_per_order,
           price: price,
           direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
           order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
-        ) rescue nil
+        ) rescue { ok: false, category: :api_error, status: 'api_error', reject_reason: 'unexpected error', error_code: 'UNKNOWN' }
 
-        if resp_order
+        sync_pending_order!(state, tk, result)
+
+        if result[:ok]
+          resp_order = result[:response]
           warn "DEBUG: BUY placed for #{tk} (figi=#{figi}) order_id=#{resp_order.order_id}"
           mark_action!(state, 'last_buy', tk) rescue nil
           return true
-        else
-          warn "DEBUG: BUY not placed or not confirmed for #{tk}"
         end
+
+        warn buy_failure_message(tk, result)
       end
 
       false
@@ -208,11 +216,80 @@ module TradingLogic
     end
 
     def load_state(path)
-      return { 'last_buy' => {}, 'last_sell' => {} } unless File.exist?(path)
+      return default_state unless File.exist?(path)
 
-      JSON.parse(File.read(path))
+      ensure_state_defaults!(JSON.parse(File.read(path)))
     rescue
-      { 'last_buy' => {}, 'last_sell' => {} }
+      default_state
+    end
+
+
+    def default_state
+      { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {} }
+    end
+
+    def ensure_state_defaults!(state)
+      state ||= {}
+      state['last_buy'] ||= {}
+      state['last_sell'] ||= {}
+      state['pending_orders'] ||= {}
+      state
+    end
+
+    def pending_order_active?(state, ticker)
+      pending = (state['pending_orders'] || {})[ticker]
+      return false unless pending.is_a?(Hash)
+
+      status = pending['status'].to_s
+      return false unless %w[sent_not_filled partially_filled].include?(status)
+
+      ts = Time.parse(pending['ts'].to_s) rescue nil
+      return false unless ts
+
+      cooldown = (ENV['BUY_PENDING_COOLDOWN_MIN'] || '10').to_i * 60
+      (Time.now.utc - ts) < cooldown
+    end
+
+    def sync_pending_order!(state, ticker, result)
+      ensure_state_defaults!(state)
+      category = result[:category].to_s
+      pending_status =
+        case category
+        when 'sent_not_filled' then 'sent_not_filled'
+        when 'partially_filled' then 'partially_filled'
+        else nil
+        end
+
+      if pending_status
+        state['pending_orders'][ticker] = {
+          'client_order_id' => result[:client_order_id],
+          'ticker' => ticker,
+          'ts' => Time.now.utc.iso8601,
+          'status' => pending_status
+        }
+      else
+        state['pending_orders'].delete(ticker)
+      end
+    end
+
+    def buy_failure_message(ticker, result)
+      category = result[:category].to_s
+      reason = result[:reject_reason]
+      code = result[:error_code]
+      tail = "reject_reason=#{reason.inspect} error_code=#{code.inspect}"
+
+      case category
+      when 'not_sent'
+        "DEBUG: BUY not sent for #{ticker} (confirmation missing) #{tail}"
+      when 'broker_rejected'
+        "DEBUG: BUY rejected by broker for #{ticker} #{tail}"
+      when 'sent_not_filled'
+        "DEBUG: BUY sent but not filled for #{ticker} #{tail}"
+      when 'partially_filled'
+        "DEBUG: BUY partially filled for #{ticker} #{tail}"
+      else
+        "DEBUG: BUY failed for #{ticker} (category=#{category}) #{tail}"
+      end
     end
 
     def save_state(path, state)
