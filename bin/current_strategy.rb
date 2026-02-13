@@ -158,12 +158,20 @@ begin
     positions = port.positions
 
     universe.each do |it|
-      next if acted_today?(state, 'last_sell', it[:ticker])
+      ticker = resolve_ticker_for_sell(client, figi: it[:figi], fallback_ticker: it[:ticker])
+      unless ticker
+        warn "ERROR: SELL ticker resolution failed payload=#{it.to_json}"
+        next
+      end
+
+      next if acted_today?(state, 'last_sell', ticker)
       p = positions.find { |pos| pos.figi == it[:figi] }
       next unless p
       qty_units = p.quantity.units.to_i
       next if qty_units <= 0
-      next unless logic.should_sell?(p, it)
+
+      sell_it = it.merge(ticker: ticker)
+      next unless logic.should_sell?(p, sell_it)
 
       sell_qty = [qty_units, it[:lot]].min
       resp = logic.confirm_and_place_order(
@@ -175,10 +183,10 @@ begin
         order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
       if resp
-        puts "SELL #{it[:ticker]} qty=#{sell_qty} (order_id=#{resp.order_id})"
-        mark_action!(state, 'last_sell', it[:ticker])
+        puts "SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})"
+        mark_action!(state, 'last_sell', ticker, figi: it[:figi], reason: 'signal')
       else
-        puts "SELL #{it[:ticker]} skipped / not confirmed"
+        puts "SELL #{ticker} skipped / not confirmed"
       end
     end
     # доп. проход по позициям, чтобы учесть бумаги вне исходного TICKERS
@@ -209,6 +217,7 @@ begin
      puts 'SIDE: no momentum candidates' unless bought
   end
 
+  check_sell_consistency!(client, account_id, state)
   save_state(STATE_PATH, state)
 
   puts ''

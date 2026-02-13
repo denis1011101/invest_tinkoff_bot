@@ -69,6 +69,18 @@ module TradingLogic
       nil
     end
 
+    def resolve_ticker_for_sell(client, figi:, fallback_ticker: nil)
+      ticker = fallback_ticker.to_s.strip.upcase
+      return ticker unless ticker.empty?
+      return nil if figi.to_s.strip.empty?
+
+      inst = client.grpc_instruments.get_instrument_by(:figi, figi)
+      tk = inst&.ticker.to_s.strip.upcase
+      tk.empty? ? nil : tk
+    rescue
+      nil
+    end
+
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
     def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:, max_lot_rub:, lots_per_order: 1, account_id:)
       market = load_cache_normalized(market_cache_path)
@@ -176,13 +188,19 @@ module TradingLogic
         qty_units = p.quantity.units.to_i
         next if qty_units <= 0
 
+        ticker = resolve_ticker_for_sell(client, figi: figi)
+        unless ticker
+          warn "ERROR: SELL ticker resolution failed payload=#{ { figi: figi, qty_units: qty_units }.to_json }"
+          next
+        end
+
+        next if acted_today?(state, 'last_sell', ticker)
+
         inst = begin
           client.grpc_instruments.get_instrument_by(:figi, figi)
         rescue
           nil
         end
-        ticker = (inst&.ticker || 'UNKNOWN').to_s.upcase
-        next if acted_today?(state, 'last_sell', ticker)
 
         lot = inst&.lot.to_i
         lot = 1 if lot <= 0
@@ -200,7 +218,7 @@ module TradingLogic
         ) rescue nil
         if resp
           puts "SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})"
-          mark_action!(state, 'last_sell', ticker)
+          mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'signal')
         else
           puts "SELL #{ticker} skipped / not confirmed"
         end
@@ -225,14 +243,77 @@ module TradingLogic
 
     def acted_today?(state, action, ticker)
       day = today_key
+      if action.to_s == 'last_sell'
+        sell = state[action] || {}
+        entry = sell[ticker]
+        return true if entry.is_a?(Hash) && entry['ts'].to_s.start_with?(day)
+
+        # backward compatibility with legacy format { day => { ticker => true } }
+        return ((sell[day] || {})[ticker] == true)
+      end
+
       ((state[action] || {})[day] || {})[ticker] == true
     end
 
-    def mark_action!(state, action, ticker)
+    def mark_action!(state, action, ticker, figi: nil, reason: nil, ts: Time.now.utc.iso8601)
       day = today_key
       state[action] ||= {}
+
+      if action.to_s == 'last_sell'
+        state[action][ticker] = {
+          'figi' => figi,
+          'ts' => ts,
+          'reason' => reason || 'signal'
+        }
+        return
+      end
+
       state[action][day] ||= {}
       state[action][day][ticker] = true
+    end
+
+    def state_last_sell_count_for_day(state, day: today_key)
+      sell = state['last_sell'] || {}
+      return (sell[day] || {}).keys.size if sell[day].is_a?(Hash) && !sell.values.any? { |v| v.is_a?(Hash) && v['ts'] }
+
+      sell.values.count { |v| v.is_a?(Hash) && v['ts'].to_s.start_with?(day) }
+    end
+
+    def broker_sell_orders_count_for_day(client, account_id, day: today_key)
+      from = Time.parse("#{day}T00:00:00Z")
+      to = Time.parse("#{day}T23:59:59Z")
+      operations = []
+
+      ops = client.grpc_operations
+      if ops.respond_to?(:operations_by_cursor)
+        resp = ops.operations_by_cursor(account_id: account_id, from: from, to: to)
+        operations = resp.respond_to?(:items) ? resp.items : []
+      elsif ops.respond_to?(:operations)
+        resp = ops.operations(account_id: account_id, from: from, to: to)
+        operations = resp.respond_to?(:operations) ? resp.operations : []
+      end
+
+      operations.count do |op|
+        value = if op.respond_to?(:type) then op.type
+                elsif op.respond_to?(:operation_type) then op.operation_type
+                elsif op.respond_to?(:state) then op.state
+                else nil
+                end
+        value.to_s.upcase.include?('SELL')
+      end
+    rescue => e
+      warn "ERROR: broker sell consistency check failed: #{e.class}: #{e.message}"
+      nil
+    end
+
+    def check_sell_consistency!(client, account_id, state)
+      broker_count = broker_sell_orders_count_for_day(client, account_id)
+      return if broker_count.nil?
+
+      state_count = state_last_sell_count_for_day(state)
+      return if broker_count == state_count
+
+      warn "ERROR: sell consistency mismatch broker=#{broker_count} state_last_sell=#{state_count}"
     end
   end
 end
