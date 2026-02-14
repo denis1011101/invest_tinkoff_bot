@@ -22,7 +22,6 @@ module TradingLogic
       /connection\s+reset/i
     ].freeze
 
-
     def initialize(
       client,
       tickers:,

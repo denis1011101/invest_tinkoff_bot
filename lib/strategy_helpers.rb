@@ -163,9 +163,10 @@ module TradingLogic
 
         sync_pending_order!(state, tk, result)
 
-        if result[:ok]
+        successful_buy = result[:ok] || %w[filled sent_not_filled partially_filled].include?(result[:category].to_s)
+        if successful_buy
           resp_order = result[:response]
-          warn "DEBUG: BUY placed for #{tk} (figi=#{figi}) order_id=#{resp_order.order_id}"
+          warn "DEBUG: BUY accepted for #{tk} (figi=#{figi}) order_id=#{resp_order&.order_id}"
           mark_action!(state, 'last_buy', tk) rescue nil
           return true
         end
