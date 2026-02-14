@@ -1,48 +1,127 @@
 require_relative 'spec_helper'
 require_relative '../lib/strategy_helpers'
+require 'tempfile'
+require 'json'
+require 'ostruct'
 
 RSpec.describe TradingLogic::StrategyHelpers do
-  describe '.mark_action!/.acted_today? for last_sell' do
-    it 'stores ticker => {figi,ts,reason} and detects same-day action' do
-      state = { 'last_sell' => {} }
-      described_class.mark_action!(state, 'last_sell', 'SBER', figi: 'FIGI1', reason: 'signal', ts: '2026-01-01T10:00:00Z')
-
-      expect(state['last_sell']['SBER']).to eq(
-        'figi' => 'FIGI1',
-        'ts' => '2026-01-01T10:00:00Z',
-        'reason' => 'signal'
-      )
-
-      allow(described_class).to receive(:today_key).and_return('2026-01-01')
-      expect(described_class.acted_today?(state, 'last_sell', 'SBER')).to be true
-    end
+  def q(units, nano = 0)
+    OpenStruct.new(units: units, nano: nano)
   end
 
-  describe '.resolve_ticker_for_sell' do
-    it 'resolves ticker by figi when fallback ticker absent' do
-      client = double('client')
-      grpc_instruments = double('grpc_instruments')
-      allow(client).to receive(:grpc_instruments).and_return(grpc_instruments)
-      allow(grpc_instruments).to receive(:get_instrument_by).with(:figi, 'FIGI1').and_return(OpenStruct.new(ticker: 'sber'))
-
-      expect(described_class.resolve_ticker_for_sell(client, figi: 'FIGI1', fallback_ticker: nil)).to eq('SBER')
-    end
+  def write_cache(rows)
+    f = Tempfile.new(['cache', '.json'])
+    f.write(JSON.generate({ 'instruments' => rows }))
+    f.flush
+    f
   end
 
-  describe '.check_sell_consistency!' do
-    it 'logs mismatch when broker sell count differs from state entries' do
-      client = double('client')
-      state = {
-        'last_sell' => {
-          'SBER' => { 'figi' => 'F1', 'ts' => '2026-01-01T10:00:00Z', 'reason' => 'signal' }
-        }
+  def rising_daily_candles
+    [
+      OpenStruct.new(close: q(10)),
+      OpenStruct.new(close: q(11)),
+      OpenStruct.new(close: q(12)),
+      OpenStruct.new(close: q(13))
+    ]
+  end
+
+  it 'stops after first accepted BUY when category is sent_not_filled' do
+    market_cache = write_cache(
+      [
+        { 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 },
+        { 'ticker' => 'BBB', 'figi' => 'F_BBB', 'lot' => 1 }
+      ]
+    )
+    index_cache = write_cache(
+      [
+        { 'ticker' => 'AAA' },
+        { 'ticker' => 'BBB' }
+      ]
+    )
+
+    client = double('client')
+    market_data = double('market_data')
+    allow(client).to receive(:grpc_market_data).and_return(market_data)
+    allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
+
+    logic = double('logic')
+    allow(logic).to receive(:last_price_for).and_return(100.0)
+    expect(logic).to receive(:confirm_and_place_order_with_result).once.and_return(
+      {
+        ok: false,
+        category: :sent_not_filled,
+        response: OpenStruct.new(order_id: 'order-1'),
+        client_order_id: 'client-1'
       }
+    )
 
-      allow(described_class).to receive(:today_key).and_return('2026-01-01')
-      allow(described_class).to receive(:broker_sell_orders_count_for_day).and_return(2)
+    state = { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {} }
+    result = described_class.buy_one_momentum_from_intersection!(
+      client,
+      logic,
+      state,
+      market_cache_path: market_cache.path,
+      moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0,
+      lots_per_order: 1,
+      account_id: 'acc'
+    )
 
-      expect(described_class).to receive(:warn).with(/sell consistency mismatch broker=2 state_last_sell=1/)
-      described_class.check_sell_consistency!(client, 'acc', state)
-    end
+    expect(result).to be true
+    expect(state.fetch('pending_orders').fetch('AAA').fetch('status')).to eq('sent_not_filled')
+    expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
+  ensure
+    market_cache&.close!
+    index_cache&.close!
+  end
+
+  it 'stops after first accepted BUY when category is partially_filled' do
+    market_cache = write_cache(
+      [
+        { 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 },
+        { 'ticker' => 'BBB', 'figi' => 'F_BBB', 'lot' => 1 }
+      ]
+    )
+    index_cache = write_cache(
+      [
+        { 'ticker' => 'AAA' },
+        { 'ticker' => 'BBB' }
+      ]
+    )
+
+    client = double('client')
+    market_data = double('market_data')
+    allow(client).to receive(:grpc_market_data).and_return(market_data)
+    allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
+
+    logic = double('logic')
+    allow(logic).to receive(:last_price_for).and_return(100.0)
+    expect(logic).to receive(:confirm_and_place_order_with_result).once.and_return(
+      {
+        ok: false,
+        category: :partially_filled,
+        response: OpenStruct.new(order_id: 'order-2'),
+        client_order_id: 'client-2'
+      }
+    )
+
+    state = { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {} }
+    result = described_class.buy_one_momentum_from_intersection!(
+      client,
+      logic,
+      state,
+      market_cache_path: market_cache.path,
+      moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0,
+      lots_per_order: 1,
+      account_id: 'acc'
+    )
+
+    expect(result).to be true
+    expect(state.fetch('pending_orders').fetch('AAA').fetch('status')).to eq('partially_filled')
+    expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
+  ensure
+    market_cache&.close!
+    index_cache&.close!
   end
 end

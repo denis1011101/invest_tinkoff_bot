@@ -12,6 +12,16 @@ module TradingLogic
     DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
     MIN_5 = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_5_MIN
 
+    TECHNICAL_ERROR_PATTERNS = [
+      /deadline/i,
+      /timeout/i,
+      /temporar/i,
+      /unavailable/i,
+      /internal/i,
+      /resource[_\s-]?exhausted/i,
+      /connection\s+reset/i
+    ].freeze
+
     def initialize(
       client,
       tickers:,
@@ -229,6 +239,18 @@ module TradingLogic
     end
 
     def confirm_and_place_order(account_id:, figi:, quantity:, price:, direction:, order_type:)
+      result = confirm_and_place_order_with_result(
+        account_id: account_id,
+        figi: figi,
+        quantity: quantity,
+        price: price,
+        direction: direction,
+        order_type: order_type
+      )
+      result[:response]
+    end
+
+    def confirm_and_place_order_with_result(account_id:, figi:, quantity:, price:, direction:, order_type:, max_retries: 2, retry_delay_seconds: 1)
       side = (direction == ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY) ? 'BUY' : 'SELL'
       prompt = "*Confirm #{side}*\nfigi: #{figi}\nqty: #{quantity}\nprice: #{price}\naccount: #{account_id}"
 
@@ -243,18 +265,106 @@ module TradingLogic
         confirmed = false
       end
 
-      return nil unless confirmed
+      return { ok: false, category: :not_sent, status: 'not_sent', response: nil } unless confirmed
 
-      @client.grpc_orders.post_order(
-        account_id: account_id,
-        figi: figi,
-        quantity: quantity,
-        price: price,
-        direction: direction,
-        order_type: order_type,
-        order_id: SecureRandom.uuid
-      )
+      client_order_id = SecureRandom.uuid
+      attempts = 0
+
+      begin
+        attempts += 1
+        response = @client.grpc_orders.post_order(
+          account_id: account_id,
+          figi: figi,
+          quantity: quantity,
+          price: price,
+          direction: direction,
+          order_type: order_type,
+          order_id: client_order_id
+        )
+
+        status = normalize_order_status(response)
+        reject_reason = extract_response_field(response, :reject_reason)
+        error_code = extract_response_field(response, :error_code)
+
+        category, ok = categorize_order_status(status)
+        {
+          ok: ok,
+          category: category,
+          status: status,
+          response: response,
+          client_order_id: client_order_id,
+          reject_reason: reject_reason,
+          error_code: error_code
+        }
+      rescue => e
+        technical = technical_api_error?(e)
+        if technical && attempts <= max_retries
+          warn "post_order retry ##{attempts} due to technical API error: #{e.class}: #{e.message}"
+          sleep retry_delay_seconds
+          retry
+        end
+
+        {
+          ok: false,
+          category: :api_error,
+          status: 'api_error',
+          response: nil,
+          client_order_id: client_order_id,
+          reject_reason: e.message,
+          error_code: e.class.to_s,
+          technical_error: technical
+        }
+      end
     end
+
+    private
+
+    def technical_api_error?(error)
+      text = "#{error.class} #{error.message}"
+      TECHNICAL_ERROR_PATTERNS.any? { |pattern| text.match?(pattern) }
+    end
+
+    def normalize_order_status(response)
+      raw = extract_response_field(response, :execution_report_status)
+      str = raw.to_s.downcase
+
+      return 'fill' if str.include?('fill') && !str.include?('partial')
+      return 'partially_fill' if str.include?('partially') || str.include?('partial')
+      return 'rejected' if str.include?('reject')
+      return 'cancelled' if str.include?('cancel')
+      return 'new' if str.include?('new') || str.include?('accepted')
+
+      str.empty? ? 'unknown' : str
+    end
+
+    def categorize_order_status(status)
+      case status
+      when 'fill'
+        [:filled, true]
+      when 'rejected', 'cancelled'
+        [:broker_rejected, false]
+      when 'partially_fill'
+        [:partially_filled, false]
+      else
+        [:sent_not_filled, false]
+      end
+    end
+
+    def extract_response_field(response, field)
+      return nil unless response
+
+      return response.public_send(field) if response.respond_to?(field)
+
+      key = field.to_s
+      if response.respond_to?(:to_h)
+        hash = response.to_h
+        return hash[field] if hash.key?(field)
+        return hash[key] if hash.key?(key)
+      end
+      nil
+    end
+
+    public
 
     # Мультипликатор профита (текущая / средняя). nil если не вычислить.
     def profit_multiple(position, figi)
