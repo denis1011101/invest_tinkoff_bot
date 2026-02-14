@@ -52,7 +52,24 @@ bin/current_strategy.rb — example main strategy runner
 bin/example.rb — basic gRPC examples and helpers
 
 
-## Volume parameters
-- `MIN_RELATIVE_VOLUME` — minimum ratio `today_volume / avg_volume_N_days` for BUY signals (disabled if unset).
-- `VOLUME_LOOKBACK_DAYS` — lookback length `N` for average volume (default `20`).
-- `VOLUME_COMPARE_MODE` — how to compare papers by volume in universe: `none` (default), `relative`, `turnover`.
+## Environment variables
+- `TINKOFF_TOKEN` — required API token for Tinkoff Invest.
+- `TELEGRAM_BOT_TOKEN` — Telegram bot token for confirmations/notifications.
+- `TELEGRAM_CHAT_ID` — target Telegram chat id for confirmations.
+- `AUTO_CONFIRM` — if `1`/`true`, skips Telegram/manual confirmation and sends orders immediately.
+- `TICKERS` — comma-separated ticker list for main universe (example: `SBER,ROSN,VTBR`).
+- `MAX_LOT_RUB` — strategy/runtime per-order price limit (`price_per_lot * lots_per_order`) used in `Runner` and momentum buy helper.
+- `MAX_LOT_COUNT` — max instrument lot size allowed when building universe (`lot <= MAX_LOT_COUNT`).
+- `LOTS_PER_ORDER` — multiplier for order size (`quantity = lot * LOTS_PER_ORDER`).
+- `DIP_PCT` — intraday dip threshold for BUY in uptrend (`cur <= today_high * (1 - DIP_PCT)`).
+- `MIN_RELATIVE_VOLUME` — minimum `today_volume / avg_volume_N_days` ratio for BUY (disabled if unset).
+- `VOLUME_LOOKBACK_DAYS` — lookback `N` for average daily volume (default `20`).
+- `VOLUME_COMPARE_MODE` — volume ranking mode for universe: `none`, `relative`, `turnover`.
+- `SCAN_MAX_LOT_RUB` — cache-time filter in `MarketCache`; excludes instruments with `price_per_lot` above this threshold.
+- `INSTRUMENT_CACHE_DAYS` — market instruments cache TTL in days.
+- `MARKET_CACHE_SLEEP` — optional sleep between `last_prices` batches during cache refresh (seconds).
+- `BUY_PENDING_COOLDOWN_MIN` — cooldown (minutes) to avoid repeated BUY attempts for tickers with pending statuses (`sent_not_filled`, `partially_filled`).
+- `FORCE` — rake task flag for forced market cache refresh (`FORCE=true bundle exec rake market_cache:refresh`).
+- `INDEX` — MOEX index code for cache refresh task (`INDEX=IMOEX bundle exec rake moex:refresh`).
+
+Note: `SCAN_MAX_LOT_RUB` and `MAX_LOT_RUB` are related but different. `SCAN_MAX_LOT_RUB` works at cache stage, `MAX_LOT_RUB` works at strategy stage. Keep `SCAN_MAX_LOT_RUB >= MAX_LOT_RUB` to avoid dropping valid candidates before strategy logic.
