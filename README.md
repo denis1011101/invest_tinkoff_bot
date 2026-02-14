@@ -41,6 +41,12 @@ bundle exec rake moex:refresh
 
 # refresh MOEX index cache for a specific index
 INDEX=IMOEX bundle exec rake moex:refresh
+
+# restore strategy state from broker (today UTC)
+bundle exec rake state:restore
+
+# restore strategy state for a specific day
+DAY=2026-02-14 bundle exec rake state:restore
 ```
 
 ## Important files
@@ -69,6 +75,7 @@ bin/example.rb — basic gRPC examples and helpers
 - `INSTRUMENT_CACHE_DAYS` — market instruments cache TTL in days.
 - `MARKET_CACHE_SLEEP` — optional sleep between `last_prices` batches during cache refresh (seconds).
 - `BUY_PENDING_COOLDOWN_MIN` — cooldown (minutes) to avoid repeated BUY attempts for tickers with pending statuses (`sent_not_filled`, `partially_filled`).
+- `RESTORE_STATE_FROM_BROKER` — if not `0`, auto-restores empty `tmp/strategy_state.json` from current-day broker operations and active buy orders.
 - `FORCE` — rake task flag for forced market cache refresh (`FORCE=true bundle exec rake market_cache:refresh`).
 - `INDEX` — MOEX index code for cache refresh task (`INDEX=IMOEX bundle exec rake moex:refresh`).
 

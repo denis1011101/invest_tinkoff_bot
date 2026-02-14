@@ -93,6 +93,9 @@ begin
   end
 
   state = load_state(STATE_PATH)
+  if ENV.fetch('RESTORE_STATE_FROM_BROKER', '1').to_s.strip.downcase != '0'
+    restore_state_from_broker_if_empty!(client, account_id, state)
+  end
 
   # Принудительная продажа всех лотов при профите >= +10% (до основной логики)
   begin

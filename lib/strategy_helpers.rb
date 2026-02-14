@@ -315,6 +315,55 @@ module TradingLogic
       File.write(path, JSON.pretty_generate(state))
     end
 
+    def restore_state_from_broker_if_empty!(client, account_id, state, day: today_key)
+      ensure_state_defaults!(state)
+      has_actions = state['last_buy'].any? || state['last_sell'].any?
+      has_pending = state['pending_orders'].any?
+      return state if has_actions || has_pending
+
+      from = Time.parse("#{day}T00:00:00Z")
+      to = Time.parse("#{day}T23:59:59Z")
+      operations = []
+
+      ops = client.grpc_operations
+      if ops.respond_to?(:operations_by_cursor)
+        resp = ops.operations_by_cursor(account_id: account_id, from: from, to: to)
+        operations = resp.respond_to?(:items) ? resp.items : []
+      elsif ops.respond_to?(:operations)
+        resp = ops.operations(account_id: account_id, from: from, to: to)
+        operations = resp.respond_to?(:operations) ? resp.operations : []
+      end
+
+      operations.each do |op|
+        kind = operation_kind(op)
+        next unless kind
+
+        figi = op.respond_to?(:figi) ? op.figi.to_s : ''
+        next if figi.empty?
+
+        ticker = resolve_ticker_for_sell(client, figi: figi)
+        next unless ticker
+
+        ts = operation_ts_iso8601(op)
+        if kind == :buy
+          state['last_buy'][day] ||= {}
+          state['last_buy'][day][ticker] = true
+        elsif kind == :sell
+          state['last_sell'][ticker] = {
+            'figi' => figi,
+            'ts' => ts,
+            'reason' => 'broker_restore'
+          }
+        end
+      end
+
+      restore_pending_buy_orders!(client, account_id, state)
+      state
+    rescue => e
+      warn "ERROR: state restore from broker failed: #{e.class}: #{e.message}"
+      state
+    end
+
     def today_key
       Time.now.utc.strftime('%Y-%m-%d')
     end
@@ -392,6 +441,87 @@ module TradingLogic
       return if broker_count == state_count
 
       warn "ERROR: sell consistency mismatch broker=#{broker_count} state_last_sell=#{state_count}"
+    end
+
+    def restore_pending_buy_orders!(client, account_id, state)
+      ensure_state_defaults!(state)
+      return unless client.respond_to?(:grpc_orders)
+
+      resp = client.grpc_orders.get_orders(account_id: account_id)
+      orders = resp.respond_to?(:orders) ? resp.orders : []
+      return if orders.empty?
+
+      orders.each do |ord|
+        direction = if ord.respond_to?(:direction)
+                      ord.direction.to_s.upcase
+                    else
+                      ''
+                    end
+        next unless direction.include?('BUY')
+
+        status_str = if ord.respond_to?(:execution_report_status)
+                       ord.execution_report_status.to_s.upcase
+                     elsif ord.respond_to?(:status)
+                       ord.status.to_s.upcase
+                     else
+                       ''
+                     end
+
+        pending_status =
+          if status_str.include?('PARTIALLYFILL')
+            'partially_filled'
+          elsif status_str.include?('NEW') || status_str.include?('ACTIVE') || status_str.include?('FILL')
+            'sent_not_filled'
+          end
+        next unless pending_status
+
+        figi = ord.respond_to?(:figi) ? ord.figi.to_s : ''
+        next if figi.empty?
+
+        ticker = resolve_ticker_for_sell(client, figi: figi)
+        next unless ticker
+
+        client_order_id = if ord.respond_to?(:order_id)
+                            ord.order_id
+                          elsif ord.respond_to?(:order_request_id)
+                            ord.order_request_id
+                          else
+                            nil
+                          end
+
+        state['pending_orders'][ticker] = {
+          'client_order_id' => client_order_id,
+          'ticker' => ticker,
+          'ts' => Time.now.utc.iso8601,
+          'status' => pending_status
+        }
+      end
+    rescue => e
+      warn "ERROR: pending orders restore failed: #{e.class}: #{e.message}"
+    end
+
+    def operation_kind(op)
+      raw = if op.respond_to?(:type) then op.type
+            elsif op.respond_to?(:operation_type) then op.operation_type
+            elsif op.respond_to?(:state) then op.state
+            else nil
+            end
+      val = raw.to_s.upcase
+      return :buy if val.include?('BUY')
+      return :sell if val.include?('SELL')
+
+      nil
+    end
+
+    def operation_ts_iso8601(op)
+      candidate =
+        if op.respond_to?(:date) then op.date
+        elsif op.respond_to?(:time) then op.time
+        elsif op.respond_to?(:timestamp) then op.timestamp
+        else nil
+        end
+      t = Time.parse(candidate.to_s).utc rescue Time.now.utc
+      t.iso8601
     end
   end
 end
