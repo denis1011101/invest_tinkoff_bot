@@ -230,8 +230,10 @@ module TradingLogic
       (@min_relative_volume && @min_relative_volume.positive?) || %w[relative turnover].include?(@volume_compare_mode)
     end
 
-    # Продаём, если текущая цена >= средней покупки * 1.10 и есть позиция
-    def should_sell?(position, it)
+    # Продаём, если текущая цена >= средней покупки * порог.
+    # Порог зависит от тренда: UP=+10%, SIDE=+4%, DOWN=+2%.
+    # Можно переопределить через ENV: SELL_THRESHOLD_UP, SELL_THRESHOLD_SIDE, SELL_THRESHOLD_DOWN.
+    def should_sell?(position, it, trend: :side)
       qty_units = position.quantity.units.to_i
       return false if qty_units <= 0
 
@@ -239,7 +241,19 @@ module TradingLogic
       cur = last_price_for(it[:figi])
       return false unless avg && cur && avg.positive?
 
-      (cur / avg) >= 1.10
+      threshold = sell_threshold_for_trend(trend)
+      (cur / avg) >= threshold
+    end
+
+    def sell_threshold_for_trend(trend)
+      case trend
+      when :up
+        (ENV['SELL_THRESHOLD_UP'] || '1.10').to_f
+      when :down
+        (ENV['SELL_THRESHOLD_DOWN'] || '1.02').to_f
+      else
+        (ENV['SELL_THRESHOLD_SIDE'] || '1.04').to_f
+      end
     end
 
     def confirm_and_place_order(account_id:, figi:, quantity:, price:, direction:, order_type:)

@@ -44,8 +44,15 @@ RSpec.describe TradingLogic::StrategyHelpers do
     allow(client).to receive(:grpc_market_data).and_return(market_data)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
 
+    operations = double('operations')
+    allow(client).to receive(:grpc_operations).and_return(operations)
+    allow(operations).to receive(:portfolio).and_return(
+      OpenStruct.new(total_amount_shares: q(10_000), positions: [])
+    )
+
     logic = double('logic')
     allow(logic).to receive(:last_price_for).and_return(100.0)
+    allow(logic).to receive(:dip_today?).and_return(true)
     expect(logic).to receive(:confirm_and_place_order_with_result).once.and_return(
       {
         ok: false,
@@ -94,8 +101,15 @@ RSpec.describe TradingLogic::StrategyHelpers do
     allow(client).to receive(:grpc_market_data).and_return(market_data)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
 
+    operations = double('operations')
+    allow(client).to receive(:grpc_operations).and_return(operations)
+    allow(operations).to receive(:portfolio).and_return(
+      OpenStruct.new(total_amount_shares: q(10_000), positions: [])
+    )
+
     logic = double('logic')
     allow(logic).to receive(:last_price_for).and_return(100.0)
+    allow(logic).to receive(:dip_today?).and_return(true)
     expect(logic).to receive(:confirm_and_place_order_with_result).once.and_return(
       {
         ok: false,
@@ -123,5 +137,68 @@ RSpec.describe TradingLogic::StrategyHelpers do
   ensure
     market_cache&.close!
     index_cache&.close!
+  end
+
+  describe '.position_within_limit?' do
+    def make_portfolio(total_shares:, positions: [])
+      OpenStruct.new(total_amount_shares: q(total_shares), positions: positions)
+    end
+
+    def make_position(figi:, qty:, avg_price:, current_price: nil)
+      pos = OpenStruct.new(
+        figi: figi,
+        quantity: OpenStruct.new(units: qty),
+        average_position_price: q(avg_price)
+      )
+      if current_price
+        allow(pos).to receive(:respond_to?).and_call_original
+        allow(pos).to receive(:respond_to?).with(:current_price).and_return(true)
+        allow(pos).to receive(:current_price).and_return(q(current_price))
+      end
+      pos
+    end
+
+    it 'returns true when no existing position' do
+      port = make_portfolio(total_shares: 10_000)
+      result = described_class.position_within_limit?(
+        nil, nil, 'F_NEW', portfolio: port, planned_buy_value: 100
+      )
+      expect(result).to be true
+    end
+
+    it 'returns false when post-trade share exceeds limit' do
+      pos = make_position(figi: 'F1', qty: 30, avg_price: 100)
+      port = make_portfolio(total_shares: 10_000, positions: [pos])
+      # current position = 30*100 = 3000, planned = 1000
+      # post_trade = 4000 / 11000 = 36.4% > 33%
+      result = described_class.position_within_limit?(
+        nil, nil, 'F1', portfolio: port, planned_buy_value: 1000, max_share: 0.33
+      )
+      expect(result).to be false
+    end
+
+    it 'returns true when post-trade share is within limit' do
+      pos = make_position(figi: 'F1', qty: 10, avg_price: 100)
+      port = make_portfolio(total_shares: 10_000, positions: [pos])
+      # current position = 10*100 = 1000, planned = 200
+      # post_trade = 1200 / 10200 = 11.8% < 33%
+      result = described_class.position_within_limit?(
+        nil, nil, 'F1', portfolio: port, planned_buy_value: 200, max_share: 0.33
+      )
+      expect(result).to be true
+    end
+
+    it 'accounts for planned buy in share calculation' do
+      pos = make_position(figi: 'F1', qty: 30, avg_price: 100)
+      port = make_portfolio(total_shares: 10_000, positions: [pos])
+      # Without planned buy: 3000/10000 = 30% < 33% => would pass
+      expect(described_class.position_within_limit?(
+        nil, nil, 'F1', portfolio: port, planned_buy_value: 0, max_share: 0.33
+      )).to be true
+      # With planned buy of 500: (3000+500)/(10000+500) = 33.3% >= 33% => should fail
+      expect(described_class.position_within_limit?(
+        nil, nil, 'F1', portfolio: port, planned_buy_value: 500, max_share: 0.33
+      )).to be false
+    end
   end
 end

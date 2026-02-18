@@ -7,7 +7,6 @@ require 'time'
 require 'json'
 require 'fileutils'
 require_relative '../lib/strategy_helpers'
-include TradingLogic::StrategyHelpers
 
 token = ENV['TINKOFF_TOKEN'] || abort('Set TINKOFF_TOKEN')
 client = InvestTinkoff::V2::Client.new(token: token, sandbox: false)
@@ -92,9 +91,12 @@ begin
     exit 0
   end
 
-  state = load_state(STATE_PATH)
+  figi_cache = TradingLogic::StrategyHelpers.build_figi_ticker_map(MARKET_CACHE_PATH)
+
+  state = TradingLogic::StrategyHelpers.load_state(STATE_PATH)
+  TradingLogic::StrategyHelpers.cleanup_pending_orders!(client, account_id, state)
   if ENV.fetch('RESTORE_STATE_FROM_BROKER', '1').to_s.strip.downcase != '0'
-    restore_state_from_broker_if_empty!(client, account_id, state)
+    TradingLogic::StrategyHelpers.restore_state_from_broker_if_empty!(client, account_id, state)
   end
 
   # Принудительная продажа всех лотов при профите >= +10% (до основной логики)
@@ -132,12 +134,19 @@ begin
   case trend
   when :up
     puts 'Trend: UP — intraday dip BUY (max once per ticker per day)'
+    up_portfolio = client.grpc_operations.portfolio(account_id: account_id)
     universe.each do |it|
       cur = logic.last_price_for(it[:figi])
       today_high = logic.today_high(it[:figi]) rescue nil
       puts "DEBUG: #{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} dip_threshold=#{(today_high ? (today_high * (1.0 - DIP_PCT)) : nil).inspect} should_buy=#{logic.should_buy?(it)}"
-      next if acted_today?(state, 'last_buy', it[:ticker])
+      next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
       next unless logic.should_buy?(it)
+
+      buy_value = it[:price] * it[:lot] * LOTS_PER_ORDER
+      next unless TradingLogic::StrategyHelpers.position_within_limit?(
+        client, account_id, it[:figi],
+        planned_buy_value: buy_value, portfolio: up_portfolio
+      )
 
       resp = logic.confirm_and_place_order(
         account_id: account_id,
@@ -149,32 +158,35 @@ begin
       )
       if resp
         puts "BUY #{it[:ticker]} lot=#{it[:lot]} @#{it[:price]} (order_id=#{resp.order_id})"
-        mark_action!(state, 'last_buy', it[:ticker])
+        TradingLogic::StrategyHelpers.mark_action!(state, 'last_buy', it[:ticker])
       else
         puts "BUY #{it[:ticker]} skipped / not confirmed"
       end
     end
 
   when :down
-    puts 'Trend: DOWN — SELL one lot if >= avg * 1.05 (max once per ticker per day)'
+    sell_pct = ((logic.sell_threshold_for_trend(:down) - 1) * 100).round(1)
+    puts "Trend: DOWN — SELL one lot if >= avg * +#{sell_pct}% (max once per ticker per day)"
     port = client.grpc_operations.portfolio(account_id: account_id)
     positions = port.positions
 
     universe.each do |it|
-      ticker = resolve_ticker_for_sell(client, figi: it[:figi], fallback_ticker: it[:ticker])
+      ticker = TradingLogic::StrategyHelpers.resolve_ticker_for_sell(
+        client, figi: it[:figi], fallback_ticker: it[:ticker], figi_cache: figi_cache
+      )
       unless ticker
-        warn "ERROR: SELL ticker resolution failed payload=#{it.to_json}"
+        warn "DEBUG: SELL ticker resolution failed payload=#{it.to_json}"
         next
       end
 
-      next if acted_today?(state, 'last_sell', ticker)
+      next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_sell', ticker)
       p = positions.find { |pos| pos.figi == it[:figi] }
       next unless p
       qty_units = p.quantity.units.to_i
       next if qty_units <= 0
 
       sell_it = it.merge(ticker: ticker)
-      next unless logic.should_sell?(p, sell_it)
+      next unless logic.should_sell?(p, sell_it, trend: trend)
 
       sell_qty = [qty_units, it[:lot]].min
       resp = logic.confirm_and_place_order(
@@ -187,13 +199,15 @@ begin
       )
       if resp
         puts "SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})"
-        mark_action!(state, 'last_sell', ticker, figi: it[:figi], reason: 'signal')
+        TradingLogic::StrategyHelpers.mark_action!(state, 'last_sell', ticker, figi: it[:figi], reason: 'signal')
       else
         puts "SELL #{ticker} skipped / not confirmed"
       end
     end
     # доп. проход по позициям, чтобы учесть бумаги вне исходного TICKERS
-    try_sell_positions_with_logic!(client, logic, account_id, state)
+    TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
+      client, logic, account_id, state, figi_cache: figi_cache, trend: trend
+    )
     # попытка одной покупки по сигналу "3 дневных закрытия вверх" из пересечения IMOEX∩market
     puts 'DOWN: try momentum(3D up) BUY one per day from IMOEX∩market'
     bought = TradingLogic::StrategyHelpers.buy_one_momentum_from_intersection!(
@@ -208,7 +222,9 @@ begin
 
   else
     puts 'Trend: SIDE — SELL by same rules, and try momentum(3D up) BUY one per day'
-    try_sell_positions_with_logic!(client, logic, account_id, state)
+    TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
+      client, logic, account_id, state, figi_cache: figi_cache, trend: trend
+    )
     bought = TradingLogic::StrategyHelpers.buy_one_momentum_from_intersection!(
       client, logic, state,
       market_cache_path: MARKET_CACHE_PATH,
@@ -220,8 +236,8 @@ begin
      puts 'SIDE: no momentum candidates' unless bought
   end
 
-  check_sell_consistency!(client, account_id, state)
-  save_state(STATE_PATH, state)
+  TradingLogic::StrategyHelpers.check_sell_consistency!(client, account_id, state)
+  TradingLogic::StrategyHelpers.save_state(STATE_PATH, state)
 
   puts ''
 rescue InvestTinkoff::GRPC::Error => e

@@ -2,6 +2,7 @@
 
 require 'json'
 require 'time'
+require 'set'
 require_relative 'utils'
 
 module TradingLogic
@@ -69,10 +70,22 @@ module TradingLogic
       nil
     end
 
-    def resolve_ticker_for_sell(client, figi:, fallback_ticker: nil)
+    def build_figi_ticker_map(cache_path)
+      return {} unless File.exist?(cache_path)
+
+      data = JSON.parse(File.read(cache_path)) rescue {}
+      (data['instruments'] || []).each_with_object({}) do |h, map|
+        map[h['figi']] = h['ticker'] if h['figi'] && h['ticker']
+      end
+    end
+
+    def resolve_ticker_for_sell(client, figi:, fallback_ticker: nil, figi_cache: {})
       ticker = fallback_ticker.to_s.strip.upcase
       return ticker unless ticker.empty?
       return nil if figi.to_s.strip.empty?
+
+      cached = figi_cache[figi].to_s.strip.upcase
+      return cached unless cached.empty?
 
       inst = client.grpc_instruments.get_instrument_by(:figi, figi)
       tk = inst&.ticker.to_s.strip.upcase
@@ -159,8 +172,20 @@ module TradingLogic
           next
         end
 
+        # Покупаем только на откате: momentum + intraday dip
+        unless logic.dip_today?(figi)
+          warn "DEBUG: skip #{tk} — momentum OK but no intraday dip"
+          next
+        end
+
         if pending_order_active?(state, tk)
           warn "DEBUG: BUY skipped for #{tk} — active pending order cooldown"
+          next
+        end
+
+        buy_value = price * lot * lots_per_order
+        unless position_within_limit?(client, account_id, figi, planned_buy_value: buy_value)
+          warn "DEBUG: BUY skipped for #{tk} — position share limit reached"
           next
         end
 
@@ -189,17 +214,27 @@ module TradingLogic
       false
     end
 
-    def try_sell_positions_with_logic!(client, logic, account_id, state)
+    def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side)
       port = client.grpc_operations.portfolio(account_id: account_id)
       positions = port.positions
       positions.each do |p|
         figi = p.figi
+
+        # Пропускаем не-акции (валюта, облигации, фонды)
+        if p.respond_to?(:instrument_type)
+          inst_type = p.instrument_type.to_s.upcase
+          unless inst_type.include?('SHARE')
+            warn "DEBUG: SELL skip non-share position figi=#{figi} type=#{inst_type}"
+            next
+          end
+        end
+
         qty_units = p.quantity.units.to_i
         next if qty_units <= 0
 
-        ticker = resolve_ticker_for_sell(client, figi: figi)
+        ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache)
         unless ticker
-          warn "ERROR: SELL ticker resolution failed payload=#{ { figi: figi, qty_units: qty_units }.to_json }"
+          warn "DEBUG: SELL ticker resolution failed (likely non-share) figi=#{figi} qty=#{qty_units}"
           next
         end
 
@@ -214,7 +249,7 @@ module TradingLogic
         lot = inst&.lot.to_i
         lot = 1 if lot <= 0
         it = { figi: figi, ticker: ticker, lot: lot }
-        next unless logic.should_sell?(p, it)
+        next unless logic.should_sell?(p, it, trend: trend)
 
         sell_qty = [qty_units, lot].min
         resp = logic.confirm_and_place_order(
@@ -267,6 +302,66 @@ module TradingLogic
 
       cooldown = (ENV['BUY_PENDING_COOLDOWN_MIN'] || '10').to_i * 60
       (Time.now.utc - ts) < cooldown
+    end
+
+    # Проверяет, не превысит ли позиция по figi долю портфеля после покупки.
+    # planned_buy_value — стоимость планируемой покупки (qty * price), включается в расчёт.
+    # portfolio — предзагруженный портфель (чтобы не дёргать API повторно).
+    def position_within_limit?(client, account_id, figi, max_share: nil, planned_buy_value: 0, portfolio: nil)
+      max_share ||= (ENV['MAX_POSITION_SHARE'] || '0.33').to_f
+      return true if max_share <= 0 || max_share >= 1.0
+
+      port = portfolio || client.grpc_operations.portfolio(account_id: account_id)
+      total = Utils.q_to_decimal(port.total_amount_shares)
+      return true unless total && total > 0
+
+      position = port.positions.find { |p| p.figi == figi }
+      current_value = 0.0
+      if position
+        qty = position.quantity.units.to_i
+        if qty > 0
+          cur_price = position.respond_to?(:current_price) ? Utils.q_to_decimal(position.current_price) : nil
+          cur_price ||= Utils.q_to_decimal(position.average_position_price)
+          current_value = qty * cur_price if cur_price && cur_price > 0
+        end
+      end
+
+      post_trade_value = current_value + planned_buy_value.to_f
+      post_trade_total = total + planned_buy_value.to_f
+      share = post_trade_value / post_trade_total
+      if share >= max_share
+        warn "DEBUG: position limit reached for figi=#{figi} post_trade_share=#{(share * 100).round(1)}% >= #{(max_share * 100).round(1)}%"
+        return false
+      end
+      true
+    rescue
+      true
+    end
+
+    def cleanup_pending_orders!(client, account_id, state)
+      ensure_state_defaults!(state)
+      pending = state['pending_orders']
+      return if pending.empty?
+
+      active_order_ids = begin
+        resp = client.grpc_orders.get_orders(account_id: account_id)
+        orders = resp.respond_to?(:orders) ? resp.orders : []
+        Set.new(orders.map { |o|
+          o.respond_to?(:order_id) ? o.order_id.to_s : nil
+        }.compact)
+      rescue
+        return
+      end
+
+      pending.delete_if do |ticker, info|
+        order_id = info['client_order_id'].to_s
+        next false if order_id.empty?
+
+        unless active_order_ids.include?(order_id)
+          warn "DEBUG: cleaned up pending order for #{ticker} (order_id=#{order_id})"
+          true
+        end
+      end
     end
 
     def sync_pending_order!(state, ticker, result)

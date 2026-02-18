@@ -58,11 +58,35 @@ RSpec.describe TradingLogic::Runner do
   end
 
   describe 'selling helpers' do
-    it 'should_sell? returns true when current >= avg * 1.10' do
+    it 'should_sell? returns true when current >= avg * 1.10 (default side threshold 1.04)' do
       position = OpenStruct.new(quantity: OpenStruct.new(units: 2), average_position_price: q(100))
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(110))]))
       it_hash = { figi: 'F' }
       expect(subject.should_sell?(position, it_hash)).to be true
+    end
+
+    it 'should_sell? uses lower threshold for :down trend' do
+      position = OpenStruct.new(quantity: OpenStruct.new(units: 2), average_position_price: q(100))
+      # price 103 => 1.03 ratio, above DOWN threshold (1.02) but below SIDE (1.04)
+      allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(103))]))
+      it_hash = { figi: 'F' }
+      expect(subject.should_sell?(position, it_hash, trend: :down)).to be true
+      expect(subject.should_sell?(position, it_hash, trend: :side)).to be false
+    end
+
+    it 'should_sell? uses higher threshold for :up trend' do
+      position = OpenStruct.new(quantity: OpenStruct.new(units: 2), average_position_price: q(100))
+      # price 105 => 1.05 ratio, above SIDE (1.04) but below UP (1.10)
+      allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(105))]))
+      it_hash = { figi: 'F' }
+      expect(subject.should_sell?(position, it_hash, trend: :up)).to be false
+      expect(subject.should_sell?(position, it_hash, trend: :side)).to be true
+    end
+
+    it 'sell_threshold_for_trend respects ENV overrides' do
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with('SELL_THRESHOLD_DOWN').and_return('1.05')
+      expect(subject.sell_threshold_for_trend(:down)).to eq(1.05)
     end
 
     it 'profit_multiple and should_force_exit? works' do
