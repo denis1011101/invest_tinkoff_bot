@@ -63,6 +63,7 @@ module TradingLogic
 
     def load_config
       return {} unless File.exist?(CONFIG_PATH)
+
       JSON.parse(File.read(CONFIG_PATH))
     rescue JSON::ParserError
       {}
@@ -90,10 +91,12 @@ module TradingLogic
 
     def fetch_prices(figis)
       return {} if figis.empty?
+
       resp = @client.grpc_market_data.last_prices(figis: figis)
       prices = {}
       resp.last_prices.each do |lp|
-        next unless lp&.figi && lp&.price
+        next unless lp&.figi && lp.price
+
         prices[lp.figi] = Utils.q_to_decimal(lp.price)
       end
       prices
@@ -104,6 +107,7 @@ module TradingLogic
 
     def load_previous_prices
       return {} unless File.exist?(STATE_PATH)
+
       data = JSON.parse(File.read(STATE_PATH))
       data['prices'] || {}
     rescue JSON::ParserError
@@ -115,9 +119,9 @@ module TradingLogic
       results.each { |r| prices[r[:query]] = r[:price] }
       FileUtils.mkdir_p(File.dirname(STATE_PATH))
       File.write(STATE_PATH, JSON.pretty_generate({
-        'updated_at' => yek_now.iso8601,
-        'prices' => prices
-      }))
+                                                    'updated_at' => yek_now.iso8601,
+                                                    'prices' => prices
+                                                  }))
     end
 
     def yek_now
@@ -145,6 +149,7 @@ module TradingLogic
 
     def format_price(price)
       return '?' unless price
+
       price >= 100 ? price.round(1).to_s : price.round(2).to_s
     end
 
@@ -159,7 +164,7 @@ module TradingLogic
                 '—'
               end
 
-      sign = delta > 0 ? '+' : ''
+      sign = delta.positive? ? '+' : ''
       d = escape_md("#{sign}#{format_price(delta)}")
       p = escape_md("#{sign}#{delta_pct.round(2)}%")
       "#{arrow} #{d} \\(#{p}\\)"

@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require_relative 'spec_helper'
 require_relative '../lib/strategy_helpers'
 require 'tempfile'
@@ -193,12 +195,12 @@ RSpec.describe TradingLogic::StrategyHelpers do
       port = make_portfolio(total_shares: 10_000, positions: [pos])
       # Without planned buy: 3000/10000 = 30% < 33% => would pass
       expect(described_class.position_within_limit?(
-        nil, nil, 'F1', portfolio: port, planned_buy_value: 0, max_share: 0.33
-      )).to be true
+               nil, nil, 'F1', portfolio: port, planned_buy_value: 0, max_share: 0.33
+             )).to be true
       # With planned buy of 500: (3000+500)/(10000+500) = 33.3% >= 33% => should fail
       expect(described_class.position_within_limit?(
-        nil, nil, 'F1', portfolio: port, planned_buy_value: 500, max_share: 0.33
-      )).to be false
+               nil, nil, 'F1', portfolio: port, planned_buy_value: 500, max_share: 0.33
+             )).to be false
     end
   end
 end

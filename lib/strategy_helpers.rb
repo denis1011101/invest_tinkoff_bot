@@ -2,31 +2,35 @@
 
 require 'json'
 require 'time'
-require 'set'
 require_relative 'utils'
 
 module TradingLogic
-  module StrategyHelpers
+  module StrategyHelpers # rubocop:disable Metrics/ModuleLength
     module_function
 
     def load_cache_normalized(path)
       return [] unless File.exist?(path)
 
-      raw = JSON.parse(File.read(path)) rescue {}
+      raw = begin
+        JSON.parse(File.read(path))
+      rescue StandardError
+        {}
+      end
       arr = raw['instruments'] || raw['instruments_list'] || []
       arr.map do |h|
         # поддерживаем разные форматы: string keys or symbol keys
         hh = h.transform_keys(&:to_s)
         ticker = hh['ticker'] || hh['secid'] || hh['seccode'] || hh['seccode_short']
         figi   = hh['figi'] || hh['FIGI'] || nil
-        { 'ticker' => ticker && ticker.to_s, 'figi' => figi, 'raw' => hh }
+        { 'ticker' => ticker&.to_s, 'figi' => figi, 'raw' => hh }
       end.compact
     end
 
     def read_json(path)
       return {} unless File.exist?(path)
+
       JSON.parse(File.read(path))
-    rescue
+    rescue StandardError
       {}
     end
 
@@ -59,21 +63,27 @@ module TradingLogic
       closes = Utils.last_daily_closes(client, figi, days: 5)
       return false unless closes && closes.size >= 3
 
-      a, b, c = closes[-3], closes[-2], closes[-1]
+      a = closes[-3]
+      b = closes[-2]
+      c = closes[-1]
       a < b && b < c
     end
 
     def find_instrument_by_ticker(client, ticker)
       resp = client.grpc_instruments.find_instrument(query: ticker.to_s)
       resp.instruments.first
-    rescue
+    rescue StandardError
       nil
     end
 
     def build_figi_ticker_map(cache_path)
       return {} unless File.exist?(cache_path)
 
-      data = JSON.parse(File.read(cache_path)) rescue {}
+      data = begin
+        JSON.parse(File.read(cache_path))
+      rescue StandardError
+        {}
+      end
       (data['instruments'] || []).each_with_object({}) do |h, map|
         map[h['figi']] = h['ticker'] if h['figi'] && h['ticker']
       end
@@ -90,12 +100,13 @@ module TradingLogic
       inst = client.grpc_instruments.get_instrument_by(:figi, figi)
       tk = inst&.ticker.to_s.strip.upcase
       tk.empty? ? nil : tk
-    rescue
+    rescue StandardError
       nil
     end
 
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
-    def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:, max_lot_rub:, lots_per_order: 1, account_id:)
+    def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:, # rubocop:disable Metrics
+                                            max_lot_rub:, account_id:, lots_per_order: 1)
       market = load_cache_normalized(market_cache_path)
       index  = load_cache_normalized(moex_index_cache_path)
 
@@ -110,9 +121,14 @@ module TradingLogic
 
       return false if inter.empty?
 
-      inter.each do |tk|
+      inter.each do |tk| # rubocop:disable Metrics/BlockLength
         warn "DEBUG: processing candidate #{tk}"
-        next if acted_today?(state, 'last_buy', tk) rescue (warn("DEBUG: acted_today? failed for #{tk}"); false)
+        begin
+          next if acted_today?(state, 'last_buy', tk)
+        rescue StandardError
+          (warn("DEBUG: acted_today? failed for #{tk}")
+           false)
+        end
 
         item = market.find { |m| m['ticker'] == tk } || {}
         warn "DEBUG: market item for #{tk} => #{item.keys.inspect}"
@@ -120,10 +136,14 @@ module TradingLogic
         figi = item['figi']
         if figi.nil?
           begin
-            r = client.grpc_instruments.find_instrument(query: tk) rescue nil
+            r = begin
+              client.grpc_instruments.find_instrument(query: tk)
+            rescue StandardError
+              nil
+            end
             figi = r&.instruments&.first&.figi
             warn "DEBUG: resolved figi for #{tk} => #{figi.inspect}"
-          rescue => e
+          rescue StandardError => e
             warn "DEBUG: find_instrument(#{tk}) error: #{e.class}: #{e.message}"
             figi = nil
           end
@@ -140,11 +160,11 @@ module TradingLogic
         begin
           resp = client.grpc_market_data.candles(
             figi: figi,
-            from: (Time.now.utc - 8 * 86_400),
+            from: (Time.now.utc - (8 * 86_400)),
             to: Time.now.utc,
             interval: ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
           )
-        rescue => e
+        rescue StandardError => e
           warn "DEBUG: candles request failed for #{tk}/#{figi}: #{e.class}: #{e.message}"
           next
         end
@@ -157,17 +177,20 @@ module TradingLogic
           next
         end
 
-        a, b, c, d = closes[-4], closes[-3], closes[-2], closes[-1]
+        a = closes[-4]
+        b = closes[-3]
+        c = closes[-2]
+        d = closes[-1]
         unless a < b && b < c && c < d
-          warn "DEBUG: skip #{tk} — not 3-day momentum (#{[a,b,c,d].map { |v| v.round(2) }.inspect})"
+          warn "DEBUG: skip #{tk} — not 3-day momentum (#{[a, b, c, d].map { |v| v.round(2) }.inspect})"
           next
         end
 
-        lot = item['raw'] && (item['raw']['lot'] || item['raw']['LOT']) || 1
+        lot = (item['raw'] && (item['raw']['lot'] || item['raw']['LOT'])) || 1
         price = logic.last_price_for(figi) || (item['raw'] && item['raw']['price'])
         warn "DEBUG: #{tk} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{(price && lot ? price * lot : nil).inspect}"
 
-        unless price && lot && (price * lot * lots_per_order <= (max_lot_rub || 1_0_000))
+        unless price && lot && (price * lot * lots_per_order <= (max_lot_rub || 10_000))
           warn "DEBUG: skip #{tk} — price/lot missing or too expensive"
           next
         end
@@ -189,14 +212,19 @@ module TradingLogic
           next
         end
 
-        result = logic.confirm_and_place_order_with_result(
-          account_id: account_id,
-          figi: figi,
-          quantity: lot * lots_per_order,
-          price: price,
-          direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
-          order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
-        ) rescue { ok: false, category: :api_error, status: 'api_error', reject_reason: 'unexpected error', error_code: 'UNKNOWN' }
+        result = begin
+          logic.confirm_and_place_order_with_result(
+            account_id: account_id,
+            figi: figi,
+            quantity: lot * lots_per_order,
+            price: price,
+            direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
+            order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
+          )
+        rescue StandardError
+          { ok: false, category: :api_error, status: 'api_error', reject_reason: 'unexpected error',
+            error_code: 'UNKNOWN' }
+        end
 
         sync_pending_order!(state, tk, result)
 
@@ -204,7 +232,11 @@ module TradingLogic
         if successful_buy
           resp_order = result[:response]
           warn "DEBUG: BUY accepted for #{tk} (figi=#{figi}) order_id=#{resp_order&.order_id}"
-          mark_action!(state, 'last_buy', tk) rescue nil
+          begin
+            mark_action!(state, 'last_buy', tk)
+          rescue StandardError
+            nil
+          end
           return true
         end
 
@@ -217,7 +249,7 @@ module TradingLogic
     def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side)
       port = client.grpc_operations.portfolio(account_id: account_id)
       positions = port.positions
-      positions.each do |p|
+      positions.each do |p| # rubocop:disable Metrics/BlockLength
         figi = p.figi
 
         # Пропускаем не-акции (валюта, облигации, фонды)
@@ -242,7 +274,7 @@ module TradingLogic
 
         inst = begin
           client.grpc_instruments.get_instrument_by(:figi, figi)
-        rescue
+        rescue StandardError
           nil
         end
 
@@ -252,14 +284,18 @@ module TradingLogic
         next unless logic.should_sell?(p, it, trend: trend)
 
         sell_qty = [qty_units, lot].min
-        resp = logic.confirm_and_place_order(
-          account_id: account_id,
-          figi: figi,
-          quantity: sell_qty,
-          price: logic.last_price_for(figi),
-          direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
-          order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
-        ) rescue nil
+        resp = begin
+          logic.confirm_and_place_order(
+            account_id: account_id,
+            figi: figi,
+            quantity: sell_qty,
+            price: logic.last_price_for(figi),
+            direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
+            order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
+          )
+        rescue StandardError
+          nil
+        end
         if resp
           puts "SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})"
           mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'signal')
@@ -273,10 +309,9 @@ module TradingLogic
       return default_state unless File.exist?(path)
 
       ensure_state_defaults!(JSON.parse(File.read(path)))
-    rescue
+    rescue StandardError
       default_state
     end
-
 
     def default_state
       { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {} }
@@ -297,7 +332,11 @@ module TradingLogic
       status = pending['status'].to_s
       return false unless %w[sent_not_filled partially_filled].include?(status)
 
-      ts = Time.parse(pending['ts'].to_s) rescue nil
+      ts = begin
+        Time.parse(pending['ts'].to_s)
+      rescue StandardError
+        nil
+      end
       return false unless ts
 
       cooldown = (ENV['BUY_PENDING_COOLDOWN_MIN'] || '10').to_i * 60
@@ -313,16 +352,16 @@ module TradingLogic
 
       port = portfolio || client.grpc_operations.portfolio(account_id: account_id)
       total = Utils.q_to_decimal(port.total_amount_shares)
-      return true unless total && total > 0
+      return true unless total&.positive?
 
       position = port.positions.find { |p| p.figi == figi }
       current_value = 0.0
       if position
         qty = position.quantity.units.to_i
-        if qty > 0
+        if qty.positive?
           cur_price = position.respond_to?(:current_price) ? Utils.q_to_decimal(position.current_price) : nil
           cur_price ||= Utils.q_to_decimal(position.average_position_price)
-          current_value = qty * cur_price if cur_price && cur_price > 0
+          current_value = qty * cur_price if cur_price&.positive?
         end
       end
 
@@ -334,7 +373,7 @@ module TradingLogic
         return false
       end
       true
-    rescue
+    rescue StandardError
       true
     end
 
@@ -346,12 +385,13 @@ module TradingLogic
       active_order_ids = begin
         resp = client.grpc_orders.get_orders(account_id: account_id)
         orders = resp.respond_to?(:orders) ? resp.orders : []
-        Set.new(orders.map { |o|
+        Set.new(orders.filter_map do |o|
           o.respond_to?(:order_id) ? o.order_id.to_s : nil
-        }.compact)
-      rescue
-        return
+        end)
+      rescue StandardError
+        nil
       end
+      return unless active_order_ids
 
       pending.delete_if do |ticker, info|
         order_id = info['client_order_id'].to_s
@@ -371,7 +411,6 @@ module TradingLogic
         case category
         when 'sent_not_filled' then 'sent_not_filled'
         when 'partially_filled' then 'partially_filled'
-        else nil
         end
 
       if pending_status
@@ -454,7 +493,7 @@ module TradingLogic
 
       restore_pending_buy_orders!(client, account_id, state)
       state
-    rescue => e
+    rescue StandardError => e
       warn "ERROR: state restore from broker failed: #{e.class}: #{e.message}"
       state
     end
@@ -471,7 +510,7 @@ module TradingLogic
         return true if entry.is_a?(Hash) && entry['ts'].to_s.start_with?(day)
 
         # backward compatibility with legacy format { day => { ticker => true } }
-        return ((sell[day] || {})[ticker] == true)
+        return (sell[day] || {})[ticker] == true
       end
 
       ((state[action] || {})[day] || {})[ticker] == true
@@ -496,7 +535,7 @@ module TradingLogic
 
     def state_last_sell_count_for_day(state, day: today_key)
       sell = state['last_sell'] || {}
-      return (sell[day] || {}).keys.size if sell[day].is_a?(Hash) && !sell.values.any? { |v| v.is_a?(Hash) && v['ts'] }
+      return (sell[day] || {}).keys.size if sell[day].is_a?(Hash) && sell.values.none? { |v| v.is_a?(Hash) && v['ts'] }
 
       sell.values.count { |v| v.is_a?(Hash) && v['ts'].to_s.start_with?(day) }
     end
@@ -519,11 +558,10 @@ module TradingLogic
         value = if op.respond_to?(:type) then op.type
                 elsif op.respond_to?(:operation_type) then op.operation_type
                 elsif op.respond_to?(:state) then op.state
-                else nil
                 end
         value.to_s.upcase.include?('SELL')
       end
-    rescue => e
+    rescue StandardError => e
       warn "ERROR: broker sell consistency check failed: #{e.class}: #{e.message}"
       nil
     end
@@ -538,7 +576,7 @@ module TradingLogic
       warn "ERROR: sell consistency mismatch broker=#{broker_count} state_last_sell=#{state_count}"
     end
 
-    def restore_pending_buy_orders!(client, account_id, state)
+    def restore_pending_buy_orders!(client, account_id, state) # rubocop:disable Metrics/PerceivedComplexity
       ensure_state_defaults!(state)
       return unless client.respond_to?(:grpc_orders)
 
@@ -580,8 +618,6 @@ module TradingLogic
                             ord.order_id
                           elsif ord.respond_to?(:order_request_id)
                             ord.order_request_id
-                          else
-                            nil
                           end
 
         state['pending_orders'][ticker] = {
@@ -591,7 +627,7 @@ module TradingLogic
           'status' => pending_status
         }
       end
-    rescue => e
+    rescue StandardError => e
       warn "ERROR: pending orders restore failed: #{e.class}: #{e.message}"
     end
 
@@ -599,7 +635,6 @@ module TradingLogic
       raw = if op.respond_to?(:type) then op.type
             elsif op.respond_to?(:operation_type) then op.operation_type
             elsif op.respond_to?(:state) then op.state
-            else nil
             end
       val = raw.to_s.upcase
       return :buy if val.include?('BUY')
@@ -613,9 +648,12 @@ module TradingLogic
         if op.respond_to?(:date) then op.date
         elsif op.respond_to?(:time) then op.time
         elsif op.respond_to?(:timestamp) then op.timestamp
-        else nil
         end
-      t = Time.parse(candidate.to_s).utc rescue Time.now.utc
+      t = begin
+        Time.parse(candidate.to_s).utc
+      rescue StandardError
+        Time.now.utc
+      end
       t.iso8601
     end
   end

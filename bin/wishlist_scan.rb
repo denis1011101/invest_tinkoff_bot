@@ -20,8 +20,8 @@ results = if ARGV[0]
             scanner.scan_all
           end
 
-bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV['TELEGRAM_BOT_TOKEN']
-chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV['TELEGRAM_CHAT_ID']
+bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV.fetch('TELEGRAM_BOT_TOKEN', nil)
+chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV.fetch('TELEGRAM_CHAT_ID', nil)
 
 if bot_token && chat_id && !bot_token.empty? && !chat_id.empty?
   scanner.notify_telegram(results, bot_token: bot_token, chat_id: chat_id)

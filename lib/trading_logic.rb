@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require 'securerandom'
 require 'time'
 require 'net/http'
@@ -62,7 +64,7 @@ module TradingLogic
 
     def figi_and_lot(ticker, class_code: 'TQBR')
       resp = Utils.safe_share_by_ticker(@client, ticker, class_code: class_code)
-      return [nil, nil] unless resp && resp.instrument
+      return [nil, nil] unless resp&.instrument
 
       [resp.instrument.figi, resp.instrument.lot]
     end
@@ -76,7 +78,7 @@ module TradingLogic
 
     def prev_close_for(figi)
       resp = Utils.fetch_candles(@client, figi: figi, from: Utils.days_ago(3), to: Utils.now_utc, interval: DAY)
-      candles = resp && resp.candles
+      candles = resp&.candles
       return nil unless candles && candles.size >= 2
 
       Utils.q_to_decimal(candles[-2].close)
@@ -86,7 +88,7 @@ module TradingLogic
     def today_high(figi)
       from = Utils.today_utc_start
       resp = Utils.fetch_candles(@client, figi: figi, from: from, to: Utils.now_utc, interval: MIN_5)
-      highs = resp && resp.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.high) }.compact : []
+      highs = resp&.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.high) }.compact : []
       return nil if highs.empty?
 
       highs.max
@@ -107,7 +109,7 @@ module TradingLogic
         interval: DAY
       )
 
-      candles = resp && resp.candles ? resp.candles : []
+      candles = resp&.candles ? resp.candles : []
       return nil if candles.size < (lookback + 1)
 
       volumes = candles.map { |c| c.volume.to_f }.compact
@@ -126,7 +128,7 @@ module TradingLogic
     # Денежный объём за текущий день по дневной свече: close * volume
     def daily_turnover_rub(figi)
       resp = Utils.fetch_candles(@client, figi: figi, from: Utils.days_ago(3), to: Utils.now_utc, interval: DAY)
-      candle = resp && resp.candles ? resp.candles.last : nil
+      candle = resp&.candles&.last
       return nil unless candle
 
       close = Utils.q_to_decimal(candle.close)
@@ -137,7 +139,7 @@ module TradingLogic
     end
 
     def volume_spike?(figi)
-      return true unless @min_relative_volume && @min_relative_volume.positive?
+      return true unless @min_relative_volume&.positive?
 
       rvol = relative_daily_volume(figi)
       rvol && rvol >= @min_relative_volume
@@ -158,11 +160,14 @@ module TradingLogic
       return :side unless index_figi
 
       resp = Utils.fetch_candles(@client, figi: index_figi, from: Utils.days_ago(6), to: Utils.now_utc, interval: DAY)
-      closes = resp && resp.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.close) }.compact : []
+      closes = resp&.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.close) }.compact : []
       return :side if closes.size < 4
 
       # последние 4 закрытия => последние 3 изменения
-      a, b, c, d = closes[-4], closes[-3], closes[-2], closes[-1]
+      a = closes[-4]
+      b = closes[-3]
+      c = closes[-2]
+      d = closes[-1]
       return :up   if a < b && b < c && c < d
       return :down if a > b && b > c && c > d
 
@@ -173,39 +178,37 @@ module TradingLogic
       volume_enabled = volume_features_enabled?
 
       @tickers.map do |t|
-        begin
-          figi, lot = figi_and_lot(t)
-          # skip if API lot count exceeds configured max_lot_count
-          if @max_lot_count && lot.to_i > @max_lot_count.to_i
-            warn "build_universe: skipping #{t} — lot=#{lot} > max_lot_count=#{@max_lot_count}"
-            next
-          end
-          price = last_price_for(figi)
-          next unless price && lot
-
-          h = {
-            ticker: t,
-            figi: figi,
-            lot: lot.to_i,
-            price: price,
-            price_per_lot: price * lot.to_i
-          }
-
-          if volume_enabled
-            h[:relative_volume] = relative_daily_volume(figi)
-            h[:daily_turnover_rub] = daily_turnover_rub(figi)
-          end
-
-          # фильтр по цене лота, если нужен
-          if @max_lot
-            total_price = h[:price_per_lot] * (@lots_per_order || 1)
-            h if total_price <= @max_lot
-          else
-            h
-          end
-        rescue StandardError
-          nil
+        figi, lot = figi_and_lot(t)
+        # skip if API lot count exceeds configured max_lot_count
+        if @max_lot_count && lot.to_i > @max_lot_count.to_i
+          warn "build_universe: skipping #{t} — lot=#{lot} > max_lot_count=#{@max_lot_count}"
+          next
         end
+        price = last_price_for(figi)
+        next unless price && lot
+
+        h = {
+          ticker: t,
+          figi: figi,
+          lot: lot.to_i,
+          price: price,
+          price_per_lot: price * lot.to_i
+        }
+
+        if volume_enabled
+          h[:relative_volume] = relative_daily_volume(figi)
+          h[:daily_turnover_rub] = daily_turnover_rub(figi)
+        end
+
+        # фильтр по цене лота, если нужен
+        if @max_lot
+          total_price = h[:price_per_lot] * (@lots_per_order || 1)
+          h if total_price <= @max_lot
+        else
+          h
+        end
+      rescue StandardError
+        nil
       end.compact
     end
 
@@ -227,7 +230,7 @@ module TradingLogic
     end
 
     def volume_features_enabled?
-      (@min_relative_volume && @min_relative_volume.positive?) || %w[relative turnover].include?(@volume_compare_mode)
+      @min_relative_volume&.positive? || %w[relative turnover].include?(@volume_compare_mode)
     end
 
     # Продаём, если текущая цена >= средней покупки * порог.
@@ -268,20 +271,21 @@ module TradingLogic
       result[:response]
     end
 
-    def confirm_and_place_order_with_result(account_id:, figi:, quantity:, price:, direction:, order_type:, max_retries: 2, retry_delay_seconds: 1)
-      side = (direction == ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY) ? 'BUY' : 'SELL'
+    def confirm_and_place_order_with_result(account_id:, figi:, quantity:, price:, direction:, order_type:,
+                                            max_retries: 2, retry_delay_seconds: 1)
+      side = direction == ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY ? 'BUY' : 'SELL'
       prompt = "*Confirm #{side}*\nfigi: #{figi}\nqty: #{quantity}\nprice: #{price}\naccount: #{account_id}"
 
       # Если переменная окружения AUTO_CONFIRM установлена в "1" или "true",
       # пропускаем подтверждение и сразу размещаем ордер.
-      if ENV['AUTO_CONFIRM'] == '1' || ENV['AUTO_CONFIRM'] == 'true'
-        confirmed = true
-      elsif @telegram && @telegram.respond_to?(:confirm?)
-        confirmed = @telegram.confirm?(prompt, timeout: 120)
-      else
-        # Если нет Telegram-клиента, и AUTO_CONFIRM не включён — считаем как не подтверждённое.
-        confirmed = false
-      end
+      confirmed = if %w[1 true].include?(ENV['AUTO_CONFIRM'])
+                    true
+                  elsif @telegram.respond_to?(:confirm?)
+                    @telegram.confirm?(prompt, timeout: 120)
+                  else
+                    # Если нет Telegram-клиента, и AUTO_CONFIRM не включён — считаем как не подтверждённое.
+                    false
+                  end
 
       return { ok: false, category: :not_sent, status: 'not_sent', response: nil } unless confirmed
 
@@ -314,7 +318,7 @@ module TradingLogic
           reject_reason: reject_reason,
           error_code: error_code
         }
-      rescue => e
+      rescue StandardError => e
         technical = technical_api_error?(e)
         if technical && attempts <= max_retries
           warn "post_order retry ##{attempts} due to technical API error: #{e.class}: #{e.message}"
@@ -388,7 +392,7 @@ module TradingLogic
     def profit_multiple(position, figi)
       avg = Utils.q_to_decimal(position.average_position_price)
       cur = last_price_for(figi)
-      return nil unless avg && cur && avg > 0
+      return nil unless avg && cur && avg.positive?
 
       cur / avg
     end

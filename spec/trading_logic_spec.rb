@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require_relative 'spec_helper'
 require_relative '../lib/trading_logic'
 
@@ -112,14 +114,16 @@ RSpec.describe TradingLogic::Runner do
     it 'filters out by max_lot_rub' do
       # set tiny max_lot to force filter
       runner = described_class.new(client, tickers: %w[SBER], max_lot_rub: 10.0)
-      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: OpenStruct.new(figi: 'F1', lot: 1)))
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: OpenStruct.new(figi: 'F1',
+                                                                                                           lot: 1)))
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
       expect(runner.build_universe).to eq([])
     end
 
     it 'does not request volume metrics when volume features are disabled' do
       runner = described_class.new(client, tickers: %w[SBER], volume_compare_mode: 'none')
-      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: OpenStruct.new(figi: 'F1', lot: 1)))
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: OpenStruct.new(figi: 'F1',
+                                                                                                           lot: 1)))
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
 
       expect(runner).not_to receive(:relative_daily_volume)
@@ -128,7 +132,6 @@ RSpec.describe TradingLogic::Runner do
       runner.build_universe
     end
   end
-
 
   describe '#relative_daily_volume' do
     it 'uses exactly configured lookback window and returns nil if not enough daily candles' do

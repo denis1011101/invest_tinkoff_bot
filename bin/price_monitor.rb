@@ -18,12 +18,16 @@ if results.empty?
 end
 
 results.each do |r|
-  delta_str = r[:delta] ? " (#{r[:delta] > 0 ? '+' : ''}#{r[:delta].round(2)})" : ''
+  delta_str = if r[:delta]
+                " (#{'+' if r[:delta].positive?}#{r[:delta].round(2)})"
+              else
+                ''
+              end
   puts "#{r[:label]}: #{r[:price].round(2)}#{delta_str}"
 end
 
-bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV['TELEGRAM_BOT_TOKEN']
-chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV['TELEGRAM_CHAT_ID']
+bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV.fetch('TELEGRAM_BOT_TOKEN', nil)
+chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV.fetch('TELEGRAM_CHAT_ID', nil)
 
 if bot_token && chat_id && !bot_token.empty? && !chat_id.empty?
   monitor.notify_telegram(results, bot_token: bot_token, chat_id: chat_id)

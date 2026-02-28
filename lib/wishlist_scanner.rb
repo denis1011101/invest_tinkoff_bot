@@ -11,14 +11,15 @@ require_relative 'telegram_helper'
 module TradingLogic
   class WishlistScanner
     include TelegramHelper
+
     WISHLISTS_DIR = File.expand_path('../tmp/wishlists', __dir__)
     RESULTS_DIR   = File.expand_path('../tmp/wishlist_results', __dir__)
     DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
 
     CONDITION_METHODS = {
-      '52day_low'      => :scan_52day_low,
-      'growth_months'  => :scan_growth_months,
-      'below_sma'      => :scan_below_sma,
+      '52day_low' => :scan_52day_low,
+      'growth_months' => :scan_growth_months,
+      'below_sma' => :scan_below_sma,
       'drop_from_high' => :scan_drop_from_high
     }.freeze
 
@@ -67,7 +68,7 @@ module TradingLogic
     private
 
     def wishlist_files
-      Dir.glob(File.join(WISHLISTS_DIR, '*.json')).sort
+      Dir.glob(File.join(WISHLISTS_DIR, '*.json'))
     end
 
     def resolve_universe(universe_spec)
@@ -80,23 +81,22 @@ module TradingLogic
         universe_spec.filter_map do |ticker|
           resp = Utils.safe_share_by_ticker(@client, ticker)
           next unless resp&.instrument
+
           { 'ticker' => ticker, 'figi' => resp.instrument.figi }
         end
-      else
-        @market_cache.load_market_cache.map { |h| { 'ticker' => h['ticker'], 'figi' => h['figi'] } }
+      else # defaults to market_cache
+        resolve_universe('market_cache')
       end
     end
 
     def daily_closes(figi, days:)
-      if @candle_cache[figi] && @candle_cache[figi].size >= days
-        return @candle_cache[figi]
-      end
+      return @candle_cache[figi] if @candle_cache[figi] && @candle_cache[figi].size >= days
 
       calendar_days = [days * 2, days + 30].max
       from = Utils.days_ago(calendar_days)
       to = Utils.now_utc
       resp = Utils.fetch_candles(@client, figi: figi, from: from, to: to, interval: DAY)
-      sleep @candle_sleep if @candle_sleep > 0
+      sleep @candle_sleep if @candle_sleep.positive?
       closes = if resp&.candles
                  resp.candles.map { |c| Utils.q_to_decimal(c.close) }.compact
                else
@@ -113,12 +113,15 @@ module TradingLogic
       scored = universe.filter_map do |inst|
         closes = daily_closes(inst['figi'], days: days)
         next if closes.size < days
+
         recent = closes.last(days)
         min_price = recent.min
         current = recent.last
-        next unless min_price && current && min_price > 0
+        next unless min_price && current && min_price.positive?
+
         pct_above_low = (current - min_price) / min_price * 100.0
         next if pct_above_low > 5.0
+
         inst.merge(
           'score' => pct_above_low,
           'price' => current,
@@ -134,10 +137,13 @@ module TradingLogic
       scored = universe.filter_map do |inst|
         closes = daily_closes(inst['figi'], days: days_needed + 5)
         next if closes.size < days_needed
-        monthly_closes = (0..months).map { |i| closes[-(1 + i * 22)] }.reverse.compact
+
+        monthly_closes = (0..months).map { |i| closes[-(1 + (i * 22))] }.reverse.compact
         next if monthly_closes.size < months + 1
+
         growing = monthly_closes.each_cons(2).all? { |a, b| b > a }
         next unless growing
+
         total_growth = (monthly_closes.last - monthly_closes.first) / monthly_closes.first * 100.0
         inst.merge(
           'score' => -total_growth,
@@ -153,9 +159,11 @@ module TradingLogic
       scored = universe.filter_map do |inst|
         closes = daily_closes(inst['figi'], days: period + 5)
         next if closes.size < period
+
         sma = closes.last(period).sum / period.to_f
         current = closes.last
         next unless current < sma
+
         gap_pct = (sma - current) / sma * 100.0
         inst.merge(
           'score' => -gap_pct,
@@ -172,12 +180,15 @@ module TradingLogic
       scored = universe.filter_map do |inst|
         closes = daily_closes(inst['figi'], days: days)
         next if closes.size < days
+
         recent = closes.last(days)
         high = recent.max
         current = recent.last
-        next unless high && current && high > 0
+        next unless high && current && high.positive?
+
         drop_pct = (high - current) / high * 100.0
         next if drop_pct < min_drop
+
         inst.merge(
           'score' => -drop_pct,
           'price' => current,
@@ -195,10 +206,10 @@ module TradingLogic
       slug = 'wishlist' if slug.empty?
       path = File.join(RESULTS_DIR, "#{slug}_#{Time.now.utc.strftime('%Y%m%d')}.json")
       File.write(path, JSON.pretty_generate({
-        'scanned_at' => Time.now.utc.iso8601,
-        'config' => config,
-        'matches' => matches
-      }))
+                                              'scanned_at' => Time.now.utc.iso8601,
+                                              'config' => config,
+                                              'matches' => matches
+                                            }))
     end
 
     def format_telegram_message(header, matches)

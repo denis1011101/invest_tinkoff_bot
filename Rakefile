@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require 'rake'
 require 'bundler/setup'
 require 'dotenv/load'
@@ -19,7 +21,7 @@ namespace :market_cache do
     force = ENV['FORCE'] == 'true'
     mc = TradingLogic::MarketCache.new(client)
     ok = mc.refresh_market_cache(force: force)
-    puts ok ? "market cache refreshed -> #{TradingLogic::MarketCache::CACHE_PATH}" : "market cache refresh failed"
+    puts ok ? "market cache refreshed -> #{TradingLogic::MarketCache::CACHE_PATH}" : 'market cache refresh failed'
   end
 end
 
@@ -32,7 +34,7 @@ namespace :moex do
     if res && !res.empty?
       puts "moex index cache written -> #{TradingLogic::MoexISS::CACHE_PATH} (#{res.size} instruments)"
     else
-      puts "moex index refresh found no instruments"
+      puts 'moex index refresh found no instruments'
     end
   end
 end
@@ -49,8 +51,8 @@ namespace :wishlist do
     scanner = TradingLogic::WishlistScanner.new(client, candle_sleep: candle_sleep)
     results = scanner.scan_all
 
-    bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV['TELEGRAM_BOT_TOKEN']
-    chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV['TELEGRAM_CHAT_ID']
+    bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV.fetch('TELEGRAM_BOT_TOKEN', nil)
+    chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV.fetch('TELEGRAM_CHAT_ID', nil)
 
     if bot_token && chat_id && !bot_token.empty? && !chat_id.empty?
       scanner.notify_telegram(results, bot_token: bot_token, chat_id: chat_id)
@@ -86,12 +88,16 @@ namespace :price_monitor do
     end
 
     results.each do |r|
-      delta_str = r[:delta] ? " (#{r[:delta] > 0 ? '+' : ''}#{r[:delta].round(2)})" : ''
+      delta_str = if r[:delta]
+                    " (#{'+' if r[:delta].positive?}#{r[:delta].round(2)})"
+                  else
+                    ''
+                  end
       puts "#{r[:label]}: #{r[:price].round(2)}#{delta_str}"
     end
 
-    bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV['TELEGRAM_BOT_TOKEN']
-    chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV['TELEGRAM_CHAT_ID']
+    bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV.fetch('TELEGRAM_BOT_TOKEN', nil)
+    chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV.fetch('TELEGRAM_CHAT_ID', nil)
 
     if bot_token && chat_id && !bot_token.empty? && !chat_id.empty?
       monitor.notify_telegram(results, bot_token: bot_token, chat_id: chat_id)

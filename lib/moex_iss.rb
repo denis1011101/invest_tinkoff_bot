@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require 'net/http'
 require 'uri'
 require 'json'
@@ -18,14 +20,20 @@ module TradingLogic
     def initialize(options = {})
       @engine  = options.fetch(:engine, 'stock')
       @market  = options.fetch(:market, 'shares')
-      @boards  = options.fetch(:boards, ['TQBR', 'TQTF'])
+      @boards  = options.fetch(:boards, %w[TQBR TQTF])
       @timeout = options.fetch(:timeout, 10)
     end
+
+    private
+
+    def enc(val) = enc(val)
+
+    public
 
     # Возвращает массив хэшей — каждое значение соответствует колонке ISS, ключи symbolized (downcased).
     # Если traded_only: true — фильтрует по доскам (BOARDID in boards) и по наличию BOARDID.
     def securities(traded_only: true)
-      url = "#{BASE}/engines/#{URI.encode_www_form_component(@engine)}/markets/#{URI.encode_www_form_component(@market)}/securities.json"
+      url = "#{BASE}/engines/#{enc(@engine)}/markets/#{enc(@market)}/securities.json"
       body = http_get_json(url)
       return [] unless body && body['securities'] && body['securities']['columns'] && body['securities']['data']
 
@@ -49,23 +57,23 @@ module TradingLogic
 
     # Возвращает массив хэшей компонентов индекса (например 'IMOEX').
     # Пробует несколько известных URL-форматов ISS и парсит таблицы analytics/constituents/securities.
-    def index_constituents(index_id)
+    def index_constituents(index_id) # rubocop:disable Metrics
       candidates = [
         # 1) analytics — обычно даёт полный состав (нужна пагинация + limit)
-        "statistics/engines/#{URI.encode_www_form_component(@engine)}/markets/index/analytics/#{URI.encode_www_form_component(index_id)}.json",
+        "statistics/engines/#{enc(@engine)}/markets/index/analytics/#{enc(index_id)}.json",
         # 2) constituents — альтернативные старые эндпоинты состава
-        "engines/#{URI.encode_www_form_component(@engine)}/markets/#{URI.encode_www_form_component(@market)}/indexes/#{URI.encode_www_form_component(index_id)}/constituents.json",
-        "indexes/#{URI.encode_www_form_component(index_id)}/constituents.json",
+        "engines/#{enc(@engine)}/markets/#{enc(@market)}/indexes/#{enc(index_id)}/constituents.json",
+        "indexes/#{enc(index_id)}/constituents.json",
         # 3) securities для индекса (иногда возвращает состав)
-        "engines/#{URI.encode_www_form_component(@engine)}/markets/#{URI.encode_www_form_component(@market)}/indexes/#{URI.encode_www_form_component(index_id)}/securities.json",
-        "indexes/#{URI.encode_www_form_component(index_id)}/securities.json"
+        "engines/#{enc(@engine)}/markets/#{enc(@market)}/indexes/#{enc(index_id)}/securities.json",
+        "indexes/#{enc(index_id)}/securities.json"
         # ВАЖНО: SNDX/securities — это список всех индексов, а не состав конкретного => не используем
       ]
 
       per_page = 100
-      max_pages = 50  # safety cap -> 100*50 = 5000 rows max
+      max_pages = 50 # safety cap -> 100*50 = 5000 rows max
 
-      candidates.each do |path|
+      candidates.each do |path| # rubocop:disable Metrics/BlockLength
         url_base = "#{BASE}/#{path}"
         # ask for per_page rows explicitly (ISS default limit is small, ~20)
         body = http_get_json("#{url_base}?limit=#{per_page}")
@@ -80,21 +88,21 @@ module TradingLogic
 
         # check top-level keys first
         body.each do |k, v|
-          if v.is_a?(Hash) && v['columns'].is_a?(Array) && v['data'].is_a?(Array)
-            table_key = k
-            table_cols = v['columns']
-            break
-          end
+          next unless v.is_a?(Hash) && v['columns'].is_a?(Array) && v['data'].is_a?(Array)
+
+          table_key = k
+          table_cols = v['columns']
+          break
         end
 
         # fallback: check nested blocks like analytics/*
         if table_key.nil? && body['analytics'].is_a?(Hash)
           body['analytics'].each do |k, v|
-            if v.is_a?(Hash) && v['columns'].is_a?(Array) && v['data'].is_a?(Array)
-              table_key = "analytics/#{k}"
-              table_cols = v['columns']
-              break
-            end
+            next unless v.is_a?(Hash) && v['columns'].is_a?(Array) && v['data'].is_a?(Array)
+
+            table_key = "analytics/#{k}"
+            table_cols = v['columns']
+            break
           end
         end
 
@@ -111,7 +119,7 @@ module TradingLogic
           total_expected = cur['total'] || cur['all'] || cur['count'] || cur.values.find { |v| v.is_a?(Integer) }
         end
         loop do
-          req_url = if start > 0
+          req_url = if start.positive?
                       "#{url_base}?start=#{start}&limit=#{per_page}"
                     else
                       "#{url_base}?limit=#{per_page}"
@@ -124,11 +132,10 @@ module TradingLogic
           if table_key.start_with?('analytics/')
             subk = table_key.split('/', 2).last
             tbl = body_page['analytics'] && body_page['analytics'][subk]
-            page_rows = tbl['data'] if tbl.is_a?(Hash) && tbl['data'].is_a?(Array)
           else
             tbl = body_page[table_key]
-            page_rows = tbl['data'] if tbl.is_a?(Hash) && tbl['data'].is_a?(Array)
           end
+          page_rows = tbl['data'] if tbl.is_a?(Hash) && tbl['data'].is_a?(Array)
 
           break if page_rows.nil? || page_rows.empty?
 
@@ -136,6 +143,7 @@ module TradingLogic
           page += 1
           break if page_rows.size < per_page
           break if total_expected && all_rows.size >= total_expected
+
           start += per_page
           break if page >= max_pages
         end
@@ -153,8 +161,10 @@ module TradingLogic
         # save cache
         begin
           FileUtils.mkdir_p(File.dirname(CACHE_PATH))
-          File.write(CACHE_PATH, JSON.pretty_generate({ 'updated_at' => Time.now.utc.iso8601, 'index' => index_id, 'instruments' => res }))
-        rescue => e
+          File.write(CACHE_PATH,
+                     JSON.pretty_generate({ 'updated_at' => Time.now.utc.iso8601, 'index' => index_id,
+                                            'instruments' => res }))
+        rescue StandardError => e
           warn "MoexISS: failed to write cache #{CACHE_PATH}: #{e.class}: #{e.message}"
         end
 
@@ -185,11 +195,11 @@ module TradingLogic
       req = Net::HTTP::Get.new(uri.request_uri, { 'Accept' => 'application/json' })
       res = http.request(req)
       unless res.is_a?(Net::HTTPSuccess)
-        warn "HTTP GET #{url} failed: status=#{res.code} body=#{res.body[0,500].inspect}"
+        warn "HTTP GET #{url} failed: status=#{res.code} body=#{res.body[0, 500].inspect}"
         return nil
       end
       JSON.parse(res.body)
-    rescue => e
+    rescue StandardError => e
       warn "Error during HTTP GET or JSON parse for #{url}: #{e.class}: #{e.message}"
       nil
     end

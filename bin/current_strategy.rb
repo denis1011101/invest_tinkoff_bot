@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require 'bundler/setup'
 require 'dotenv/load'
 require 'invest_tinkoff'
@@ -20,7 +22,7 @@ DIP_PCT = (ENV['DIP_PCT'] || '0.01').to_f
 MIN_RELATIVE_VOLUME = ENV['MIN_RELATIVE_VOLUME']&.to_f
 VOLUME_LOOKBACK_DAYS = (ENV['VOLUME_LOOKBACK_DAYS'] || '20').to_i
 VOLUME_COMPARE_MODE = (ENV['VOLUME_COMPARE_MODE'] || 'none').strip
-DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
+DAY = Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
 
 logic = TradingLogic::Runner.new(
   client,
@@ -32,8 +34,8 @@ logic = TradingLogic::Runner.new(
   min_relative_volume: MIN_RELATIVE_VOLUME,
   volume_lookback_days: VOLUME_LOOKBACK_DAYS,
   volume_compare_mode: VOLUME_COMPARE_MODE,
-  telegram_bot_token: ENV['TELEGRAM_BOT_TOKEN'],
-  telegram_chat_id: ENV['TELEGRAM_CHAT_ID']
+  telegram_bot_token: ENV.fetch('TELEGRAM_BOT_TOKEN', nil),
+  telegram_chat_id: ENV.fetch('TELEGRAM_CHAT_ID', nil)
 )
 
 STATE_PATH = File.expand_path('../tmp/strategy_state.json', __dir__)
@@ -54,14 +56,12 @@ begin
     nil
   end
   if index_figi.nil?
-    index_figi = %w[TMOS SBMX].lazy.map { |ticker|
-      begin
-        r = client.grpc_instruments.find_instrument(query: ticker)
-        r.instruments.first&.figi
-      rescue InvestTinkoff::GRPC::Error
-        nil
-      end
-    }.find(&:itself)
+    index_figi = %w[TMOS SBMX].lazy.map do |ticker|
+      r = client.grpc_instruments.find_instrument(query: ticker)
+      r.instruments.first&.figi
+    rescue InvestTinkoff::GRPC::Error
+      nil
+    end.find(&:itself)
   end
 
   puts "DEBUG: index_figi=#{index_figi.inspect}"
@@ -77,13 +77,13 @@ begin
   puts "DEBUG: universe (count=#{universe.size}):"
   universe.each do |u|
     puts format(
-      "  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f  rvol=%5.2f  turnover=%12.0f",
-      (u[:ticker] || ''),
-      (u[:price] || 0.0),
-      (u[:lot] || 0),
-      (u[:price_per_lot] || 0.0),
-      (u[:relative_volume] || 0.0),
-      (u[:daily_turnover_rub] || 0.0)
+      '  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f  rvol=%5.2f  turnover=%12.0f',
+      u[:ticker] || '',
+      u[:price] || 0.0,
+      u[:lot] || 0,
+      u[:price_per_lot] || 0.0,
+      u[:relative_volume] || 0.0,
+      u[:daily_turnover_rub] || 0.0
     )
   end
   if universe.empty?
@@ -103,7 +103,7 @@ begin
   begin
     port_force = client.grpc_operations.portfolio(account_id: account_id)
     positions_force = port_force.positions
-    positions_map = positions_force.each_with_object({}) { |p, h| h[p.figi] = p }
+    positions_map = positions_force.to_h { |p| [p.figi, p] }
 
     universe.each do |it|
       p = positions_map[it[:figi]] or next
@@ -117,8 +117,8 @@ begin
         figi: it[:figi],
         quantity: qty, # продаём весь объём
         price: cur_price,
-        direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
-        order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
+        direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
+        order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
       if resp
         puts "FORCE SELL +10% #{it[:ticker]} qty=#{qty} @#{cur_price} (order_id=#{resp.order_id})"
@@ -137,8 +137,14 @@ begin
     up_portfolio = client.grpc_operations.portfolio(account_id: account_id)
     universe.each do |it|
       cur = logic.last_price_for(it[:figi])
-      today_high = logic.today_high(it[:figi]) rescue nil
-      puts "DEBUG: #{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} dip_threshold=#{(today_high ? (today_high * (1.0 - DIP_PCT)) : nil).inspect} should_buy=#{logic.should_buy?(it)}"
+      today_high = begin
+        logic.today_high(it[:figi])
+      rescue StandardError
+        nil
+      end
+      dip_thr = today_high ? (today_high * (1.0 - DIP_PCT)) : nil
+      puts "DEBUG: #{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} " \
+           "dip_threshold=#{dip_thr.inspect} should_buy=#{logic.should_buy?(it)}"
       next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
       next unless logic.should_buy?(it)
 
@@ -153,8 +159,8 @@ begin
         figi: it[:figi],
         quantity: it[:lot] * LOTS_PER_ORDER,
         price: it[:price],
-        direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
-        order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
+        direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
+        order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
       if resp
         puts "BUY #{it[:ticker]} lot=#{it[:lot]} @#{it[:price]} (order_id=#{resp.order_id})"
@@ -180,8 +186,10 @@ begin
       end
 
       next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_sell', ticker)
+
       p = positions.find { |pos| pos.figi == it[:figi] }
       next unless p
+
       qty_units = p.quantity.units.to_i
       next if qty_units <= 0
 
@@ -194,8 +202,8 @@ begin
         figi: it[:figi],
         quantity: sell_qty,
         price: logic.last_price_for(it[:figi]),
-        direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
-        order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
+        direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
+        order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
       if resp
         puts "SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})"
@@ -218,7 +226,7 @@ begin
       lots_per_order: LOTS_PER_ORDER,
       account_id: account_id
     )
-     puts 'DOWN: no momentum candidates' unless bought
+    puts 'DOWN: no momentum candidates' unless bought
 
   else
     puts 'Trend: SIDE — SELL by same rules, and try momentum(3D up) BUY one per day'
@@ -233,7 +241,7 @@ begin
       lots_per_order: LOTS_PER_ORDER,
       account_id: account_id
     )
-     puts 'SIDE: no momentum candidates' unless bought
+    puts 'SIDE: no momentum candidates' unless bought
   end
 
   TradingLogic::StrategyHelpers.check_sell_consistency!(client, account_id, state)

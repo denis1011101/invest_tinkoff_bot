@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require_relative 'spec_helper'
 require 'ostruct'
 require 'tmpdir'
@@ -48,9 +50,9 @@ RSpec.describe TradingLogic::PriceMonitor do
       allow(market_data).to receive(:last_prices)
         .with(figis: %w[FIGI_USD FIGI_SBER])
         .and_return(OpenStruct.new(last_prices: [
-          OpenStruct.new(figi: 'FIGI_USD', price: q(92, 450_000_000)),
-          OpenStruct.new(figi: 'FIGI_SBER', price: q(245, 300_000_000))
-        ]))
+                                     OpenStruct.new(figi: 'FIGI_USD', price: q(92, 450_000_000)),
+                                     OpenStruct.new(figi: 'FIGI_SBER', price: q(245, 300_000_000))
+                                   ]))
     end
 
     it 'fetches prices for all instruments' do
@@ -100,8 +102,8 @@ RSpec.describe TradingLogic::PriceMonitor do
       allow(market_data).to receive(:last_prices)
         .with(figis: %w[FIGI_SBER])
         .and_return(OpenStruct.new(last_prices: [
-          OpenStruct.new(figi: 'FIGI_SBER', price: q(245, 300_000_000))
-        ]))
+                                     OpenStruct.new(figi: 'FIGI_SBER', price: q(245, 300_000_000))
+                                   ]))
 
       allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(false)
       allow(File).to receive(:write).and_return(nil)

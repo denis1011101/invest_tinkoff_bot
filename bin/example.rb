@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 # For test
 require 'bundler/setup'
 require 'dotenv/load'
@@ -9,7 +11,7 @@ client = InvestTinkoff::V2::Client.new(token: token, sandbox: false)
 def q_to_decimal(q)
   return nil unless q
 
-  q.units.to_i + q.nano.to_i / 1_000_000_000.0
+  q.units.to_i + (q.nano.to_i / 1_000_000_000.0)
 end
 
 begin

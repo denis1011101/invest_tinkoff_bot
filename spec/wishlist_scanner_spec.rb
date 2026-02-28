@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require_relative 'spec_helper'
 require 'ostruct'
 require 'tmpdir'
@@ -80,11 +82,15 @@ RSpec.describe TradingLogic::WishlistScanner do
       it 'finds stocks growing for N consecutive months' do
         # 3 months = 66 trading days. monthly_closes sampled at day -1, -23, -45, -67
         # Growing: 100 -> 110 -> 120 -> 130
-        sber_prices = [100.0] + Array.new(21, 105.0) + [110.0] + Array.new(21, 115.0) + [120.0] + Array.new(21, 125.0) + [130.0]
+        sber_prices = [100.0] + Array.new(21,
+                                          105.0) + [110.0] + Array.new(21,
+                                                                       115.0) + [120.0] + Array.new(21, 125.0) + [130.0]
         stub_candles_for('FIGI1', sber_prices)
 
         # Not growing: 100 -> 110 -> 105 -> 130
-        rosn_prices = [100.0] + Array.new(21, 105.0) + [110.0] + Array.new(21, 103.0) + [105.0] + Array.new(21, 125.0) + [130.0]
+        rosn_prices = [100.0] + Array.new(21,
+                                          105.0) + [110.0] + Array.new(21,
+                                                                       103.0) + [105.0] + Array.new(21, 125.0) + [130.0]
         stub_candles_for('FIGI2', rosn_prices)
 
         config = { 'condition' => 'growth_months', 'params' => { 'months' => 3 }, 'top_n' => 10 }
@@ -218,12 +224,12 @@ RSpec.describe TradingLogic::WishlistScanner do
       FileUtils.mkdir_p(wishlists_dir)
 
       File.write(File.join(wishlists_dir, 'test.json'), JSON.generate({
-        'name' => 'Test',
-        'condition' => '52day_low',
-        'params' => { 'days' => 52 },
-        'top_n' => 5,
-        'universe' => 'market_cache'
-      }))
+                                                                        'name' => 'Test',
+                                                                        'condition' => '52day_low',
+                                                                        'params' => { 'days' => 52 },
+                                                                        'top_n' => 5,
+                                                                        'universe' => 'market_cache'
+                                                                      }))
 
       stub_const('TradingLogic::WishlistScanner::WISHLISTS_DIR', wishlists_dir)
       stub_const('TradingLogic::WishlistScanner::RESULTS_DIR', File.join(dir, 'results'))
