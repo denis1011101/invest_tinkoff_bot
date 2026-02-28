@@ -21,5 +21,8 @@ jobs:
       - name: Run specs
         run: bundle exec rspec
 
+      - name: Install RuboCop
+        run: gem install rubocop -v "~> 1.75" --no-document
+
       - name: Run RuboCop
-        run: bundle exec rubocop
+        run: rubocop
