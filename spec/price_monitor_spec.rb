@@ -42,10 +42,10 @@ RSpec.describe TradingLogic::PriceMonitor do
 
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'USD000UTSTOM')
-        .and_return(OpenStruct.new(instruments: [OpenStruct.new(figi: 'FIGI_USD')]))
+        .and_return(OpenStruct.new(instruments: [OpenStruct.new(ticker: 'USD000UTSTOM', figi: 'FIGI_USD', class_code: 'CETS', api_trade_available_flag: true)]))
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'SBER')
-        .and_return(OpenStruct.new(instruments: [OpenStruct.new(figi: 'FIGI_SBER')]))
+        .and_return(OpenStruct.new(instruments: [OpenStruct.new(ticker: 'SBER', figi: 'FIGI_SBER', class_code: 'TQBR', api_trade_available_flag: true)]))
 
       allow(market_data).to receive(:last_prices)
         .with(figis: %w[FIGI_USD FIGI_SBER])
@@ -98,6 +98,9 @@ RSpec.describe TradingLogic::PriceMonitor do
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'USD000UTSTOM')
         .and_return(OpenStruct.new(instruments: []))
+      allow(instruments_svc).to receive(:find_instrument)
+        .with(query: 'SBER')
+        .and_return(OpenStruct.new(instruments: [OpenStruct.new(ticker: 'SBER', figi: 'FIGI_SBER', class_code: 'TQBR', api_trade_available_flag: true)]))
 
       allow(market_data).to receive(:last_prices)
         .with(figis: %w[FIGI_SBER])
@@ -152,6 +155,81 @@ RSpec.describe TradingLogic::PriceMonitor do
       results = [{ label: 'X', query: 'X', price: 1.0, prev_price: nil, delta: nil, delta_pct: nil }]
       msg = subject.send(:format_monitor_message, 'Test', results)
       expect(msg).to include('Екб')
+    end
+  end
+
+  describe '#resolve_figi' do
+    def instrument(ticker:, figi:, class_code: '', api_trade_available_flag: true)
+      OpenStruct.new(ticker: ticker, figi: figi, class_code: class_code,
+                     instrument_type: 'share', api_trade_available_flag: api_trade_available_flag)
+    end
+
+    it 'prefers TQBR share with matching ticker' do
+      instruments = [
+        instrument(ticker: 'GAZP', figi: 'WRONG', class_code: 'SPBX'),
+        instrument(ticker: 'GAZP', figi: 'CORRECT', class_code: 'TQBR'),
+        instrument(ticker: 'GAZP', figi: 'ALSO_WRONG', class_code: 'TQOB')
+      ]
+      allow(instruments_svc).to receive(:find_instrument)
+        .with(query: 'GAZP')
+        .and_return(OpenStruct.new(instruments: instruments))
+
+      expect(subject.send(:resolve_figi, 'GAZP')).to eq('CORRECT')
+    end
+
+    it 'is case-insensitive for query' do
+      instruments = [
+        instrument(ticker: 'SBER', figi: 'FIGI_SBER', class_code: 'TQBR')
+      ]
+      allow(instruments_svc).to receive(:find_instrument)
+        .with(query: 'sber')
+        .and_return(OpenStruct.new(instruments: instruments))
+
+      expect(subject.send(:resolve_figi, 'sber')).to eq('FIGI_SBER')
+    end
+
+    it 'handles nil ticker in instrument list' do
+      instruments = [
+        OpenStruct.new(ticker: nil, figi: 'NIL_TICKER', class_code: 'TQBR', instrument_type: 'bond', api_trade_available_flag: false),
+        instrument(ticker: 'SBER', figi: 'GOOD', class_code: 'TQBR')
+      ]
+      allow(instruments_svc).to receive(:find_instrument)
+        .with(query: 'SBER')
+        .and_return(OpenStruct.new(instruments: instruments))
+
+      expect(subject.send(:resolve_figi, 'SBER')).to eq('GOOD')
+    end
+
+    it 'falls back to api_trade_available when no TQBR match' do
+      instruments = [
+        instrument(ticker: 'X', figi: 'NOT_TRADABLE', api_trade_available_flag: false),
+        instrument(ticker: 'BTC/USD', figi: 'TRADABLE', class_code: 'CETS', api_trade_available_flag: true)
+      ]
+      allow(instruments_svc).to receive(:find_instrument)
+        .with(query: 'BTC/USD')
+        .and_return(OpenStruct.new(instruments: instruments))
+
+      expect(subject.send(:resolve_figi, 'BTC/USD')).to eq('TRADABLE')
+    end
+
+    it 'falls back to first instrument when none are tradable' do
+      instruments = [
+        instrument(ticker: 'X', figi: 'FIRST', api_trade_available_flag: false),
+        instrument(ticker: 'Y', figi: 'SECOND', api_trade_available_flag: false)
+      ]
+      allow(instruments_svc).to receive(:find_instrument)
+        .with(query: 'UNKNOWN')
+        .and_return(OpenStruct.new(instruments: instruments))
+
+      expect(subject.send(:resolve_figi, 'UNKNOWN')).to eq('FIRST')
+    end
+
+    it 'returns nil for empty results' do
+      allow(instruments_svc).to receive(:find_instrument)
+        .with(query: 'NOPE')
+        .and_return(OpenStruct.new(instruments: []))
+
+      expect(subject.send(:resolve_figi, 'NOPE')).to be_nil
     end
   end
 

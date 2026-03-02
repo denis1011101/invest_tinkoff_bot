@@ -84,7 +84,13 @@ module TradingLogic
 
     def resolve_figi(query)
       resp = @client.grpc_instruments.find_instrument(query: query.to_s)
-      resp.instruments.first&.figi
+      instruments = resp.instruments.to_a
+      upcased = query.to_s.upcase
+      preferred = instruments.find { |i| i.ticker.to_s.upcase == upcased && i.class_code == 'TQBR' } ||
+                  instruments.find { |i| i.ticker.to_s.upcase == upcased && i.api_trade_available_flag } ||
+                  instruments.find { |i| i.api_trade_available_flag } ||
+                  instruments.first
+      preferred&.figi
     rescue StandardError
       nil
     end
