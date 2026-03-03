@@ -34,6 +34,8 @@ module TradingLogic
         price = prices[inst[:figi]]
         next unless price
 
+        price *= inst[:scale] if inst[:scale] != 1.0
+
         prev = previous[inst[:query]]
         delta = prev ? price - prev : nil
         delta_pct = prev && prev != 0 ? (delta / prev * 100.0) : nil
@@ -73,12 +75,13 @@ module TradingLogic
       instruments_config.filter_map do |inst|
         query = inst['query']
         label = inst['label'] || query
+        scale = inst['scale']&.to_f || 1.0
         figi = resolve_figi(query)
         unless figi
           warn "PriceMonitor: instrument not found for query '#{query}'"
           next
         end
-        { label: label, query: query, figi: figi }
+        { label: label, query: query, figi: figi, scale: scale }
       end
     end
 

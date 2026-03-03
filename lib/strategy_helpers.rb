@@ -97,10 +97,25 @@ module TradingLogic
       cached = figi_cache[figi].to_s.strip.upcase
       return cached unless cached.empty?
 
-      inst = client.grpc_instruments.get_instrument_by(:figi, figi)
-      tk = inst&.ticker.to_s.strip.upcase
-      tk.empty? ? nil : tk
-    rescue StandardError
+      # Пробуем get_instrument_by (основной метод)
+      begin
+        inst = client.grpc_instruments.get_instrument_by(:figi, figi)
+        tk = inst&.ticker.to_s.strip.upcase
+        return tk unless tk.empty?
+      rescue StandardError => e
+        warn "DEBUG: get_instrument_by failed for figi=#{figi}: #{e.class}: #{e.message}"
+      end
+
+      # Fallback: find_instrument по FIGI (поиск по строке)
+      begin
+        resp = client.grpc_instruments.find_instrument(query: figi)
+        found = resp&.instruments&.first
+        tk = found&.ticker.to_s.strip.upcase
+        return tk unless tk.empty?
+      rescue StandardError => e
+        warn "DEBUG: find_instrument fallback failed for figi=#{figi}: #{e.class}: #{e.message}"
+      end
+
       nil
     end
 
