@@ -21,9 +21,11 @@ module TradingLogic
 
     def fetch_all
       config = load_config
-      return [] if config['instruments'].nil? || config['instruments'].empty?
+      static_config, dynamic_config = instrument_configs(config)
+      return [] if static_config.empty? && dynamic_config.empty?
 
-      instruments = resolve_instruments(config['instruments'])
+      instruments = resolve_instruments(static_config, group: :static) +
+                    resolve_instruments(dynamic_config, group: :dynamic)
       return [] if instruments.empty?
 
       figis = instruments.filter_map { |i| i[:figi] }
@@ -43,6 +45,8 @@ module TradingLogic
         {
           label: inst[:label],
           query: inst[:query],
+          group: inst[:group],
+          sort_index: inst[:sort_index],
           price: price,
           prev_price: prev,
           delta: delta,
@@ -50,6 +54,7 @@ module TradingLogic
         }
       end
 
+      results = sort_results(results)
       save_current_prices(results)
       results
     end
@@ -71,8 +76,16 @@ module TradingLogic
       {}
     end
 
-    def resolve_instruments(instruments_config)
-      instruments_config.filter_map do |inst|
+    def instrument_configs(config)
+      if config['static_instruments'].is_a?(Array) || config['dynamic_instruments'].is_a?(Array)
+        [config['static_instruments'] || [], config['dynamic_instruments'] || []]
+      else
+        [config['instruments'] || [], []]
+      end
+    end
+
+    def resolve_instruments(instruments_config, group:)
+      instruments_config.each_with_index.filter_map do |inst, idx|
         query = inst['query']
         label = inst['label'] || query
         scale = inst['scale']&.to_f || 1.0
@@ -81,8 +94,20 @@ module TradingLogic
           warn "PriceMonitor: instrument not found for query '#{query}'"
           next
         end
-        { label: label, query: query, figi: figi, scale: scale }
+        { label: label, query: query, figi: figi, scale: scale, group: group, sort_index: idx }
       end
+    end
+
+    def sort_results(results)
+      static, dynamic = results.partition { |r| r[:group] == :static }
+      dynamic = dynamic.sort_by do |r|
+        [
+          r[:delta] ? 0 : 1,
+          -(r[:delta] || 0.0),
+          r[:sort_index]
+        ]
+      end
+      static + dynamic
     end
 
     def resolve_figi(query)

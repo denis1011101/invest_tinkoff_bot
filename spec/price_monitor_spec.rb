@@ -27,10 +27,11 @@ RSpec.describe TradingLogic::PriceMonitor do
     let(:config) do
       {
         'telegram_header' => 'Test',
-        'instruments' => [
+        'static_instruments' => [
           { 'label' => 'USD/RUB', 'query' => 'USD000UTSTOM' },
           { 'label' => 'Сбер', 'query' => 'SBER' }
-        ]
+        ],
+        'dynamic_instruments' => []
       }
     end
 
@@ -92,6 +93,64 @@ RSpec.describe TradingLogic::PriceMonitor do
 
       expect(results[0][:delta]).to be_nil
       expect(results[0][:delta_pct]).to be_nil
+    end
+
+    it 'keeps static instruments first and sorts dynamic ones by descending delta' do
+      config = {
+        'telegram_header' => 'Test',
+        'static_instruments' => [
+          { 'label' => 'USD/RUB', 'query' => 'USD000UTSTOM' }
+        ],
+        'dynamic_instruments' => [
+          { 'label' => 'Лукойл', 'query' => 'LKOH' },
+          { 'label' => 'Сбер', 'query' => 'SBER' }
+        ]
+      }
+      prev_state = { 'prices' => { 'USD000UTSTOM' => 92.0, 'LKOH' => 7000.0, 'SBER' => 240.0 } }
+
+      allow(File).to receive(:read).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(JSON.generate(config))
+      allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(true)
+      allow(File).to receive(:read).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(JSON.generate(prev_state))
+
+      allow(instruments_svc).to receive(:find_instrument)
+        .with(query: 'LKOH')
+        .and_return(OpenStruct.new(instruments: [OpenStruct.new(ticker: 'LKOH', figi: 'FIGI_LKOH', class_code: 'TQBR', api_trade_available_flag: true)]))
+      allow(market_data).to receive(:last_prices)
+        .with(figis: %w[FIGI_USD FIGI_LKOH FIGI_SBER])
+        .and_return(OpenStruct.new(last_prices: [
+                                     OpenStruct.new(figi: 'FIGI_USD', price: q(92, 450_000_000)),
+                                     OpenStruct.new(figi: 'FIGI_LKOH', price: q(7_500, 0)),
+                                     OpenStruct.new(figi: 'FIGI_SBER', price: q(245, 300_000_000))
+                                   ]))
+      allow(File).to receive(:write).and_return(nil)
+      allow(FileUtils).to receive(:mkdir_p)
+
+      results = subject.fetch_all
+
+      expect(results.map { |r| r[:label] }).to eq(['USD/RUB', 'Лукойл', 'Сбер'])
+    end
+
+    it 'supports legacy single instruments list' do
+      legacy_config = {
+        'telegram_header' => 'Test',
+        'instruments' => [
+          { 'label' => 'USD/RUB', 'query' => 'USD000UTSTOM' }
+        ]
+      }
+
+      allow(File).to receive(:read).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(JSON.generate(legacy_config))
+      allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(false)
+      allow(market_data).to receive(:last_prices)
+        .with(figis: %w[FIGI_USD])
+        .and_return(OpenStruct.new(last_prices: [
+                                     OpenStruct.new(figi: 'FIGI_USD', price: q(92, 450_000_000))
+                                   ]))
+      allow(File).to receive(:write).and_return(nil)
+      allow(FileUtils).to receive(:mkdir_p)
+
+      results = subject.fetch_all
+
+      expect(results.map { |r| r[:label] }).to eq(['USD/RUB'])
     end
 
     it 'skips instruments not found via find_instrument' do
