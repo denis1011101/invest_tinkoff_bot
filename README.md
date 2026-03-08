@@ -5,14 +5,15 @@ A small automated trading helper for MOEX using Tinkoff gRPC API. It implements 
 ## Strategies (brief)
 
 ### Entry signals
-- **Intraday dip buy (UP trend)** — when the market index trend is up and a ticker's current price <= today's high * (1 - dip_pct), the bot may place a BUY. See [`TradingLogic::Runner`](lib/trading_logic.rb).
-- **Momentum buy with dip filter (SIDE/DOWN trend)** — from intersection of market universe and IMOEX index constituents, buy one instrument showing 3 consecutive daily closes up **and** an intraday dip on the current day. This avoids buying at the peak of a momentum run. See [`TradingLogic::StrategyHelpers`](lib/strategy_helpers.rb).
+- **Intraday dip buy (UP trend)** — when the market index trend is up and a ticker's current price <= today's high * (1 - dip_pct), the bot may place a BUY. If support/resistance levels are enabled, UP-trend BUY also requires the live price to be near a support level; if levels cannot be computed, the strategy falls back to the original dip logic. See [`TradingLogic::Runner`](lib/trading_logic.rb).
+- **Momentum buy with dip filter (SIDE/DOWN trend)** — from intersection of market universe and IMOEX index constituents, buy one instrument showing 3 consecutive daily closes up **and** an intraday dip on the current day. If support/resistance levels are enabled, candidates closer to support are prioritized, but this does not block buying. See [`TradingLogic::StrategyHelpers`](lib/strategy_helpers.rb).
 
 ### Exit signals
 - **Trend-dependent profit exit** — sell threshold depends on the current market trend:
   - UP: +10% (`SELL_THRESHOLD_UP`, default `1.10`)
   - SIDE: +4% (`SELL_THRESHOLD_SIDE`, default `1.04`)
   - DOWN: +2% (`SELL_THRESHOLD_DOWN`, default `1.02`)
+- **Resistance-based exit** — if support/resistance levels are enabled, the bot may also sell near the nearest resistance level when the position already has at least minimal profit (`LEVEL_SELL_MIN_PROFIT`).
 - **Force exit** — sell the entire position when profit reaches +10% regardless of trend (runs before main strategy logic).
 
 ### Risk management
@@ -24,6 +25,7 @@ A small automated trading helper for MOEX using Tinkoff gRPC API. It implements 
 - **FIGI cache** — `market_instruments_cache.json` is used for fast figi-to-ticker resolution, reducing gRPC API calls.
 - **Pending order cleanup** — on startup, pending orders are reconciled with active broker orders; filled/cancelled orders are removed from state.
 - **Volume-aware filters and ranking** — optional relative volume filter for entries (`MIN_RELATIVE_VOLUME`) and cross-sectional ranking (`VOLUME_COMPARE_MODE=relative|turnover`).
+- **Support/resistance levels** — optional pivot-based levels are built from closed daily candles, cached once per `figi` for the whole run, and used as a hard BUY filter in UP trend plus a soft priority signal in SIDE/DOWN momentum buys.
 
 ## How it works (high level)
 - Market data and instruments are fetched via Invest Tinkoff gRPC client.
@@ -79,6 +81,12 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `MAX_LOT_COUNT` — max instrument lot size allowed when building universe (`lot <= MAX_LOT_COUNT`).
 - `LOTS_PER_ORDER` — multiplier for order size (`quantity = lot * LOTS_PER_ORDER`).
 - `DIP_PCT` — intraday dip threshold for BUY (`cur <= today_high * (1 - DIP_PCT)`). Used in UP trend and as momentum dip filter in SIDE/DOWN.
+- `USE_LEVELS` — enables support/resistance levels logic (`1` by default, `0` disables all level lookups and related filters).
+- `LEVELS_LOOKBACK_DAYS` — number of closed daily candles to inspect when building support/resistance levels (default `120`).
+- `LEVEL_PROXIMITY_PCT` — max relative distance from support/resistance to consider price "near level" (default `0.02` = 2%).
+- `LEVEL_SELL_MIN_PROFIT` — minimal profit multiple required before resistance-based sell is allowed (default `1.005` = +0.5%).
+- `LEVEL_PIVOT_WINDOW` — pivot window size for local extrema detection on daily candles (default `5`).
+- `LEVEL_CLUSTER_PCT` — max relative distance for clustering nearby support/resistance pivots into one level (default `0.015` = 1.5%).
 - `SELL_THRESHOLD_UP` — profit multiplier to trigger SELL in UP trend (default `1.10` = +10%).
 - `SELL_THRESHOLD_SIDE` — profit multiplier to trigger SELL in SIDE trend (default `1.04` = +4%).
 - `SELL_THRESHOLD_DOWN` — profit multiplier to trigger SELL in DOWN trend (default `1.02` = +2%).

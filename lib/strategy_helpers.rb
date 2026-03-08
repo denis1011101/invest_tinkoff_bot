@@ -136,7 +136,10 @@ module TradingLogic
 
       return false if inter.empty?
 
-      inter.each do |tk| # rubocop:disable Metrics/BlockLength
+      # Собираем всех валидных кандидатов, потом сортируем (soft boost по support)
+      candidates = []
+
+      inter.each do |tk|
         warn "DEBUG: processing candidate #{tk}"
         begin
           next if acted_today?(state, 'last_buy', tk)
@@ -226,6 +229,32 @@ module TradingLogic
           warn "DEBUG: BUY skipped for #{tk} — position share limit reached"
           next
         end
+
+        # Soft boost: оцениваем близость к support (меньше = лучше, 0.0 = прямо на уровне)
+        support_distance = begin
+          if logic.respond_to?(:near_support?) && price
+            sup = logic.nearest_support(figi, price)
+            sup ? (price - sup[:price]) / sup[:price] : 1.0
+          else
+            1.0
+          end
+        rescue StandardError
+          1.0
+        end
+
+        warn "DEBUG: #{tk} support_distance=#{support_distance.round(4)}"
+        candidates << { tk: tk, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order, support_distance: support_distance }
+      end
+
+      # Сортируем: кандидаты ближе к support — первыми
+      candidates.sort_by! { |c| c[:support_distance] }
+      warn "DEBUG: sorted candidates: #{candidates.map { |c| "#{c[:tk]}(#{c[:support_distance].round(3)})" }.inspect}"
+
+      candidates.each do |cand| # rubocop:disable Metrics/BlockLength
+        tk    = cand[:tk]
+        figi  = cand[:figi]
+        lot   = cand[:lot]
+        price = cand[:price]
 
         result = begin
           logic.confirm_and_place_order_with_result(

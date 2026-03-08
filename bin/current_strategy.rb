@@ -24,6 +24,13 @@ VOLUME_LOOKBACK_DAYS = (ENV['VOLUME_LOOKBACK_DAYS'] || '20').to_i
 VOLUME_COMPARE_MODE = (ENV['VOLUME_COMPARE_MODE'] || 'none').strip
 DAY = Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
 
+USE_LEVELS           = ENV.fetch('USE_LEVELS', '1').strip != '0'
+LEVELS_LOOKBACK_DAYS = (ENV['LEVELS_LOOKBACK_DAYS'] || '120').to_i
+LEVEL_PROXIMITY_PCT  = (ENV['LEVEL_PROXIMITY_PCT'] || '0.02').to_f
+LEVEL_SELL_MIN_PROFIT = (ENV['LEVEL_SELL_MIN_PROFIT'] || '1.005').to_f
+LEVEL_PIVOT_WINDOW   = (ENV['LEVEL_PIVOT_WINDOW'] || '5').to_i
+LEVEL_CLUSTER_PCT    = (ENV['LEVEL_CLUSTER_PCT'] || '0.015').to_f
+
 logic = TradingLogic::Runner.new(
   client,
   tickers: TICKERS,
@@ -35,7 +42,13 @@ logic = TradingLogic::Runner.new(
   volume_lookback_days: VOLUME_LOOKBACK_DAYS,
   volume_compare_mode: VOLUME_COMPARE_MODE,
   telegram_bot_token: ENV.fetch('TELEGRAM_BOT_TOKEN', nil),
-  telegram_chat_id: ENV.fetch('TELEGRAM_CHAT_ID', nil)
+  telegram_chat_id: ENV.fetch('TELEGRAM_CHAT_ID', nil),
+  use_levels: USE_LEVELS,
+  levels_lookback_days: LEVELS_LOOKBACK_DAYS,
+  level_proximity_pct: LEVEL_PROXIMITY_PCT,
+  level_sell_min_profit: LEVEL_SELL_MIN_PROFIT,
+  level_pivot_window: LEVEL_PIVOT_WINDOW,
+  level_cluster_pct: LEVEL_CLUSTER_PCT
 )
 
 STATE_PATH = File.expand_path('../tmp/strategy_state.json', __dir__)
@@ -91,6 +104,13 @@ begin
     exit 0
   end
 
+  if USE_LEVELS
+    puts "DEBUG: levels (lookback=#{LEVELS_LOOKBACK_DAYS}d, proximity=#{(LEVEL_PROXIMITY_PCT * 100).round(1)}%):"
+    universe.each do |u|
+      puts "  - #{u[:ticker]}: #{logic.level_debug_info(u[:figi], u[:price])}"
+    end
+  end
+
   figi_cache = TradingLogic::StrategyHelpers.build_figi_ticker_map(MARKET_CACHE_PATH)
 
   state = TradingLogic::StrategyHelpers.load_state(STATE_PATH)
@@ -143,12 +163,13 @@ begin
         nil
       end
       dip_thr = today_high ? (today_high * (1.0 - DIP_PCT)) : nil
+      it_live = cur ? it.merge(price: cur) : it
       puts "DEBUG: #{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} " \
-           "dip_threshold=#{dip_thr.inspect} should_buy=#{logic.should_buy?(it)}"
+           "dip_threshold=#{dip_thr.inspect} should_buy=#{logic.should_buy?(it_live, trend: trend)}"
       next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
-      next unless logic.should_buy?(it)
+      next unless logic.should_buy?(it_live, trend: trend)
 
-      buy_value = it[:price] * it[:lot] * LOTS_PER_ORDER
+      buy_value = (cur || it[:price]) * it[:lot] * LOTS_PER_ORDER
       next unless TradingLogic::StrategyHelpers.position_within_limit?(
         client, account_id, it[:figi],
         planned_buy_value: buy_value, portfolio: up_portfolio
@@ -158,7 +179,7 @@ begin
         account_id: account_id,
         figi: it[:figi],
         quantity: it[:lot] * LOTS_PER_ORDER,
-        price: it[:price],
+        price: cur || it[:price],
         direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
         order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )

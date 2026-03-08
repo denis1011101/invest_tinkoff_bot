@@ -49,7 +49,7 @@ RSpec.describe TradingLogic::Runner do
       highs = [OpenStruct.new(high: q(100))]
       allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: highs))
       expect(subject.dip_today?('FIGI')).to be true
-      expect(subject.should_buy?({ figi: 'FIGI' })).to be true
+      expect(subject.should_buy?({ figi: 'FIGI', price: 99 })).to be true
     end
 
     it 'returns false if no price or no highs' do
@@ -147,16 +147,264 @@ RSpec.describe TradingLogic::Runner do
     end
   end
 
+  # Helper: строим mock дневную свечу с заданными low/high/close
+  def day_candle(low:, high:, close: nil, time_offset_days: 0)
+    base = Time.utc(2024, 1, 1).to_i + time_offset_days * 86_400
+    OpenStruct.new(
+      low:   q(low),
+      high:  q(high),
+      close: q(close || ((low + high) / 2)),
+      time:  OpenStruct.new(seconds: base)
+    )
+  end
+
+  describe 'support/resistance levels' do
+    # Строим 15 свечей: pivot_window=2, на индексе 3 явный low=80 (support), на индексе 11 явный high=130 (resistance)
+    def make_candles_with_levels
+      data = [
+        { low: 95, high: 105 }, # 0
+        { low: 90, high: 102 }, # 1
+        { low: 85, high: 100 }, # 2
+        { low: 80, high: 95  }, # 3 — pivot low (support at 80)
+        { low: 85, high: 100 }, # 4
+        { low: 90, high: 102 }, # 5
+        { low: 92, high: 108 }, # 6
+        { low: 94, high: 112 }, # 7
+        { low: 95, high: 118 }, # 8
+        { low: 96, high: 122 }, # 9
+        { low: 97, high: 126 }, # 10
+        { low: 98, high: 130 }, # 11 — pivot high (resistance at 130)
+        { low: 96, high: 124 }, # 12
+        { low: 94, high: 120 }, # 13
+        { low: 92, high: 115 }  # 14 (последняя — будет "закрытой")
+      ]
+      data.each_with_index.map { |d, i| day_candle(low: d[:low], high: d[:high], time_offset_days: i) }
+    end
+
+    let(:runner_with_levels) do
+      described_class.new(
+        client,
+        tickers: %w[SBER],
+        use_levels: true,
+        level_pivot_window: 2,
+        level_proximity_pct: 0.05,
+        level_sell_min_profit: 1.005,
+        level_cluster_pct: 0.03
+      )
+    end
+
+    before do
+      candles = make_candles_with_levels
+      # Возвращаем все свечи кроме "сегодняшней" (последняя = сегодня по времени)
+      # Для теста используем все свечи с временем в прошлом
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: candles))
+      allow(TradingLogic::Utils).to receive(:now_utc).and_return(Time.utc(2024, 1, 20)) # после всех свечей
+    end
+
+    describe '#compute_support_resistance' do
+      it 'finds at least one support level around 80' do
+        levels = runner_with_levels.compute_support_resistance('FIGI')
+        supports = levels.select { |l| l[:type] == :support }
+        expect(supports).not_to be_empty
+        expect(supports.any? { |s| (s[:price] - 80).abs < 5 }).to be true
+      end
+
+      it 'finds at least one resistance level around 130' do
+        levels = runner_with_levels.compute_support_resistance('FIGI')
+        resistances = levels.select { |l| l[:type] == :resistance }
+        expect(resistances).not_to be_empty
+        expect(resistances.any? { |r| (r[:price] - 130).abs < 10 }).to be true
+      end
+
+      it 'returns [] when not enough candles for pivot window' do
+        allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: [day_candle(low: 90, high: 100)]))
+        expect(runner_with_levels.compute_support_resistance('FIGI')).to eq([])
+      end
+
+      it 'returns [] on API error' do
+        allow(TradingLogic::Utils).to receive(:fetch_candles).and_raise(StandardError, 'network error')
+        expect(runner_with_levels.compute_support_resistance('FIGI')).to eq([])
+      end
+    end
+
+    describe '#levels_for caching' do
+      it 'calls compute_support_resistance only once per figi per run' do
+        expect(runner_with_levels).to receive(:compute_support_resistance).with('FIGI').once.and_call_original
+        runner_with_levels.levels_for('FIGI')
+        runner_with_levels.levels_for('FIGI')
+        runner_with_levels.levels_for('FIGI')
+      end
+    end
+
+    describe 'USE_LEVELS=false disables all level access' do
+      let(:runner_no_levels) do
+        described_class.new(client, tickers: %w[SBER], use_levels: false)
+      end
+
+      it 'nearest_support returns nil without hitting API' do
+        expect(runner_no_levels).not_to receive(:compute_support_resistance)
+        expect(runner_no_levels.nearest_support('FIGI', 100)).to be_nil
+      end
+
+      it 'nearest_resistance returns nil without hitting API' do
+        expect(runner_no_levels).not_to receive(:compute_support_resistance)
+        expect(runner_no_levels.nearest_resistance('FIGI', 100)).to be_nil
+      end
+
+      it 'should_buy? ignores levels even in :up trend' do
+        allow(runner_no_levels).to receive(:dip_today?).and_return(true)
+        allow(runner_no_levels).to receive(:volume_spike?).and_return(true)
+        expect(runner_no_levels).not_to receive(:compute_support_resistance)
+        expect(runner_no_levels.should_buy?({ figi: 'FIGI', price: 100 }, trend: :up)).to be true
+      end
+    end
+
+    describe '#nearest_support and #nearest_resistance' do
+      it 'returns nearest support below price' do
+        sup = runner_with_levels.nearest_support('FIGI', 95)
+        expect(sup).not_to be_nil
+        expect(sup[:price]).to be <= 95
+        expect(sup[:type]).to eq(:support)
+      end
+
+      it 'returns nearest resistance above price' do
+        res = runner_with_levels.nearest_resistance('FIGI', 100)
+        expect(res).not_to be_nil
+        expect(res[:price]).to be >= 100
+        expect(res[:type]).to eq(:resistance)
+      end
+
+      it 'returns nil when no support below price' do
+        sup = runner_with_levels.nearest_support('FIGI', 5)
+        expect(sup).to be_nil
+      end
+    end
+
+    describe '#near_support? and #near_resistance?' do
+      it 'returns true when price is within proximity_pct of support' do
+        levels = runner_with_levels.levels_for('FIGI')
+        support_price = levels.select { |l| l[:type] == :support }.map { |l| l[:price] }.min
+        next unless support_price
+
+        close_price = support_price * 1.03 # 3% above support, within 5%
+        expect(runner_with_levels.near_support?('FIGI', close_price)).to be true
+      end
+
+      it 'returns false when price is far from support' do
+        expect(runner_with_levels.near_support?('FIGI', 999)).to be false
+      end
+
+      it 'returns false when no resistance above price' do
+        expect(runner_with_levels.near_resistance?('FIGI', 9999)).to be false
+      end
+    end
+
+    describe '#should_buy? with levels (UP trend = hard filter)' do
+      let(:runner_up) do
+        described_class.new(
+          client, tickers: %w[SBER],
+          use_levels: true,
+          level_pivot_window: 2,
+          level_proximity_pct: 0.05,
+          level_cluster_pct: 0.03
+        )
+      end
+
+      before do
+        candles = make_candles_with_levels
+        allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: candles))
+        allow(TradingLogic::Utils).to receive(:now_utc).and_return(Time.utc(2024, 1, 20))
+        allow(runner_up).to receive(:dip_today?).and_return(true)
+        allow(runner_up).to receive(:volume_spike?).and_return(true)
+      end
+
+      it 'blocks buy in :up trend when price is far from support' do
+        expect(runner_up.should_buy?({ figi: 'FIGI', price: 999 }, trend: :up)).to be false
+      end
+
+      it 'allows buy in :up trend when price is near support' do
+        levels = runner_up.levels_for('FIGI')
+        support_price = levels.select { |l| l[:type] == :support }.map { |l| l[:price] }.min
+        next unless support_price
+
+        near_price = support_price * 1.02
+        expect(runner_up.should_buy?({ figi: 'FIGI', price: near_price }, trend: :up)).to be true
+      end
+
+      it 'graceful degradation: allows buy in :up when levels are empty' do
+        allow(runner_up).to receive(:levels_for).and_return([])
+        expect(runner_up.should_buy?({ figi: 'FIGI', price: 100 }, trend: :up)).to be true
+      end
+
+      it 'does not apply level filter in :side trend' do
+        expect(runner_up.should_buy?({ figi: 'FIGI', price: 999 }, trend: :side)).to be true
+      end
+
+      it 'does not apply level filter in :down trend' do
+        expect(runner_up.should_buy?({ figi: 'FIGI', price: 999 }, trend: :down)).to be true
+      end
+    end
+
+    describe '#should_sell? with resistance level trigger' do
+      let(:runner_sell) do
+        described_class.new(
+          client, tickers: %w[SBER],
+          use_levels: true,
+          level_pivot_window: 2,
+          level_proximity_pct: 0.05,
+          level_sell_min_profit: 1.005,
+          level_cluster_pct: 0.03
+        )
+      end
+
+      before do
+        candles = make_candles_with_levels
+        allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: candles))
+        allow(TradingLogic::Utils).to receive(:now_utc).and_return(Time.utc(2024, 1, 20))
+      end
+
+      it 'triggers sell when price near resistance with min profit met' do
+        levels = runner_sell.levels_for('FIGI')
+        res = levels.select { |l| l[:type] == :resistance }.map { |l| l[:price] }.max
+        next unless res
+
+        # avg buy at res * 0.97 (so profit ~3%, above 0.5% min)
+        avg_price = (res * 0.97).to_i
+        cur_price = (res * 0.99).to_i # within 5% of resistance
+
+        position = OpenStruct.new(quantity: OpenStruct.new(units: 1), average_position_price: q(avg_price))
+        allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(cur_price))]))
+
+        expect(runner_sell.should_sell?(position, { figi: 'FIGI' })).to be true
+      end
+
+      it 'does not sell at resistance if min profit not met' do
+        levels = runner_sell.levels_for('FIGI')
+        res = levels.select { |l| l[:type] == :resistance }.map { |l| l[:price] }.max
+        next unless res
+
+        # bought right below resistance — no profit
+        avg_price = (res * 0.999).to_i
+        cur_price = (res * 0.999).to_i
+
+        position = OpenStruct.new(quantity: OpenStruct.new(units: 1), average_position_price: q(avg_price))
+        allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(cur_price))]))
+
+        expect(runner_sell.should_sell?(position, { figi: 'FIGI' })).to be false
+      end
+    end
+  end
+
   describe 'volume-aware buy filters' do
     it 'requires relative volume spike when min_relative_volume is set' do
       runner = described_class.new(client, tickers: %w[SBER], min_relative_volume: 1.5)
       allow(runner).to receive(:dip_today?).and_return(true)
       allow(runner).to receive(:relative_daily_volume).and_return(1.8)
 
-      expect(runner.should_buy?({ figi: 'F1' })).to be true
+      expect(runner.should_buy?({ figi: 'F1', price: 100 })).to be true
 
       allow(runner).to receive(:relative_daily_volume).and_return(1.1)
-      expect(runner.should_buy?({ figi: 'F1' })).to be false
+      expect(runner.should_buy?({ figi: 'F1', price: 100 })).to be false
     end
 
     it 'can rank universe by relative volume or turnover' do

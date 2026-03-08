@@ -35,7 +35,13 @@ module TradingLogic
       volume_lookback_days: 20,
       volume_compare_mode: 'none',
       telegram_bot_token: nil,
-      telegram_chat_id: nil
+      telegram_chat_id: nil,
+      use_levels: true,
+      levels_lookback_days: 120,
+      level_proximity_pct: 0.02,
+      level_sell_min_profit: 1.005,
+      level_pivot_window: 5,
+      level_cluster_pct: 0.015
     )
       @client = client
       @tickers = tickers
@@ -48,6 +54,13 @@ module TradingLogic
       @volume_compare_mode = volume_compare_mode
       @telegram = TelegramConfirm.new(bot_token: telegram_bot_token, chat_id: telegram_chat_id)
       @market_cache = MarketCache.new(@client)
+      @use_levels = use_levels
+      @levels_lookback_days = levels_lookback_days
+      @level_proximity_pct = level_proximity_pct
+      @level_sell_min_profit = level_sell_min_profit
+      @level_pivot_window = level_pivot_window
+      @level_cluster_pct = level_cluster_pct
+      @levels_cache = {}
     end
 
     def refresh_market_cache(force: false)
@@ -212,9 +225,17 @@ module TradingLogic
       end.compact
     end
 
-    # Покупаем на дневной просадке
-    def should_buy?(it)
-      dip_today?(it[:figi]) && volume_spike?(it[:figi])
+    # Покупаем на дневной просадке.
+    # trend: — если :up и уровни включены, применяем hard filter по near_support?.
+    # Graceful degradation: если уровней нет — покупаем по старым правилам.
+    def should_buy?(it, trend: :side)
+      return false unless dip_today?(it[:figi]) && volume_spike?(it[:figi])
+      return true unless @use_levels && trend == :up
+
+      levels = levels_for(it[:figi])
+      return true if levels.empty?
+
+      near_support?(it[:figi], it[:price])
     end
 
     # Сортировка кандидатов по объёмам между бумагами
@@ -236,6 +257,7 @@ module TradingLogic
     # Продаём, если текущая цена >= средней покупки * порог.
     # Порог зависит от тренда: UP=+10%, SIDE=+4%, DOWN=+2%.
     # Можно переопределить через ENV: SELL_THRESHOLD_UP, SELL_THRESHOLD_SIDE, SELL_THRESHOLD_DOWN.
+    # Доп. триггер: если уровни включены и цена у сопротивления (с min profit).
     def should_sell?(position, it, trend: :side)
       qty_units = position.quantity.units.to_i
       return false if qty_units <= 0
@@ -245,7 +267,14 @@ module TradingLogic
       return false unless avg && cur && avg.positive?
 
       threshold = sell_threshold_for_trend(trend)
-      (cur / avg) >= threshold
+      return true if (cur / avg) >= threshold
+
+      if @use_levels && (cur / avg) >= @level_sell_min_profit
+        levels = levels_for(it[:figi])
+        return true if !levels.empty? && near_resistance?(it[:figi], cur)
+      end
+
+      false
     end
 
     def sell_threshold_for_trend(trend)
@@ -339,7 +368,125 @@ module TradingLogic
       end
     end
 
+    # Кэшированный доступ к уровням поддержки/сопротивления для figi.
+    def levels_for(figi)
+      @levels_cache[figi] ||= compute_support_resistance(figi)
+    end
+
+    # Рассчитывает уровни поддержки и сопротивления по дневным свечам.
+    # Возвращает [] при недостатке данных или ошибке.
+    def compute_support_resistance(figi)
+      calendar_days = [@levels_lookback_days * 2, @levels_lookback_days + 30].max
+      resp = Utils.fetch_candles(
+        @client,
+        figi: figi,
+        from: Utils.days_ago(calendar_days),
+        to: Utils.now_utc,
+        interval: DAY
+      )
+      candles = resp&.candles.to_a
+      today_str = Utils.now_utc.strftime('%Y-%m-%d')
+      # только закрытые свечи (без текущей незавершённой)
+      candles = candles.reject { |c| Time.at(c.time.seconds).utc.strftime('%Y-%m-%d') == today_str }
+      candles = candles.last(@levels_lookback_days)
+
+      w = @level_pivot_window
+      return [] if candles.size < (w * 2 + 1)
+
+      lows = candles.map { |c| Utils.q_to_decimal(c.low) }
+      highs = candles.map { |c| Utils.q_to_decimal(c.high) }
+
+      support_prices = []
+      resistance_prices = []
+
+      (w...(candles.size - w)).each do |i|
+        l = lows[i]
+        h = highs[i]
+
+        left_lows  = lows[(i - w)...i]
+        right_lows = lows[(i + 1)..(i + w)]
+        support_prices << l if l && left_lows.all? { |v| v > l } && right_lows.all? { |v| v > l }
+
+        left_highs  = highs[(i - w)...i]
+        right_highs = highs[(i + 1)..(i + w)]
+        resistance_prices << h if h && left_highs.all? { |v| v < h } && right_highs.all? { |v| v < h }
+      end
+
+      supports   = cluster_levels(support_prices,   @level_cluster_pct).map { |p, s| { price: p, type: :support,    strength: s } }
+      resistances = cluster_levels(resistance_prices, @level_cluster_pct).map { |p, s| { price: p, type: :resistance, strength: s } }
+
+      (supports + resistances).sort_by { |l| l[:price] }
+    rescue StandardError
+      []
+    end
+
+    # Ближайший support-уровень <= price, или nil. Возвращает nil если уровни отключены.
+    def nearest_support(figi, price)
+      return nil unless @use_levels
+
+      levels_for(figi).select { |l| l[:type] == :support && l[:price] <= price }.max_by { |l| l[:price] }
+    end
+
+    # Ближайший resistance-уровень >= price, или nil. Возвращает nil если уровни отключены.
+    def nearest_resistance(figi, price)
+      return nil unless @use_levels
+
+      levels_for(figi).select { |l| l[:type] == :resistance && l[:price] >= price }.min_by { |l| l[:price] }
+    end
+
+    # Цена в пределах level_proximity_pct от ближайшего support?
+    def near_support?(figi, price)
+      lvl = nearest_support(figi, price)
+      return false unless lvl
+
+      distance = (price - lvl[:price]) / lvl[:price]
+      distance <= @level_proximity_pct
+    end
+
+    # Цена в пределах level_proximity_pct от ближайшего resistance?
+    def near_resistance?(figi, price)
+      lvl = nearest_resistance(figi, price)
+      return false unless lvl
+
+      distance = (lvl[:price] - price) / lvl[:price]
+      distance <= @level_proximity_pct
+    end
+
+    # Отладочная информация по уровням для тикера
+    def level_debug_info(figi, price)
+      return 'levels disabled' unless @use_levels
+
+      levels = levels_for(figi)
+      return 'no levels computed' if levels.empty?
+
+      sup = nearest_support(figi, price)
+      res = nearest_resistance(figi, price)
+      sup_str = sup ? "support=#{sup[:price].round(2)} dist=#{((price - sup[:price]) / sup[:price] * 100).round(2)}% str=#{sup[:strength]}" : 'no support'
+      res_str = res ? "resistance=#{res[:price].round(2)} dist=#{((res[:price] - price) / res[:price] * 100).round(2)}% str=#{res[:strength]}" : 'no resistance'
+      "#{sup_str} | #{res_str} (total levels: #{levels.size})"
+    end
+
     private
+
+    # Кластеризует массив цен: группирует точки в пределах cluster_pct друг от друга.
+    # Возвращает массив [средняя_цена, количество_точек].
+    def cluster_levels(prices, cluster_pct)
+      sorted = prices.compact.sort
+      clusters = []
+      sorted.each do |p|
+        added = false
+        clusters.each do |cluster|
+          center = cluster.sum / cluster.size
+          if (p - center).abs / center <= cluster_pct
+            cluster << p
+            added = true
+            break
+          end
+        end
+        clusters << [p] unless added
+      end
+      clusters.map { |cluster| [cluster.sum / cluster.size, cluster.size] }
+    end
 
     def technical_api_error?(error)
       text = "#{error.class} #{error.message}"
