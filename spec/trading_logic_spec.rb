@@ -149,12 +149,12 @@ RSpec.describe TradingLogic::Runner do
 
   # Helper: строим mock дневную свечу с заданными low/high/close
   def day_candle(low:, high:, close: nil, time_offset_days: 0)
-    base = Time.utc(2024, 1, 1).to_i + time_offset_days * 86_400
+    base = Time.utc(2024, 1, 1).to_i + (time_offset_days * 86_400)
     OpenStruct.new(
-      low:   q(low),
-      high:  q(high),
+      low: q(low),
+      high: q(high),
       close: q(close || ((low + high) / 2)),
-      time:  OpenStruct.new(seconds: base)
+      time: OpenStruct.new(seconds: base)
     )
   end
 
@@ -234,6 +234,20 @@ RSpec.describe TradingLogic::Runner do
         runner_with_levels.levels_for('FIGI')
         runner_with_levels.levels_for('FIGI')
       end
+
+      it 'recomputes levels after cache ttl expires' do
+        runner = described_class.new(client, tickers: %w[SBER], use_levels: true, levels_cache_ttl_seconds: 1)
+        allow(runner).to receive(:compute_support_resistance).with('FIGI').and_return([{ price: 80, type: :support }])
+
+        now = Time.utc(2024, 1, 20, 10, 0, 0)
+        allow(Time).to receive(:now).and_return(now, now, now + 2, now + 2)
+
+        runner.levels_for('FIGI')
+        runner.levels_for('FIGI')
+        runner.levels_for('FIGI')
+
+        expect(runner).to have_received(:compute_support_resistance).with('FIGI').twice
+      end
     end
 
     describe 'USE_LEVELS=false disables all level access' do
@@ -297,17 +311,27 @@ RSpec.describe TradingLogic::Runner do
       it 'returns false when no resistance above price' do
         expect(runner_with_levels.near_resistance?('FIGI', 9999)).to be false
       end
+
+      it 'returns true when price is within proximity_pct of resistance' do
+        levels = runner_with_levels.levels_for('FIGI')
+        resistance_price = levels.select { |l| l[:type] == :resistance }.map { |l| l[:price] }.max
+        next unless resistance_price
+
+        close_price = resistance_price * 0.98
+        expect(runner_with_levels.near_resistance?('FIGI', close_price)).to be true
+      end
+
+      it 'returns false when support level price is zero' do
+        allow(runner_with_levels).to receive(:nearest_support).with('FIGI', 10).and_return({ price: 0.0 })
+
+        expect(runner_with_levels.near_support?('FIGI', 10)).to be false
+      end
     end
 
     describe '#should_buy? with levels (UP trend = hard filter)' do
       let(:runner_up) do
-        described_class.new(
-          client, tickers: %w[SBER],
-          use_levels: true,
-          level_pivot_window: 2,
-          level_proximity_pct: 0.05,
-          level_cluster_pct: 0.03
-        )
+        described_class.new(client, tickers: %w[SBER], use_levels: true, level_pivot_window: 2,
+                                    level_proximity_pct: 0.05, level_cluster_pct: 0.03)
       end
 
       before do
@@ -347,14 +371,9 @@ RSpec.describe TradingLogic::Runner do
 
     describe '#should_sell? with resistance level trigger' do
       let(:runner_sell) do
-        described_class.new(
-          client, tickers: %w[SBER],
-          use_levels: true,
-          level_pivot_window: 2,
-          level_proximity_pct: 0.05,
-          level_sell_min_profit: 1.005,
-          level_cluster_pct: 0.03
-        )
+        described_class.new(client, tickers: %w[SBER], use_levels: true, level_pivot_window: 2,
+                                    level_proximity_pct: 0.05, level_sell_min_profit: 1.005,
+                                    level_cluster_pct: 0.03)
       end
 
       before do
@@ -391,6 +410,14 @@ RSpec.describe TradingLogic::Runner do
         allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(cur_price))]))
 
         expect(runner_sell.should_sell?(position, { figi: 'FIGI' })).to be false
+      end
+
+      it 'reports debug info for nearest support and resistance' do
+        info = runner_sell.level_debug_info('FIGI', 100)
+
+        expect(info).to include('support=')
+        expect(info).to include('resistance=')
+        expect(info).to include('total levels:')
       end
     end
   end

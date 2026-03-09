@@ -120,7 +120,7 @@ module TradingLogic
     end
 
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
-    def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:, # rubocop:disable Metrics
+    def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:,
                                             max_lot_rub:, account_id:, lots_per_order: 1)
       market = load_cache_normalized(market_cache_path)
       index  = load_cache_normalized(moex_index_cache_path)
@@ -136,158 +136,165 @@ module TradingLogic
 
       return false if inter.empty?
 
-      # Собираем всех валидных кандидатов, потом сортируем (soft boost по support)
-      candidates = []
-
-      inter.each do |tk|
-        warn "DEBUG: processing candidate #{tk}"
-        begin
-          next if acted_today?(state, 'last_buy', tk)
-        rescue StandardError
-          (warn("DEBUG: acted_today? failed for #{tk}")
-           false)
-        end
-
-        item = market.find { |m| m['ticker'] == tk } || {}
-        warn "DEBUG: market item for #{tk} => #{item.keys.inspect}"
-
-        figi = item['figi']
-        if figi.nil?
-          begin
-            r = begin
-              client.grpc_instruments.find_instrument(query: tk)
-            rescue StandardError
-              nil
-            end
-            figi = r&.instruments&.first&.figi
-            warn "DEBUG: resolved figi for #{tk} => #{figi.inspect}"
-          rescue StandardError => e
-            warn "DEBUG: find_instrument(#{tk}) error: #{e.class}: #{e.message}"
-            figi = nil
-          end
-        else
-          warn "DEBUG: item already contains figi=#{figi}"
-        end
-
-        unless figi
-          warn "DEBUG: skip #{tk} — no figi"
-          next
-        end
-
-        # проверка 3 последовательных дневных закрытий вверх (нужны 4 закрытия для 3 приростов)
-        begin
-          resp = client.grpc_market_data.candles(
-            figi: figi,
-            from: (Time.now.utc - (8 * 86_400)),
-            to: Time.now.utc,
-            interval: ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
-          )
-        rescue StandardError => e
-          warn "DEBUG: candles request failed for #{tk}/#{figi}: #{e.class}: #{e.message}"
-          next
-        end
-
-        closes = (resp&.candles || []).map { |c| Utils.q_to_decimal(c.close) }.compact
-        warn "DEBUG: #{tk} closes_count=#{closes.size} sample_last=#{closes.last(5).inspect}"
-
-        if closes.size < 4
-          warn "DEBUG: skip #{tk} — not enough daily closes (need 4 for 3 consecutive increases)"
-          next
-        end
-
-        a = closes[-4]
-        b = closes[-3]
-        c = closes[-2]
-        d = closes[-1]
-        unless a < b && b < c && c < d
-          warn "DEBUG: skip #{tk} — not 3-day momentum (#{[a, b, c, d].map { |v| v.round(2) }.inspect})"
-          next
-        end
-
-        lot = (item['raw'] && (item['raw']['lot'] || item['raw']['LOT'])) || 1
-        price = logic.last_price_for(figi) || (item['raw'] && item['raw']['price'])
-        warn "DEBUG: #{tk} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{(price && lot ? price * lot : nil).inspect}"
-
-        unless price && lot && (price * lot * lots_per_order <= (max_lot_rub || 10_000))
-          warn "DEBUG: skip #{tk} — price/lot missing or too expensive"
-          next
-        end
-
-        # Покупаем только на откате: momentum + intraday dip
-        unless logic.dip_today?(figi)
-          warn "DEBUG: skip #{tk} — momentum OK but no intraday dip"
-          next
-        end
-
-        if pending_order_active?(state, tk)
-          warn "DEBUG: BUY skipped for #{tk} — active pending order cooldown"
-          next
-        end
-
-        buy_value = price * lot * lots_per_order
-        unless position_within_limit?(client, account_id, figi, planned_buy_value: buy_value)
-          warn "DEBUG: BUY skipped for #{tk} — position share limit reached"
-          next
-        end
-
-        # Soft boost: оцениваем близость к support (меньше = лучше, 0.0 = прямо на уровне)
-        support_distance = begin
-          if logic.respond_to?(:near_support?) && price
-            sup = logic.nearest_support(figi, price)
-            sup ? (price - sup[:price]) / sup[:price] : 1.0
-          else
-            1.0
-          end
-        rescue StandardError
-          1.0
-        end
-
-        warn "DEBUG: #{tk} support_distance=#{support_distance.round(4)}"
-        candidates << { tk: tk, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order, support_distance: support_distance }
+      candidates = inter.filter_map do |ticker|
+        build_intersection_candidate(
+          client, logic, state, market, ticker,
+          max_lot_rub: max_lot_rub,
+          account_id: account_id,
+          lots_per_order: lots_per_order
+        )
       end
 
       # Сортируем: кандидаты ближе к support — первыми
       candidates.sort_by! { |c| c[:support_distance] }
       warn "DEBUG: sorted candidates: #{candidates.map { |c| "#{c[:tk]}(#{c[:support_distance].round(3)})" }.inspect}"
 
-      candidates.each do |cand| # rubocop:disable Metrics/BlockLength
-        tk    = cand[:tk]
-        figi  = cand[:figi]
-        lot   = cand[:lot]
-        price = cand[:price]
-
-        result = begin
-          logic.confirm_and_place_order_with_result(
-            account_id: account_id,
-            figi: figi,
-            quantity: lot * lots_per_order,
-            price: price,
-            direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
-            order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
-          )
-        rescue StandardError
-          { ok: false, category: :api_error, status: 'api_error', reject_reason: 'unexpected error',
-            error_code: 'UNKNOWN' }
-        end
-
-        sync_pending_order!(state, tk, result)
-
-        successful_buy = result[:ok] || %w[filled sent_not_filled partially_filled].include?(result[:category].to_s)
-        if successful_buy
-          resp_order = result[:response]
-          warn "DEBUG: BUY accepted for #{tk} (figi=#{figi}) order_id=#{resp_order&.order_id}"
-          begin
-            mark_action!(state, 'last_buy', tk)
-          rescue StandardError
-            nil
-          end
-          return true
-        end
-
-        warn buy_failure_message(tk, result)
+      candidates.each do |candidate|
+        return true if execute_intersection_buy_candidate!(logic, state, candidate, account_id: account_id)
       end
 
       false
+    end
+
+    def build_intersection_candidate(client, logic, state, market, ticker, max_lot_rub:, account_id:, lots_per_order:)
+      warn "DEBUG: processing candidate #{ticker}"
+      return nil if buy_already_processed_today?(state, ticker)
+
+      item = market.find { |market_item| market_item['ticker'] == ticker } || {}
+      warn "DEBUG: market item for #{ticker} => #{item.keys.inspect}"
+
+      figi = resolve_candidate_figi(client, ticker, item)
+      return nil unless figi
+      return nil unless valid_momentum_candidate?(client, ticker, figi)
+
+      lot = (item.dig('raw', 'lot') || item.dig('raw', 'LOT') || 1).to_i
+      price = logic.last_price_for(figi) || item.dig('raw', 'price')
+      price_per_lot = price && lot ? (price * lot) : nil
+      warn "DEBUG: #{ticker} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{price_per_lot.inspect}"
+
+      unless affordable_candidate?(price, lot, lots_per_order, max_lot_rub)
+        warn "DEBUG: skip #{ticker} — price/lot missing or too expensive"
+        return nil
+      end
+
+      unless logic.dip_today?(figi)
+        warn "DEBUG: skip #{ticker} — momentum OK but no intraday dip"
+        return nil
+      end
+
+      if pending_order_active?(state, ticker)
+        warn "DEBUG: BUY skipped for #{ticker} — active pending order cooldown"
+        return nil
+      end
+
+      buy_value = price * lot * lots_per_order
+      unless position_within_limit?(client, account_id, figi, planned_buy_value: buy_value)
+        warn "DEBUG: BUY skipped for #{ticker} — position share limit reached"
+        return nil
+      end
+
+      support_distance = support_distance_for_candidate(logic, figi, price)
+      warn "DEBUG: #{ticker} support_distance=#{support_distance.round(4)}"
+
+      { tk: ticker, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order, support_distance: support_distance }
+    end
+
+    def buy_already_processed_today?(state, ticker)
+      acted_today?(state, 'last_buy', ticker)
+    rescue StandardError
+      warn "DEBUG: acted_today? failed for #{ticker}"
+      false
+    end
+
+    def resolve_candidate_figi(client, ticker, item)
+      figi = item['figi']
+      if figi
+        warn "DEBUG: item already contains figi=#{figi}"
+        return figi
+      end
+
+      response = client.grpc_instruments.find_instrument(query: ticker)
+      figi = response&.instruments&.first&.figi
+      warn "DEBUG: resolved figi for #{ticker} => #{figi.inspect}"
+      warn "DEBUG: skip #{ticker} — no figi" unless figi
+      figi
+    rescue StandardError => e
+      warn "DEBUG: find_instrument(#{ticker}) error: #{e.class}: #{e.message}"
+      nil
+    end
+
+    def valid_momentum_candidate?(client, ticker, figi)
+      response = client.grpc_market_data.candles(
+        figi: figi,
+        from: (Time.now.utc - (8 * 86_400)),
+        to: Time.now.utc,
+        interval: ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
+      )
+      closes = (response&.candles || []).map { |c| Utils.q_to_decimal(c.close) }.compact
+      warn "DEBUG: #{ticker} closes_count=#{closes.size} sample_last=#{closes.last(5).inspect}"
+
+      if closes.size < 4
+        warn "DEBUG: skip #{ticker} — not enough daily closes (need 4 for 3 consecutive increases)"
+        return false
+      end
+
+      sequence = closes.last(4)
+      return true if sequence.each_cons(2).all? { |left, right| left < right }
+
+      warn "DEBUG: skip #{ticker} — not 3-day momentum (#{sequence.map { |value| value.round(2) }.inspect})"
+      false
+    rescue StandardError => e
+      warn "DEBUG: candles request failed for #{ticker}/#{figi}: #{e.class}: #{e.message}"
+      false
+    end
+
+    def affordable_candidate?(price, lot, lots_per_order, max_lot_rub)
+      return false unless price && lot
+
+      (price * lot * lots_per_order) <= (max_lot_rub || 10_000)
+    end
+
+    def support_distance_for_candidate(logic, figi, price)
+      return 1.0 unless logic.respond_to?(:near_support?) && price
+
+      support = logic.nearest_support(figi, price)
+      support ? ((price - support[:price]) / support[:price]) : 1.0
+    rescue StandardError
+      1.0
+    end
+
+    def execute_intersection_buy_candidate!(logic, state, candidate, account_id:)
+      result = begin
+        logic.confirm_and_place_order_with_result(
+          account_id: account_id,
+          figi: candidate[:figi],
+          quantity: candidate[:lot] * candidate[:lots_per_order],
+          price: candidate[:price],
+          direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
+          order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
+        )
+      rescue StandardError
+        { ok: false, category: :api_error, status: 'api_error', reject_reason: 'unexpected error', error_code: 'UNKNOWN' }
+      end
+
+      sync_pending_order!(state, candidate[:tk], result)
+      return handle_successful_intersection_buy!(state, candidate, result) if successful_buy_result?(result)
+
+      warn buy_failure_message(candidate[:tk], result)
+      false
+    end
+
+    def successful_buy_result?(result)
+      result[:ok] || %w[filled sent_not_filled partially_filled].include?(result[:category].to_s)
+    end
+
+    def handle_successful_intersection_buy!(state, candidate, result)
+      response = result[:response]
+      warn "DEBUG: BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) order_id=#{response&.order_id}"
+      mark_action!(state, 'last_buy', candidate[:tk])
+      true
+    rescue StandardError
+      true
     end
 
     def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side)

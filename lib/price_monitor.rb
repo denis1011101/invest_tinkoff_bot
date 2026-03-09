@@ -36,7 +36,8 @@ module TradingLogic
         price = prices[inst[:figi]]
         next unless price
 
-        price *= inst[:scale] if inst[:scale] != 1.0
+        scale = inst[:scale]
+        price *= scale if (scale - 1.0).abs > 1e-10
 
         prev = previous[inst[:query]]
         delta = prev ? price - prev : nil
@@ -116,7 +117,7 @@ module TradingLogic
       upcased = query.to_s.upcase
       preferred = instruments.find { |i| i.ticker.to_s.upcase == upcased && i.class_code == 'TQBR' } ||
                   instruments.find { |i| i.ticker.to_s.upcase == upcased && i.api_trade_available_flag } ||
-                  instruments.find { |i| i.api_trade_available_flag } ||
+                  instruments.find(&:api_trade_available_flag) ||
                   instruments.first
       preferred&.figi
     rescue StandardError

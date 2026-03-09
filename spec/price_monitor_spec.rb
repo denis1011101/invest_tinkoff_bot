@@ -43,10 +43,18 @@ RSpec.describe TradingLogic::PriceMonitor do
 
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'USD000UTSTOM')
-        .and_return(OpenStruct.new(instruments: [OpenStruct.new(ticker: 'USD000UTSTOM', figi: 'FIGI_USD', class_code: 'CETS', api_trade_available_flag: true)]))
+        .and_return(
+          OpenStruct.new(
+            instruments: [OpenStruct.new(ticker: 'USD000UTSTOM', figi: 'FIGI_USD', class_code: 'CETS', api_trade_available_flag: true)]
+          )
+        )
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'SBER')
-        .and_return(OpenStruct.new(instruments: [OpenStruct.new(ticker: 'SBER', figi: 'FIGI_SBER', class_code: 'TQBR', api_trade_available_flag: true)]))
+        .and_return(
+          OpenStruct.new(
+            instruments: [OpenStruct.new(ticker: 'SBER', figi: 'FIGI_SBER', class_code: 'TQBR', api_trade_available_flag: true)]
+          )
+        )
 
       allow(market_data).to receive(:last_prices)
         .with(figis: %w[FIGI_USD FIGI_SBER])
@@ -114,7 +122,11 @@ RSpec.describe TradingLogic::PriceMonitor do
 
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'LKOH')
-        .and_return(OpenStruct.new(instruments: [OpenStruct.new(ticker: 'LKOH', figi: 'FIGI_LKOH', class_code: 'TQBR', api_trade_available_flag: true)]))
+        .and_return(
+          OpenStruct.new(
+            instruments: [OpenStruct.new(ticker: 'LKOH', figi: 'FIGI_LKOH', class_code: 'TQBR', api_trade_available_flag: true)]
+          )
+        )
       allow(market_data).to receive(:last_prices)
         .with(figis: %w[FIGI_USD FIGI_LKOH FIGI_SBER])
         .and_return(OpenStruct.new(last_prices: [
@@ -159,7 +171,11 @@ RSpec.describe TradingLogic::PriceMonitor do
         .and_return(OpenStruct.new(instruments: []))
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'SBER')
-        .and_return(OpenStruct.new(instruments: [OpenStruct.new(ticker: 'SBER', figi: 'FIGI_SBER', class_code: 'TQBR', api_trade_available_flag: true)]))
+        .and_return(
+          OpenStruct.new(
+            instruments: [OpenStruct.new(ticker: 'SBER', figi: 'FIGI_SBER', class_code: 'TQBR', api_trade_available_flag: true)]
+          )
+        )
 
       allow(market_data).to receive(:last_prices)
         .with(figis: %w[FIGI_SBER])
