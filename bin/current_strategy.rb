@@ -100,14 +100,14 @@ begin
   LOGGER.debug("universe (count=#{universe.size}):")
   universe.each do |u|
     LOGGER.debug(format(
-      '  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f  rvol=%5.2f  turnover=%12.0f',
-      u[:ticker] || '',
-      u[:price] || 0.0,
-      u[:lot] || 0,
-      u[:price_per_lot] || 0.0,
-      u[:relative_volume] || 0.0,
-      u[:daily_turnover_rub] || 0.0
-    ))
+                   '  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f  rvol=%5.2f  turnover=%12.0f',
+                   u[:ticker] || '',
+                   u[:price] || 0.0,
+                   u[:lot] || 0,
+                   u[:price_per_lot] || 0.0,
+                   u[:relative_volume] || 0.0,
+                   u[:daily_turnover_rub] || 0.0
+                 ))
   end
   if universe.empty?
     LOGGER.info("no instruments under limit: max_lot_rub=#{MAX_LOT_RUB}, lots_per_order=#{LOTS_PER_ORDER}")

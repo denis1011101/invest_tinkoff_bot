@@ -634,7 +634,7 @@ module TradingLogic
       logger&.error("sell consistency mismatch broker=#{broker_count} state_last_sell=#{state_count}")
     end
 
-    def restore_pending_buy_orders!(client, account_id, state, logger: nil) # rubocop:disable Metrics/PerceivedComplexity
+    def restore_pending_buy_orders!(client, account_id, state, logger: nil)
       ensure_state_defaults!(state)
       return unless client.respond_to?(:grpc_orders)
 
@@ -643,50 +643,70 @@ module TradingLogic
       return if orders.empty?
 
       orders.each do |ord|
-        direction = if ord.respond_to?(:direction)
-                      ord.direction.to_s.upcase
-                    else
-                      ''
-                    end
-        next unless direction.include?('BUY')
+        next unless buy_order?(ord)
 
-        status_str = if ord.respond_to?(:execution_report_status)
-                       ord.execution_report_status.to_s.upcase
-                     elsif ord.respond_to?(:status)
-                       ord.status.to_s.upcase
-                     else
-                       ''
-                     end
-
-        pending_status =
-          if status_str.include?('PARTIALLYFILL')
-            'partially_filled'
-          elsif status_str.include?('NEW') || status_str.include?('ACTIVE') || status_str.include?('FILL')
-            'sent_not_filled'
-          end
+        pending_status = pending_status_for_order(ord)
         next unless pending_status
 
-        figi = ord.respond_to?(:figi) ? ord.figi.to_s : ''
+        figi = order_figi(ord)
         next if figi.empty?
 
         ticker = resolve_ticker_for_sell(client, figi: figi, logger: logger)
         next unless ticker
 
-        client_order_id = if ord.respond_to?(:order_id)
-                            ord.order_id
-                          elsif ord.respond_to?(:order_request_id)
-                            ord.order_request_id
-                          end
-
-        state['pending_orders'][ticker] = {
-          'client_order_id' => client_order_id,
-          'ticker' => ticker,
-          'ts' => Time.now.utc.iso8601,
-          'status' => pending_status
-        }
+        state['pending_orders'][ticker] = restored_pending_order_payload(ord, ticker, pending_status)
       end
     rescue StandardError => e
       logger&.error("pending orders restore failed: #{e.class}: #{e.message}")
+    end
+
+    def buy_order?(order)
+      order_direction(order).include?('BUY')
+    end
+
+    def order_direction(order)
+      return '' unless order.respond_to?(:direction)
+
+      order.direction.to_s.upcase
+    end
+
+    def pending_status_for_order(order)
+      status = order_status(order)
+      return 'partially_filled' if status.include?('PARTIALLYFILL')
+      return 'sent_not_filled' if status.include?('NEW') || status.include?('ACTIVE') || status.include?('FILL')
+
+      nil
+    end
+
+    def order_status(order)
+      if order.respond_to?(:execution_report_status)
+        order.execution_report_status.to_s.upcase
+      elsif order.respond_to?(:status)
+        order.status.to_s.upcase
+      else
+        ''
+      end
+    end
+
+    def order_figi(order)
+      order.respond_to?(:figi) ? order.figi.to_s : ''
+    end
+
+    def restored_pending_order_payload(order, ticker, pending_status)
+      {
+        'client_order_id' => restored_order_id(order),
+        'ticker' => ticker,
+        'ts' => Time.now.utc.iso8601,
+        'status' => pending_status
+      }
+    end
+
+    def restored_order_id(order)
+      if order.respond_to?(:order_id)
+        order.order_id
+      elsif order.respond_to?(:order_request_id)
+        order.order_request_id
+      end
     end
 
     def operation_kind(op)

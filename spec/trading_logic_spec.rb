@@ -20,7 +20,7 @@ RSpec.describe TradingLogic::Runner do
   end
 
   it 'converts protobuf money (units/nano) to decimal' do
-    expect(subject.q_to_decimal(q(123, 500_000_000))).to eq(123.5)
+    expect(TradingLogic::Utils.q_to_decimal(q(123, 500_000_000))).to eq(123.5)
   end
 
   describe '#trend' do
@@ -233,7 +233,7 @@ RSpec.describe TradingLogic::Runner do
 
         levels = runner_with_levels.compute_support_resistance('FIGI')
 
-        expect(levels.any? { |level| level[:price] == 1 || level[:price] == 200 }).to be false
+        expect(levels.any? { |level| [1, 200].include?(level[:price]) }).to be false
       end
 
       it 'returns [] when all candles are filtered out' do

@@ -81,10 +81,6 @@ module TradingLogic
       @market_cache.load_market_cache
     end
 
-    def q_to_decimal(q)
-      Utils.q_to_decimal(q)
-    end
-
     def figi_and_lot(ticker, class_code: 'TQBR')
       resp = Utils.safe_share_by_ticker(@client, ticker, class_code: class_code)
       return [nil, nil] unless resp&.instrument
