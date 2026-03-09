@@ -3,11 +3,12 @@
 module TradingLogic
   module LevelAnalysis
     def levels_for(figi)
-      cached_entry = @levels_cache[figi]
+      cache_key = level_cache_key(figi)
+      cached_entry = @levels_cache[cache_key]
       return cached_entry[:levels] if level_cache_entry_fresh?(cached_entry)
 
       levels = compute_support_resistance(figi)
-      @levels_cache[figi] = { levels: levels, cached_at: Time.now.utc }
+      @levels_cache[cache_key] = { levels: levels, cached_at: Time.now.utc }
       levels
     end
 
@@ -73,8 +74,8 @@ module TradingLogic
     end
 
     def filter_closed_level_candles(candles)
-      today = Utils.now_utc.strftime('%Y-%m-%d')
-      candles.reject { |c| Time.at(c.time.seconds).utc.strftime('%Y-%m-%d') == today }
+      today_start = Utils.today_utc_start
+      candles.reject { |c| candle_time_utc(c) >= today_start }
     end
 
     def extract_level_prices(lows, highs, pivot_window)
@@ -106,24 +107,16 @@ module TradingLogic
     end
 
     def level_near_price?(level, price, reverse: false)
-      return false unless level && level[:price]&.nonzero?
-
-      distance = if reverse
-                   (level[:price] - price) / level[:price]
-                 else
-                   (price - level[:price]) / level[:price]
-                 end
-      distance <= @level_proximity_pct
+      distance = compute_distance(level, price, reverse: reverse)
+      !!(distance && distance <= @level_proximity_pct)
     end
 
     def format_level_debug(type, level, price)
       return "no #{type}" unless level
 
-      distance = if type == :support
-                   (price - level[:price]) / level[:price]
-                 else
-                   (level[:price] - price) / level[:price]
-                 end
+      distance = compute_distance(level, price, reverse: type == :resistance)
+      return "no #{type}" unless distance
+
       "#{type}=#{level[:price].round(2)} dist=#{(distance * 100).round(2)}% str=#{level[:strength]}"
     end
 
@@ -143,6 +136,37 @@ module TradingLogic
     def within_cluster?(price, cluster, cluster_pct)
       center = cluster.sum / cluster.size
       ((price - center).abs / center) <= cluster_pct
+    end
+
+    def compute_distance(level, price, reverse: false)
+      return nil unless level.is_a?(Hash)
+      return nil unless level[:price].is_a?(Numeric) && price.is_a?(Numeric)
+
+      level_price = level[:price]
+      current_price = price
+      return nil if level_price.zero?
+      return nil if level_price.respond_to?(:finite?) && !level_price.finite?
+      return nil if current_price.respond_to?(:finite?) && !current_price.finite?
+
+      if reverse
+        (level_price - current_price) / level_price
+      else
+        (current_price - level_price) / level_price
+      end
+    end
+
+    def candle_time_utc(candle)
+      Time.at(candle.time.seconds).utc
+    end
+
+    def level_cache_key(figi)
+      [
+        figi,
+        @levels_lookback_days,
+        @level_pivot_window,
+        @level_cluster_pct,
+        @level_proximity_pct
+      ]
     end
 
     def level_cache_entry_fresh?(entry)

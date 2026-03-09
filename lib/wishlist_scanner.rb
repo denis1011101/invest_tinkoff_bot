@@ -57,11 +57,12 @@ module TradingLogic
     end
 
     def notify_telegram(results, bot_token:, chat_id:)
-      results.each do |_name, data|
+      results.all? do |_name, data|
         header = data['config']['telegram_header'] || _name
         text = format_telegram_message(header, data['matches'])
-        send_telegram(bot_token: bot_token, chat_id: chat_id, text: text)
+        sent = send_telegram(bot_token: bot_token, chat_id: chat_id, text: text)
         sleep 1
+        sent
       end
     end
 

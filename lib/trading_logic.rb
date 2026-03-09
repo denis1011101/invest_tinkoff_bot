@@ -47,6 +47,7 @@ module TradingLogic
 
     def initialize(client, tickers:, **options)
       settings = DEFAULT_OPTIONS.merge(options)
+      validate_level_settings!(settings)
 
       @client = client
       @tickers = tickers
@@ -378,6 +379,27 @@ module TradingLogic
     end
 
     private
+
+    def validate_level_settings!(settings)
+      assert_positive_integer!(settings[:levels_lookback_days], :levels_lookback_days)
+      assert_positive_number!(settings[:level_proximity_pct], :level_proximity_pct)
+      assert_positive_number!(settings[:level_sell_min_profit], :level_sell_min_profit)
+      assert_positive_integer!(settings[:level_pivot_window], :level_pivot_window)
+      assert_non_negative_number!(settings[:level_cluster_pct], :level_cluster_pct)
+      assert_non_negative_number!(settings[:levels_cache_ttl_seconds], :levels_cache_ttl_seconds)
+    end
+
+    def assert_positive_integer!(value, name)
+      raise ArgumentError, "#{name} must be > 0" unless value.to_i.positive?
+    end
+
+    def assert_positive_number!(value, name)
+      raise ArgumentError, "#{name} must be > 0" unless value.to_f.positive?
+    end
+
+    def assert_non_negative_number!(value, name)
+      raise ArgumentError, "#{name} must be >= 0" if value.to_f.negative?
+    end
 
     def technical_api_error?(error)
       text = "#{error.class} #{error.message}"

@@ -225,6 +225,24 @@ RSpec.describe TradingLogic::Runner do
         allow(TradingLogic::Utils).to receive(:fetch_candles).and_raise(StandardError, 'network error')
         expect(runner_with_levels.compute_support_resistance('FIGI')).to eq([])
       end
+
+      it 'ignores candles from today when building levels' do
+        candles = make_candles_with_levels + [day_candle(low: 1, high: 200, time_offset_days: 19)]
+        allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: candles))
+        allow(TradingLogic::Utils).to receive(:now_utc).and_return(Time.utc(2024, 1, 20, 12, 0, 0))
+
+        levels = runner_with_levels.compute_support_resistance('FIGI')
+
+        expect(levels.any? { |level| level[:price] == 1 || level[:price] == 200 }).to be false
+      end
+
+      it 'returns [] when all candles are filtered out' do
+        today_only = [day_candle(low: 90, high: 100, time_offset_days: 19)]
+        allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: today_only))
+        allow(TradingLogic::Utils).to receive(:now_utc).and_return(Time.utc(2024, 1, 20, 12, 0, 0))
+
+        expect(runner_with_levels.compute_support_resistance('FIGI')).to eq([])
+      end
     end
 
     describe '#levels_for caching' do
@@ -247,6 +265,16 @@ RSpec.describe TradingLogic::Runner do
         runner.levels_for('FIGI')
 
         expect(runner).to have_received(:compute_support_resistance).with('FIGI').twice
+      end
+
+      it 'recomputes levels when clustering params change on the same instance' do
+        allow(runner_with_levels).to receive(:compute_support_resistance).with('FIGI').and_return([{ price: 80, type: :support }])
+
+        runner_with_levels.levels_for('FIGI')
+        runner_with_levels.instance_variable_set(:@level_cluster_pct, 0.05)
+        runner_with_levels.levels_for('FIGI')
+
+        expect(runner_with_levels).to have_received(:compute_support_resistance).with('FIGI').twice
       end
     end
 
@@ -298,7 +326,7 @@ RSpec.describe TradingLogic::Runner do
       it 'returns true when price is within proximity_pct of support' do
         levels = runner_with_levels.levels_for('FIGI')
         support_price = levels.select { |l| l[:type] == :support }.map { |l| l[:price] }.min
-        next unless support_price
+        expect(support_price).not_to be_nil
 
         close_price = support_price * 1.03 # 3% above support, within 5%
         expect(runner_with_levels.near_support?('FIGI', close_price)).to be true
@@ -315,7 +343,7 @@ RSpec.describe TradingLogic::Runner do
       it 'returns true when price is within proximity_pct of resistance' do
         levels = runner_with_levels.levels_for('FIGI')
         resistance_price = levels.select { |l| l[:type] == :resistance }.map { |l| l[:price] }.max
-        next unless resistance_price
+        expect(resistance_price).not_to be_nil
 
         close_price = resistance_price * 0.98
         expect(runner_with_levels.near_resistance?('FIGI', close_price)).to be true
@@ -326,12 +354,24 @@ RSpec.describe TradingLogic::Runner do
 
         expect(runner_with_levels.near_support?('FIGI', 10)).to be false
       end
+
+      it 'returns false when support level price is effectively zero' do
+        allow(runner_with_levels).to receive(:nearest_support).with('FIGI', 10).and_return({ price: Float::EPSILON / 2 })
+
+        expect(runner_with_levels.near_support?('FIGI', 10)).to be false
+      end
     end
 
     describe '#should_buy? with levels (UP trend = hard filter)' do
       let(:runner_up) do
-        described_class.new(client, tickers: %w[SBER], use_levels: true, level_pivot_window: 2,
-                                    level_proximity_pct: 0.05, level_cluster_pct: 0.03)
+        described_class.new(
+          client,
+          tickers: %w[SBER],
+          use_levels: true,
+          level_pivot_window: 2,
+          level_proximity_pct: 0.05,
+          level_cluster_pct: 0.03
+        )
       end
 
       before do
@@ -349,7 +389,7 @@ RSpec.describe TradingLogic::Runner do
       it 'allows buy in :up trend when price is near support' do
         levels = runner_up.levels_for('FIGI')
         support_price = levels.select { |l| l[:type] == :support }.map { |l| l[:price] }.min
-        next unless support_price
+        expect(support_price).not_to be_nil
 
         near_price = support_price * 1.02
         expect(runner_up.should_buy?({ figi: 'FIGI', price: near_price }, trend: :up)).to be true
@@ -371,9 +411,15 @@ RSpec.describe TradingLogic::Runner do
 
     describe '#should_sell? with resistance level trigger' do
       let(:runner_sell) do
-        described_class.new(client, tickers: %w[SBER], use_levels: true, level_pivot_window: 2,
-                                    level_proximity_pct: 0.05, level_sell_min_profit: 1.005,
-                                    level_cluster_pct: 0.03)
+        described_class.new(
+          client,
+          tickers: %w[SBER],
+          use_levels: true,
+          level_pivot_window: 2,
+          level_proximity_pct: 0.05,
+          level_sell_min_profit: 1.005,
+          level_cluster_pct: 0.03
+        )
       end
 
       before do
@@ -385,7 +431,7 @@ RSpec.describe TradingLogic::Runner do
       it 'triggers sell when price near resistance with min profit met' do
         levels = runner_sell.levels_for('FIGI')
         res = levels.select { |l| l[:type] == :resistance }.map { |l| l[:price] }.max
-        next unless res
+        expect(res).not_to be_nil
 
         # avg buy at res * 0.97 (so profit ~3%, above 0.5% min)
         avg_price = (res * 0.97).to_i
@@ -400,7 +446,7 @@ RSpec.describe TradingLogic::Runner do
       it 'does not sell at resistance if min profit not met' do
         levels = runner_sell.levels_for('FIGI')
         res = levels.select { |l| l[:type] == :resistance }.map { |l| l[:price] }.max
-        next unless res
+        expect(res).not_to be_nil
 
         # bought right below resistance — no profit
         avg_price = (res * 0.999).to_i
@@ -419,6 +465,28 @@ RSpec.describe TradingLogic::Runner do
         expect(info).to include('resistance=')
         expect(info).to include('total levels:')
       end
+
+      it 'merges nearby levels when cluster pct is large' do
+        runner = described_class.new(client, tickers: %w[SBER], use_levels: true, level_cluster_pct: 0.5)
+        levels = runner.send(:cluster_levels, [100.0, 105.0, 145.0], 0.5)
+
+        expect(levels.size).to eq(1)
+        expect(levels.first.last).to eq(3)
+      end
+    end
+  end
+
+  describe 'level settings validation' do
+    it 'rejects non-positive pivot window' do
+      expect do
+        described_class.new(client, tickers: %w[SBER], level_pivot_window: 0)
+      end.to raise_error(ArgumentError, /level_pivot_window must be > 0/)
+    end
+
+    it 'rejects negative proximity pct' do
+      expect do
+        described_class.new(client, tickers: %w[SBER], level_proximity_pct: -0.01)
+      end.to raise_error(ArgumentError, /level_proximity_pct must be > 0/)
     end
   end
 

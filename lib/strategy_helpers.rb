@@ -89,7 +89,7 @@ module TradingLogic
       end
     end
 
-    def resolve_ticker_for_sell(client, figi:, fallback_ticker: nil, figi_cache: {})
+    def resolve_ticker_for_sell(client, figi:, fallback_ticker: nil, figi_cache: {}, logger: nil)
       ticker = fallback_ticker.to_s.strip.upcase
       return ticker unless ticker.empty?
       return nil if figi.to_s.strip.empty?
@@ -103,7 +103,7 @@ module TradingLogic
         tk = inst&.ticker.to_s.strip.upcase
         return tk unless tk.empty?
       rescue StandardError => e
-        warn "DEBUG: get_instrument_by failed for figi=#{figi}: #{e.class}: #{e.message}"
+        logger&.debug("get_instrument_by failed for figi=#{figi}: #{e.class}: #{e.message}")
       end
 
       # Fallback: find_instrument по FIGI (поиск по строке)
@@ -113,7 +113,7 @@ module TradingLogic
         tk = found&.ticker.to_s.strip.upcase
         return tk unless tk.empty?
       rescue StandardError => e
-        warn "DEBUG: find_instrument fallback failed for figi=#{figi}: #{e.class}: #{e.message}"
+        logger&.debug("find_instrument fallback failed for figi=#{figi}: #{e.class}: #{e.message}")
       end
 
       nil
@@ -121,18 +121,18 @@ module TradingLogic
 
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
     def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:,
-                                            max_lot_rub:, account_id:, lots_per_order: 1)
+                                            max_lot_rub:, account_id:, lots_per_order: 1, logger: nil)
       market = load_cache_normalized(market_cache_path)
       index  = load_cache_normalized(moex_index_cache_path)
 
       market_tickers = market.map { |i| i['ticker'] }.compact.uniq
       index_tickers  = index.map { |i| i['ticker'] }.compact.uniq
 
-      warn "DEBUG: market_tickers=#{market_tickers.size} sample=#{market_tickers.sample(5).inspect}"
-      warn "DEBUG: index_tickers=#{index_tickers.size} sample=#{index_tickers.sample(5).inspect}"
+      logger&.debug("market_tickers=#{market_tickers.size} sample=#{market_tickers.sample(5).inspect}")
+      logger&.debug("index_tickers=#{index_tickers.size} sample=#{index_tickers.sample(5).inspect}")
 
       inter = market_tickers & index_tickers
-      warn "DEBUG: intersection candidates=#{inter.size} #{inter.sample(10).inspect}"
+      logger&.debug("intersection candidates=#{inter.size} #{inter.sample(10).inspect}")
 
       return false if inter.empty?
 
@@ -141,60 +141,68 @@ module TradingLogic
           client, logic, state, market, ticker,
           max_lot_rub: max_lot_rub,
           account_id: account_id,
-          lots_per_order: lots_per_order
+          lots_per_order: lots_per_order,
+          logger: logger
         )
       end
 
       # Сортируем: кандидаты ближе к support — первыми
       candidates.sort_by! { |c| c[:support_distance] }
-      warn "DEBUG: sorted candidates: #{candidates.map { |c| "#{c[:tk]}(#{c[:support_distance].round(3)})" }.inspect}"
+      logger&.debug("sorted candidates: #{candidates.map { |c| "#{c[:tk]}(#{c[:support_distance].round(3)})" }.inspect}")
 
       candidates.each do |candidate|
-        return true if execute_intersection_buy_candidate!(logic, state, candidate, account_id: account_id)
+        return true if execute_intersection_buy_candidate!(
+          logic,
+          state,
+          candidate,
+          account_id: account_id,
+          logger: logger
+        )
       end
 
       false
     end
 
-    def build_intersection_candidate(client, logic, state, market, ticker, max_lot_rub:, account_id:, lots_per_order:)
-      warn "DEBUG: processing candidate #{ticker}"
+    def build_intersection_candidate(client, logic, state, market, ticker, max_lot_rub:, account_id:, lots_per_order:,
+                                     logger: nil)
+      logger&.debug("processing candidate #{ticker}")
       return nil if buy_already_processed_today?(state, ticker)
 
       item = market.find { |market_item| market_item['ticker'] == ticker } || {}
-      warn "DEBUG: market item for #{ticker} => #{item.keys.inspect}"
+      logger&.debug("market item for #{ticker} => #{item.keys.inspect}")
 
-      figi = resolve_candidate_figi(client, ticker, item)
+      figi = resolve_candidate_figi(client, ticker, item, logger: logger)
       return nil unless figi
-      return nil unless valid_momentum_candidate?(client, ticker, figi)
+      return nil unless valid_momentum_candidate?(client, ticker, figi, logger: logger)
 
       lot = (item.dig('raw', 'lot') || item.dig('raw', 'LOT') || 1).to_i
       price = logic.last_price_for(figi) || item.dig('raw', 'price')
       price_per_lot = price && lot ? (price * lot) : nil
-      warn "DEBUG: #{ticker} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{price_per_lot.inspect}"
+      logger&.debug("#{ticker} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{price_per_lot.inspect}")
 
       unless affordable_candidate?(price, lot, lots_per_order, max_lot_rub)
-        warn "DEBUG: skip #{ticker} — price/lot missing or too expensive"
+        logger&.debug("skip #{ticker} — price/lot missing or too expensive")
         return nil
       end
 
       unless logic.dip_today?(figi)
-        warn "DEBUG: skip #{ticker} — momentum OK but no intraday dip"
+        logger&.debug("skip #{ticker} — momentum OK but no intraday dip")
         return nil
       end
 
       if pending_order_active?(state, ticker)
-        warn "DEBUG: BUY skipped for #{ticker} — active pending order cooldown"
+        logger&.debug("BUY skipped for #{ticker} — active pending order cooldown")
         return nil
       end
 
       buy_value = price * lot * lots_per_order
-      unless position_within_limit?(client, account_id, figi, planned_buy_value: buy_value)
-        warn "DEBUG: BUY skipped for #{ticker} — position share limit reached"
+      unless position_within_limit?(client, account_id, figi, planned_buy_value: buy_value, logger: logger)
+        logger&.debug("BUY skipped for #{ticker} — position share limit reached")
         return nil
       end
 
       support_distance = support_distance_for_candidate(logic, figi, price)
-      warn "DEBUG: #{ticker} support_distance=#{support_distance.round(4)}"
+      logger&.debug("#{ticker} support_distance=#{support_distance.round(4)}")
 
       { tk: ticker, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order, support_distance: support_distance }
     end
@@ -202,28 +210,27 @@ module TradingLogic
     def buy_already_processed_today?(state, ticker)
       acted_today?(state, 'last_buy', ticker)
     rescue StandardError
-      warn "DEBUG: acted_today? failed for #{ticker}"
       false
     end
 
-    def resolve_candidate_figi(client, ticker, item)
+    def resolve_candidate_figi(client, ticker, item, logger: nil)
       figi = item['figi']
       if figi
-        warn "DEBUG: item already contains figi=#{figi}"
+        logger&.debug("item already contains figi=#{figi}")
         return figi
       end
 
       response = client.grpc_instruments.find_instrument(query: ticker)
       figi = response&.instruments&.first&.figi
-      warn "DEBUG: resolved figi for #{ticker} => #{figi.inspect}"
-      warn "DEBUG: skip #{ticker} — no figi" unless figi
+      logger&.debug("resolved figi for #{ticker} => #{figi.inspect}")
+      logger&.debug("skip #{ticker} — no figi") unless figi
       figi
     rescue StandardError => e
-      warn "DEBUG: find_instrument(#{ticker}) error: #{e.class}: #{e.message}"
+      logger&.debug("find_instrument(#{ticker}) error: #{e.class}: #{e.message}")
       nil
     end
 
-    def valid_momentum_candidate?(client, ticker, figi)
+    def valid_momentum_candidate?(client, ticker, figi, logger: nil)
       response = client.grpc_market_data.candles(
         figi: figi,
         from: (Time.now.utc - (8 * 86_400)),
@@ -231,20 +238,20 @@ module TradingLogic
         interval: ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
       )
       closes = (response&.candles || []).map { |c| Utils.q_to_decimal(c.close) }.compact
-      warn "DEBUG: #{ticker} closes_count=#{closes.size} sample_last=#{closes.last(5).inspect}"
+      logger&.debug("#{ticker} closes_count=#{closes.size} sample_last=#{closes.last(5).inspect}")
 
       if closes.size < 4
-        warn "DEBUG: skip #{ticker} — not enough daily closes (need 4 for 3 consecutive increases)"
+        logger&.debug("skip #{ticker} — not enough daily closes (need 4 for 3 consecutive increases)")
         return false
       end
 
       sequence = closes.last(4)
       return true if sequence.each_cons(2).all? { |left, right| left < right }
 
-      warn "DEBUG: skip #{ticker} — not 3-day momentum (#{sequence.map { |value| value.round(2) }.inspect})"
+      logger&.debug("skip #{ticker} — not 3-day momentum (#{sequence.map { |value| value.round(2) }.inspect})")
       false
     rescue StandardError => e
-      warn "DEBUG: candles request failed for #{ticker}/#{figi}: #{e.class}: #{e.message}"
+      logger&.debug("candles request failed for #{ticker}/#{figi}: #{e.class}: #{e.message}")
       false
     end
 
@@ -263,7 +270,7 @@ module TradingLogic
       1.0
     end
 
-    def execute_intersection_buy_candidate!(logic, state, candidate, account_id:)
+    def execute_intersection_buy_candidate!(logic, state, candidate, account_id:, logger: nil)
       result = begin
         logic.confirm_and_place_order_with_result(
           account_id: account_id,
@@ -278,9 +285,9 @@ module TradingLogic
       end
 
       sync_pending_order!(state, candidate[:tk], result)
-      return handle_successful_intersection_buy!(state, candidate, result) if successful_buy_result?(result)
+      return handle_successful_intersection_buy!(state, candidate, result, logger: logger) if successful_buy_result?(result)
 
-      warn buy_failure_message(candidate[:tk], result)
+      logger&.warn(buy_failure_message(candidate[:tk], result))
       false
     end
 
@@ -288,16 +295,16 @@ module TradingLogic
       result[:ok] || %w[filled sent_not_filled partially_filled].include?(result[:category].to_s)
     end
 
-    def handle_successful_intersection_buy!(state, candidate, result)
+    def handle_successful_intersection_buy!(state, candidate, result, logger: nil)
       response = result[:response]
-      warn "DEBUG: BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) order_id=#{response&.order_id}"
+      logger&.debug("BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) order_id=#{response&.order_id}")
       mark_action!(state, 'last_buy', candidate[:tk])
       true
     rescue StandardError
       true
     end
 
-    def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side)
+    def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side, logger: nil)
       port = client.grpc_operations.portfolio(account_id: account_id)
       positions = port.positions
       positions.each do |p| # rubocop:disable Metrics/BlockLength
@@ -307,7 +314,7 @@ module TradingLogic
         if p.respond_to?(:instrument_type)
           inst_type = p.instrument_type.to_s.upcase
           unless inst_type.include?('SHARE')
-            warn "DEBUG: SELL skip non-share position figi=#{figi} type=#{inst_type}"
+            logger&.debug("SELL skip non-share position figi=#{figi} type=#{inst_type}")
             next
           end
         end
@@ -315,9 +322,9 @@ module TradingLogic
         qty_units = p.quantity.units.to_i
         next if qty_units <= 0
 
-        ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache)
+        ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache, logger: logger)
         unless ticker
-          warn "DEBUG: SELL ticker resolution failed (likely non-share) figi=#{figi} qty=#{qty_units}"
+          logger&.debug("SELL ticker resolution failed (likely non-share) figi=#{figi} qty=#{qty_units}")
           next
         end
 
@@ -348,10 +355,10 @@ module TradingLogic
           nil
         end
         if resp
-          puts "SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})"
+          logger&.info("SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})")
           mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'signal')
         else
-          puts "SELL #{ticker} skipped / not confirmed"
+          logger&.info("SELL #{ticker} skipped / not confirmed")
         end
       end
     end
@@ -397,7 +404,7 @@ module TradingLogic
     # Проверяет, не превысит ли позиция по figi долю портфеля после покупки.
     # planned_buy_value — стоимость планируемой покупки (qty * price), включается в расчёт.
     # portfolio — предзагруженный портфель (чтобы не дёргать API повторно).
-    def position_within_limit?(client, account_id, figi, max_share: nil, planned_buy_value: 0, portfolio: nil)
+    def position_within_limit?(client, account_id, figi, max_share: nil, planned_buy_value: 0, portfolio: nil, logger: nil)
       max_share ||= (ENV['MAX_POSITION_SHARE'] || '0.33').to_f
       return true if max_share <= 0 || max_share >= 1.0
 
@@ -420,7 +427,7 @@ module TradingLogic
       post_trade_total = total + planned_buy_value.to_f
       share = post_trade_value / post_trade_total
       if share >= max_share
-        warn "DEBUG: position limit reached for figi=#{figi} post_trade_share=#{(share * 100).round(1)}% >= #{(max_share * 100).round(1)}%"
+        logger&.debug("position limit reached for figi=#{figi} post_trade_share=#{(share * 100).round(1)}% >= #{(max_share * 100).round(1)}%")
         return false
       end
       true
@@ -428,7 +435,7 @@ module TradingLogic
       true
     end
 
-    def cleanup_pending_orders!(client, account_id, state)
+    def cleanup_pending_orders!(client, account_id, state, logger: nil)
       ensure_state_defaults!(state)
       pending = state['pending_orders']
       return if pending.empty?
@@ -449,7 +456,7 @@ module TradingLogic
         next false if order_id.empty?
 
         unless active_order_ids.include?(order_id)
-          warn "DEBUG: cleaned up pending order for #{ticker} (order_id=#{order_id})"
+          logger&.debug("cleaned up pending order for #{ticker} (order_id=#{order_id})")
           true
         end
       end
@@ -500,7 +507,7 @@ module TradingLogic
       File.write(path, JSON.pretty_generate(state))
     end
 
-    def restore_state_from_broker_if_empty!(client, account_id, state, day: today_key)
+    def restore_state_from_broker_if_empty!(client, account_id, state, day: today_key, logger: nil)
       ensure_state_defaults!(state)
       has_actions = state['last_buy'].any? || state['last_sell'].any?
       has_pending = state['pending_orders'].any?
@@ -526,7 +533,7 @@ module TradingLogic
         figi = op.respond_to?(:figi) ? op.figi.to_s : ''
         next if figi.empty?
 
-        ticker = resolve_ticker_for_sell(client, figi: figi)
+        ticker = resolve_ticker_for_sell(client, figi: figi, logger: logger)
         next unless ticker
 
         ts = operation_ts_iso8601(op)
@@ -542,10 +549,10 @@ module TradingLogic
         end
       end
 
-      restore_pending_buy_orders!(client, account_id, state)
+      restore_pending_buy_orders!(client, account_id, state, logger: logger)
       state
     rescue StandardError => e
-      warn "ERROR: state restore from broker failed: #{e.class}: #{e.message}"
+      logger&.error("state restore from broker failed: #{e.class}: #{e.message}")
       state
     end
 
@@ -591,7 +598,7 @@ module TradingLogic
       sell.values.count { |v| v.is_a?(Hash) && v['ts'].to_s.start_with?(day) }
     end
 
-    def broker_sell_orders_count_for_day(client, account_id, day: today_key)
+    def broker_sell_orders_count_for_day(client, account_id, day: today_key, logger: nil)
       from = Time.parse("#{day}T00:00:00Z")
       to = Time.parse("#{day}T23:59:59Z")
       operations = []
@@ -613,21 +620,21 @@ module TradingLogic
         value.to_s.upcase.include?('SELL')
       end
     rescue StandardError => e
-      warn "ERROR: broker sell consistency check failed: #{e.class}: #{e.message}"
+      logger&.error("broker sell consistency check failed: #{e.class}: #{e.message}")
       nil
     end
 
-    def check_sell_consistency!(client, account_id, state)
-      broker_count = broker_sell_orders_count_for_day(client, account_id)
+    def check_sell_consistency!(client, account_id, state, logger: nil)
+      broker_count = broker_sell_orders_count_for_day(client, account_id, logger: logger)
       return if broker_count.nil?
 
       state_count = state_last_sell_count_for_day(state)
       return if broker_count == state_count
 
-      warn "ERROR: sell consistency mismatch broker=#{broker_count} state_last_sell=#{state_count}"
+      logger&.error("sell consistency mismatch broker=#{broker_count} state_last_sell=#{state_count}")
     end
 
-    def restore_pending_buy_orders!(client, account_id, state) # rubocop:disable Metrics/PerceivedComplexity
+    def restore_pending_buy_orders!(client, account_id, state, logger: nil) # rubocop:disable Metrics/PerceivedComplexity
       ensure_state_defaults!(state)
       return unless client.respond_to?(:grpc_orders)
 
@@ -662,7 +669,7 @@ module TradingLogic
         figi = ord.respond_to?(:figi) ? ord.figi.to_s : ''
         next if figi.empty?
 
-        ticker = resolve_ticker_for_sell(client, figi: figi)
+        ticker = resolve_ticker_for_sell(client, figi: figi, logger: logger)
         next unless ticker
 
         client_order_id = if ord.respond_to?(:order_id)
@@ -679,7 +686,7 @@ module TradingLogic
         }
       end
     rescue StandardError => e
-      warn "ERROR: pending orders restore failed: #{e.class}: #{e.message}"
+      logger&.error("pending orders restore failed: #{e.class}: #{e.message}")
     end
 
     def operation_kind(op)

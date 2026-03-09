@@ -24,8 +24,11 @@ bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV.fetch('TELEGRAM_BOT_TOKEN'
 chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV.fetch('TELEGRAM_CHAT_ID', nil)
 
 if bot_token && chat_id && !bot_token.empty? && !chat_id.empty?
-  scanner.notify_telegram(results, bot_token: bot_token, chat_id: chat_id)
-  puts 'Telegram notifications sent'
+  if scanner.notify_telegram(results, bot_token: bot_token, chat_id: chat_id)
+    puts 'Telegram notifications sent'
+  else
+    abort 'Telegram notifications failed'
+  end
 else
   puts 'Telegram not configured, results saved to disk only'
 end
