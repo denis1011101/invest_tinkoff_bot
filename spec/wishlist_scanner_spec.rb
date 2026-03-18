@@ -245,7 +245,7 @@ RSpec.describe TradingLogic::WishlistScanner do
 
       allow(TradingLogic::StrategyHelpers).to receive(:load_cache_normalized)
         .with(anything)
-        .and_wrap_original do |method, path|
+        .and_wrap_original do |method, _path|
           method.call(moex_path)
         end
 
@@ -277,11 +277,12 @@ RSpec.describe TradingLogic::WishlistScanner do
         .with(hash_including(ticker: 'GONE'))
         .and_return(nil)
 
-      allow(TradingLogic::StrategyHelpers).to receive(:load_cache_normalized)
+      allow(TradingLogic::StrategyHelpers).to(
+        receive(:load_cache_normalized)
         .with(anything)
         .and_wrap_original { |_method, _path| TradingLogic::StrategyHelpers.load_cache_normalized(moex_path) }
+      )
 
-      # Need to call the original for the moex_path
       allow(TradingLogic::StrategyHelpers).to receive(:load_cache_normalized)
         .with(moex_path)
         .and_call_original
