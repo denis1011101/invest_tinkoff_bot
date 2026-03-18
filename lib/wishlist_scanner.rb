@@ -77,7 +77,18 @@ module TradingLogic
       when 'market_cache'
         @market_cache.load_market_cache.map { |h| { 'ticker' => h['ticker'], 'figi' => h['figi'] } }
       when 'moex_index'
-        StrategyHelpers.load_cache_normalized(File.expand_path('../tmp/moex_index_cache.json', __dir__))
+        raw = StrategyHelpers.load_cache_normalized(File.expand_path('../tmp/moex_index_cache.json', __dir__))
+        raw.filter_map do |h|
+          ticker = h['ticker']
+          figi = h['figi']
+          unless figi
+            resp = Utils.safe_share_by_ticker(@client, ticker)
+            next unless resp&.instrument
+
+            figi = resp.instrument.figi
+          end
+          { 'ticker' => ticker, 'figi' => figi }
+        end
       when Array
         universe_spec.filter_map do |ticker|
           resp = Utils.safe_share_by_ticker(@client, ticker)

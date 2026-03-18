@@ -217,6 +217,83 @@ RSpec.describe TradingLogic::WishlistScanner do
     end
   end
 
+  describe '#resolve_universe (moex_index)' do
+    it 'resolves figi by ticker when moex_index cache has no figi' do
+      dir = Dir.mktmpdir
+      moex_path = File.join(dir, 'moex_index_cache.json')
+      File.write(moex_path, JSON.generate({
+                                            'instruments' => [
+                                              { 'ticker' => 'SBER' },
+                                              { 'ticker' => 'ROSN' }
+                                            ]
+                                          }))
+
+      stub_const('TradingLogic::WishlistScanner::WISHLISTS_DIR', File.join(dir, 'wishlists'))
+
+      sber_resp = OpenStruct.new(instrument: OpenStruct.new(figi: 'FIGI_SBER'))
+      rosn_resp = OpenStruct.new(instrument: OpenStruct.new(figi: 'FIGI_ROSN'))
+
+      allow(instruments_svc).to receive(:share_by_ticker)
+        .with(hash_including(ticker: 'SBER'))
+        .and_return(sber_resp)
+      allow(instruments_svc).to receive(:share_by_ticker)
+        .with(hash_including(ticker: 'ROSN'))
+        .and_return(rosn_resp)
+
+      allow(TradingLogic::StrategyHelpers).to receive(:load_cache_normalized)
+        .and_call_original
+
+      allow(TradingLogic::StrategyHelpers).to receive(:load_cache_normalized)
+        .with(anything)
+        .and_wrap_original do |method, path|
+          method.call(moex_path)
+        end
+
+      result = subject.send(:resolve_universe, 'moex_index')
+
+      expect(result).to contain_exactly(
+        { 'ticker' => 'SBER', 'figi' => 'FIGI_SBER' },
+        { 'ticker' => 'ROSN', 'figi' => 'FIGI_ROSN' }
+      )
+    ensure
+      FileUtils.rm_rf(dir)
+    end
+
+    it 'skips instruments when share_by_ticker returns nil' do
+      dir = Dir.mktmpdir
+      moex_path = File.join(dir, 'moex_index_cache.json')
+      File.write(moex_path, JSON.generate({
+                                            'instruments' => [
+                                              { 'ticker' => 'SBER' },
+                                              { 'ticker' => 'GONE' }
+                                            ]
+                                          }))
+
+      sber_resp = OpenStruct.new(instrument: OpenStruct.new(figi: 'FIGI_SBER'))
+      allow(instruments_svc).to receive(:share_by_ticker)
+        .with(hash_including(ticker: 'SBER'))
+        .and_return(sber_resp)
+      allow(instruments_svc).to receive(:share_by_ticker)
+        .with(hash_including(ticker: 'GONE'))
+        .and_return(nil)
+
+      allow(TradingLogic::StrategyHelpers).to receive(:load_cache_normalized)
+        .with(anything)
+        .and_wrap_original { |_method, _path| TradingLogic::StrategyHelpers.load_cache_normalized(moex_path) }
+
+      # Need to call the original for the moex_path
+      allow(TradingLogic::StrategyHelpers).to receive(:load_cache_normalized)
+        .with(moex_path)
+        .and_call_original
+
+      result = subject.send(:resolve_universe, 'moex_index')
+      expect(result.size).to eq(1)
+      expect(result[0]['ticker']).to eq('SBER')
+    ensure
+      FileUtils.rm_rf(dir)
+    end
+  end
+
   describe '#scan_all' do
     it 'loads and scans all wishlist files from directory' do
       dir = Dir.mktmpdir
