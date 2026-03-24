@@ -103,8 +103,8 @@ module TradingLogic
       static, dynamic = results.partition { |r| r[:group] == :static }
       dynamic = dynamic.sort_by do |r|
         [
-          r[:delta] ? 0 : 1,
-          -(r[:delta] || 0.0),
+          r[:delta_pct] ? 0 : 1,
+          -(r[:delta_pct] || 0.0),
           r[:sort_index]
         ]
       end
@@ -171,7 +171,10 @@ module TradingLogic
       if results.empty?
         lines << '_Нет данных_'
       else
+        prev_group = nil
         results.each do |r|
+          lines << '' if prev_group && prev_group != r[:group]
+          prev_group = r[:group]
           label = r[:label].to_s.delete('`')
           price = escape_md(format_price(r[:price]))
           delta_str = format_delta(r[:delta], r[:delta_pct])

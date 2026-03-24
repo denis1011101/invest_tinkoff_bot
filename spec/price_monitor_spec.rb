@@ -103,7 +103,7 @@ RSpec.describe TradingLogic::PriceMonitor do
       expect(results[0][:delta_pct]).to be_nil
     end
 
-    it 'keeps static instruments first and sorts dynamic ones by descending delta' do
+    it 'keeps static instruments first and sorts dynamic ones by descending delta_pct' do
       config = {
         'telegram_header' => 'Test',
         'static_instruments' => [
@@ -114,7 +114,7 @@ RSpec.describe TradingLogic::PriceMonitor do
           { 'label' => 'Сбер', 'query' => 'SBER' }
         ]
       }
-      prev_state = { 'prices' => { 'USD000UTSTOM' => 92.0, 'LKOH' => 7000.0, 'SBER' => 240.0 } }
+      prev_state = { 'prices' => { 'USD000UTSTOM' => 92.0, 'LKOH' => 10_000.0, 'SBER' => 100.0 } }
 
       allow(File).to receive(:read).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(JSON.generate(config))
       allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(true)
@@ -131,15 +131,15 @@ RSpec.describe TradingLogic::PriceMonitor do
         .with(figis: %w[FIGI_USD FIGI_LKOH FIGI_SBER])
         .and_return(OpenStruct.new(last_prices: [
                                      OpenStruct.new(figi: 'FIGI_USD', price: q(92, 450_000_000)),
-                                     OpenStruct.new(figi: 'FIGI_LKOH', price: q(7_500, 0)),
-                                     OpenStruct.new(figi: 'FIGI_SBER', price: q(245, 300_000_000))
+                                     OpenStruct.new(figi: 'FIGI_LKOH', price: q(10_300, 0)),
+                                     OpenStruct.new(figi: 'FIGI_SBER', price: q(105, 0))
                                    ]))
       allow(File).to receive(:write).and_return(nil)
       allow(FileUtils).to receive(:mkdir_p)
 
       results = subject.fetch_all
 
-      expect(results.map { |r| r[:label] }).to eq(['USD/RUB', 'Лукойл', 'Сбер'])
+      expect(results.map { |r| r[:label] }).to eq(['USD/RUB', 'Сбер', 'Лукойл'])
     end
 
     it 'supports legacy single instruments list' do
