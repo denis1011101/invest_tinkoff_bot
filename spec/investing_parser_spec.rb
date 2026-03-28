@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require_relative 'spec_helper'
-require 'ostruct'
 require_relative '../lib/investing_parser'
 
 RSpec.describe TradingLogic::InvestingParser do
@@ -11,6 +10,20 @@ RSpec.describe TradingLogic::InvestingParser do
   let(:now_proc) { -> { current_time } }
   let(:sleep_proc) { ->(seconds) { sleep_calls << seconds } }
   let(:warn_proc) { ->(message) { warnings << message } }
+
+  def mock_response(code: '200', body: '<html></html>', cookies: [])
+    resp = double('response', code: code, body: body)
+    allow(resp).to receive(:get_fields).with('set-cookie').and_return(cookies)
+    resp
+  end
+
+  def warm_up_response
+    mock_response
+  end
+
+  def ok_response(html)
+    mock_response(body: html)
+  end
 
   it 'parses price and daily change from the top quote block' do
     html = <<~HTML
@@ -26,7 +39,13 @@ RSpec.describe TradingLogic::InvestingParser do
     HTML
 
     parser = described_class.new(
-      http_getter: ->(_uri, _headers) { OpenStruct.new(code: '200', body: html) },
+      http_getter: lambda { |uri, _headers|
+        if uri.path == '' || uri.path == '/'
+          warm_up_response
+        else
+          ok_response(html)
+        end
+      },
       now_proc: now_proc,
       sleep_proc: sleep_proc,
       warn_proc: warn_proc
@@ -57,9 +76,13 @@ RSpec.describe TradingLogic::InvestingParser do
     parser = described_class.new(
       sleep_range: 0.0..0.0,
       http_getter: lambda { |uri, _headers|
-        calls += 1
-        expect(uri.to_s).to eq('https://ru.investing.com/currencies/usd-rub')
-        OpenStruct.new(code: '200', body: html)
+        if uri.path == '' || uri.path == '/'
+          warm_up_response
+        else
+          calls += 1
+          expect(uri.to_s).to eq('https://ru.investing.com/currencies/usd-rub')
+          ok_response(html)
+        end
       },
       now_proc: now_proc,
       sleep_proc: sleep_proc,
@@ -89,12 +112,16 @@ RSpec.describe TradingLogic::InvestingParser do
     HTML
 
     parser = described_class.new(
-      http_getter: lambda { |_uri, _headers|
-        attempt += 1
-        if attempt == 1
-          OpenStruct.new(code: '503', body: 'Service unavailable')
+      http_getter: lambda { |uri, _headers|
+        if uri.path == '' || uri.path == '/'
+          warm_up_response
         else
-          OpenStruct.new(code: '200', body: html)
+          attempt += 1
+          if attempt == 1
+            mock_response(code: '503', body: 'Service unavailable')
+          else
+            ok_response(html)
+          end
         end
       },
       now_proc: now_proc,
@@ -120,7 +147,13 @@ RSpec.describe TradingLogic::InvestingParser do
     HTML
 
     parser = described_class.new(
-      http_getter: ->(_uri, _headers) { OpenStruct.new(code: '200', body: html) },
+      http_getter: lambda { |uri, _headers|
+        if uri.path == '' || uri.path == '/'
+          warm_up_response
+        else
+          ok_response(html)
+        end
+      },
       now_proc: now_proc,
       sleep_proc: sleep_proc,
       warn_proc: warn_proc
@@ -130,5 +163,36 @@ RSpec.describe TradingLogic::InvestingParser do
 
     expect(quote[:price]).to eq(81.5)
     expect(warnings).to include('InvestingParser: anchor text not found, scanning from top of document')
+  end
+
+  it 'collects cookies from warm-up and sends them with subsequent requests' do
+    received_cookies = nil
+    html = <<~HTML
+      <html>
+        <body>
+          <div>Добавить в список наблюдения</div>
+          <div>100,00</div>
+        </body>
+      </html>
+    HTML
+
+    parser = described_class.new(
+      http_getter: lambda { |uri, headers|
+        if uri.path == '' || uri.path == '/'
+          mock_response(cookies: ['__cf_bm=abc123; path=/; HttpOnly', 'session_id=xyz; path=/'])
+        else
+          received_cookies = headers['Cookie']
+          ok_response(html)
+        end
+      },
+      now_proc: now_proc,
+      sleep_proc: sleep_proc,
+      warn_proc: warn_proc
+    )
+
+    parser.fetch_quote('/test')
+
+    expect(received_cookies).to include('__cf_bm=abc123')
+    expect(received_cookies).to include('session_id=xyz')
   end
 end

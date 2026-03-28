@@ -48,10 +48,12 @@ module TradingLogic
       @sleep_proc = sleep_proc || ->(seconds) { sleep(seconds) }
       @warn_proc = warn_proc || ->(message) { warn(message) }
       @last_fetch_at = nil
+      @cookies = {}
     end
 
     def fetch_quote(path)
       normalized_path = normalize_path(path)
+      warm_up_session! if @cookies.empty?
       throttle_requests!
 
       quote = fetch_quote_uncached(normalized_path)
@@ -67,7 +69,9 @@ module TradingLogic
 
       begin
         attempts += 1
-        response = @http_getter.call(uri, default_headers)
+        headers = default_headers.merge(cookie_header)
+        response = @http_getter.call(uri, headers)
+        collect_cookies(response)
         code = response.code.to_i
         raise HttpError, "HTTP #{code}" if retriable_status?(code)
         raise HttpError, "HTTP #{code}" unless success_status?(code)
@@ -330,6 +334,28 @@ module TradingLogic
 
       delay = rand(@sleep_range) - elapsed
       @sleep_proc.call(delay) if delay.positive?
+    end
+
+    def warm_up_session!
+      uri = URI.parse(BASE_URL)
+      response = @http_getter.call(uri, default_headers)
+      collect_cookies(response)
+      @last_fetch_at = now
+    rescue StandardError => e
+      warn_once("session warm-up failed: #{e.message}")
+    end
+
+    def cookie_header
+      return {} if @cookies.empty?
+
+      { 'Cookie' => @cookies.map { |k, v| "#{k}=#{v}" }.join('; ') }
+    end
+
+    def collect_cookies(response)
+      Array(response.get_fields('set-cookie')).each do |cookie_str|
+        name, value = cookie_str.split(';').first.split('=', 2)
+        @cookies[name.strip] = value.to_s.strip if name
+      end
     end
 
     def warn_once(message)
