@@ -231,7 +231,11 @@ RSpec.describe TradingLogic::PriceMonitor do
   describe '#format_monitor_message' do
     it 'formats results with delta arrows' do
       results = [
-        { label: 'USD/RUB', query: '/currencies/usd-rub', price: 92.45, prev_price: 92.0, delta: 0.45, delta_pct: 0.489, state_key: 'investing:/currencies/usd-rub' },
+        {
+          label: 'USD/RUB', query: '/currencies/usd-rub', price: 92.45,
+          prev_price: 92.0, delta: 0.45, delta_pct: 0.489,
+          state_key: 'investing:/currencies/usd-rub'
+        },
         { label: 'SBER', query: 'SBER', price: 245.3, prev_price: 250.0, delta: -4.7, delta_pct: -1.88, state_key: 'tinkoff:SBER' }
       ]
       msg = monitor.send(:format_monitor_message, 'Котировки', results)

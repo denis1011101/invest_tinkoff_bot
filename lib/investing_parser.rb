@@ -25,7 +25,7 @@ module TradingLogic
       SocketError
     ].freeze
 
-    NUMBER_LINE_REGEX = /\A[+\-−]?\d[\d.\s\u00A0]*(?:,\d+)?%?\z/.freeze
+    NUMBER_LINE_REGEX = /\A[+-−]?\d[\d.\s\u00A0]*(?:,\d+)?%?\z/
     COMBINED_CHANGE_REGEX = /
       (?<delta>[+\-−]?\d[\d.\s\u00A0]*(?:,\d+)?)
       \s*
@@ -35,7 +35,7 @@ module TradingLogic
       %
       \s*
       \)
-    /x.freeze
+    /x
 
     class ParseError < StandardError; end
     class HttpError < StandardError; end
@@ -146,46 +146,11 @@ module TradingLogic
     def parse_from_lines(lines)
       return nil if lines.empty?
 
-      anchor_index = lines.find_index { |line| line.include?('Добавить в список наблюдения') } ||
-                     lines.find_index { |line| line.start_with?('Цена в ') } ||
-                     begin
-                       warn_once('anchor text not found, scanning from top of document')
-                       0
-                     end
-
-      window = lines[anchor_index, 16] || lines.first(16)
-      price_idx = window.find_index { |line| number_line?(line, allow_percent: false) }
-      return nil unless price_idx
-
-      price = parse_number(window[price_idx])
+      window = quote_window(lines)
+      price, trailing_lines = parse_price_from_window(window)
       return nil unless price
 
-      delta = nil
-      delta_pct = nil
-      trailing_lines = window[(price_idx + 1)..] || []
-
-      trailing_lines.each do |line|
-        next if line.empty?
-
-        parsed_delta, parsed_pct = parse_change_text(line)
-        if parsed_delta || parsed_pct
-          delta ||= parsed_delta
-          delta_pct ||= parsed_pct
-          break if delta && delta_pct
-        end
-
-        next unless number_line?(line)
-
-        if delta.nil?
-          delta = parse_number(line)
-          next
-        end
-
-        if delta_pct.nil? && line.include?('%')
-          delta_pct = parse_percent(line)
-          break
-        end
-      end
+      delta, delta_pct = parse_change_from_lines(trailing_lines)
 
       {
         price: price,
@@ -197,12 +162,60 @@ module TradingLogic
     def extract_lines(document, html)
       return document.xpath('//text()').map { |node| normalize_whitespace(node.text) }.reject(&:empty?) if document
 
-      html.gsub(/<script.*?<\/script>/m, ' ')
-          .gsub(/<style.*?<\/style>/m, ' ')
+      html.gsub(%r{<script.*?</script>}m, ' ')
+          .gsub(%r{<style.*?</style>}m, ' ')
           .gsub(/<[^>]+>/, "\n")
           .lines
           .map { |line| normalize_whitespace(line) }
           .reject(&:empty?)
+    end
+
+    def quote_window(lines)
+      anchor_index = lines.find_index { |line| line.include?('Добавить в список наблюдения') } ||
+                     lines.find_index { |line| line.start_with?('Цена в ') }
+
+      unless anchor_index
+        warn_once('anchor text not found, scanning from top of document')
+        anchor_index = 0
+      end
+
+      lines[anchor_index, 16] || lines.first(16)
+    end
+
+    def parse_price_from_window(window)
+      price_idx = window.find_index { |line| number_line?(line, allow_percent: false) }
+      return [nil, []] unless price_idx
+
+      price = parse_number(window[price_idx])
+      trailing_lines = window[(price_idx + 1)..] || []
+      [price, trailing_lines]
+    end
+
+    def parse_change_from_lines(lines)
+      delta = nil
+      delta_pct = nil
+
+      lines.each do |line|
+        next if line.empty?
+
+        delta, delta_pct = apply_change_line(line, delta, delta_pct)
+        break if delta && delta_pct
+      end
+
+      [delta, delta_pct]
+    end
+
+    def apply_change_line(line, delta, delta_pct)
+      parsed_delta, parsed_pct = parse_change_text(line)
+      delta ||= parsed_delta
+      delta_pct ||= parsed_pct
+      return [delta, delta_pct] if parsed_delta || parsed_pct
+
+      return [delta, delta_pct] unless number_line?(line)
+
+      delta ||= parse_number(line)
+      delta_pct ||= parse_percent(line) if line.include?('%')
+      [delta, delta_pct]
     end
 
     def first_selector_text(document, selectors)
@@ -243,7 +256,7 @@ module TradingLogic
         normalized = normalized.tr(',', '.')
       end
 
-      return nil unless normalized.match?(/\A[+\-]?\d+(?:\.\d+)?\z/)
+      return nil unless normalized.match?(/\A[+-]?\d+(?:\.\d+)?\z/)
 
       normalized.to_f
     end
@@ -273,7 +286,7 @@ module TradingLogic
 
     def default_headers
       {
-        'User-Agent' => 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '\
+        'User-Agent' => 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' \
                         '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept-Language' => 'ru,en;q=0.9'
       }
