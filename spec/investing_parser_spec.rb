@@ -40,7 +40,7 @@ RSpec.describe TradingLogic::InvestingParser do
 
     parser = described_class.new(
       http_getter: lambda { |uri, _headers|
-        if uri.path == '' || uri.path == '/'
+        if ['', '/'].include?(uri.path)
           warm_up_response
         else
           ok_response(html)
@@ -76,7 +76,7 @@ RSpec.describe TradingLogic::InvestingParser do
     parser = described_class.new(
       sleep_range: 0.0..0.0,
       http_getter: lambda { |uri, _headers|
-        if uri.path == '' || uri.path == '/'
+        if ['', '/'].include?(uri.path)
           warm_up_response
         else
           calls += 1
@@ -113,7 +113,7 @@ RSpec.describe TradingLogic::InvestingParser do
 
     parser = described_class.new(
       http_getter: lambda { |uri, _headers|
-        if uri.path == '' || uri.path == '/'
+        if ['', '/'].include?(uri.path)
           warm_up_response
         else
           attempt += 1
@@ -148,7 +148,7 @@ RSpec.describe TradingLogic::InvestingParser do
 
     parser = described_class.new(
       http_getter: lambda { |uri, _headers|
-        if uri.path == '' || uri.path == '/'
+        if ['', '/'].include?(uri.path)
           warm_up_response
         else
           ok_response(html)
@@ -178,7 +178,7 @@ RSpec.describe TradingLogic::InvestingParser do
 
     parser = described_class.new(
       http_getter: lambda { |uri, headers|
-        if uri.path == '' || uri.path == '/'
+        if ['', '/'].include?(uri.path)
           mock_response(cookies: ['__cf_bm=abc123; path=/; HttpOnly', 'session_id=xyz; path=/'])
         else
           received_cookies = headers['Cookie']
