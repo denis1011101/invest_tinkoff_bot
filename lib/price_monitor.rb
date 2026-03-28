@@ -3,6 +3,7 @@
 require 'json'
 require 'fileutils'
 require 'time'
+require_relative 'investing_parser'
 require_relative 'utils'
 require_relative 'strategy_helpers'
 require_relative 'telegram_helper'
@@ -15,8 +16,9 @@ module TradingLogic
     STATE_PATH  = File.expand_path('../tmp/price_monitor_state.json', __dir__)
     YEK_OFFSET  = '+05:00'
 
-    def initialize(client)
+    def initialize(client, investing_parser: nil)
       @client = client
+      @investing_parser = investing_parser || InvestingParser.new
     end
 
     def fetch_all
@@ -24,38 +26,12 @@ module TradingLogic
       static_config, dynamic_config = instrument_configs(config)
       return [] if static_config.empty? && dynamic_config.empty?
 
-      instruments = resolve_instruments(static_config, group: :static) +
-                    resolve_instruments(dynamic_config, group: :dynamic)
-      return [] if instruments.empty?
-
-      figis = instruments.filter_map { |i| i[:figi] }
-      prices = fetch_prices(figis)
       previous = load_previous_prices
+      results = sort_results(
+        fetch_static_results(static_config, previous) +
+        fetch_dynamic_results(dynamic_config, previous)
+      )
 
-      results = instruments.filter_map do |inst|
-        price = prices[inst[:figi]]
-        next unless price
-
-        scale = inst[:scale]
-        price *= scale if (scale - 1.0).abs > 1e-10
-
-        prev = previous[inst[:query]]
-        delta = prev ? price - prev : nil
-        delta_pct = prev && prev != 0 ? (delta / prev * 100.0) : nil
-
-        {
-          label: inst[:label],
-          query: inst[:query],
-          group: inst[:group],
-          sort_index: inst[:sort_index],
-          price: price,
-          prev_price: prev,
-          delta: delta,
-          delta_pct: delta_pct
-        }
-      end
-
-      results = sort_results(results)
       save_current_prices(results)
       results
     end
@@ -81,21 +57,109 @@ module TradingLogic
       if config['static_instruments'].is_a?(Array) || config['dynamic_instruments'].is_a?(Array)
         [config['static_instruments'] || [], config['dynamic_instruments'] || []]
       else
-        [config['instruments'] || [], []]
+        [[], config['instruments'] || []]
       end
     end
 
-    def resolve_instruments(instruments_config, group:)
+    def fetch_static_results(instruments_config, previous)
+      resolve_static_instruments(instruments_config).filter_map do |inst|
+        quote = @investing_parser.fetch_quote(inst[:url])
+        prev = previous[inst[:state_key]]
+        delta = quote[:delta]
+        delta_pct = quote[:delta_pct]
+
+        if delta.nil? && prev
+          delta = quote[:price] - prev
+          delta_pct = prev.zero? ? nil : (delta / prev * 100.0)
+        end
+
+        {
+          label: inst[:label],
+          query: inst[:url],
+          group: inst[:group],
+          sort_index: inst[:sort_index],
+          price: quote[:price],
+          prev_price: prev,
+          delta: delta,
+          delta_pct: delta_pct,
+          state_key: inst[:state_key]
+        }
+      rescue StandardError => e
+        warn "PriceMonitor: investing fetch failed for '#{inst[:url]}': #{e.class}: #{e.message}"
+        nil
+      end
+    end
+
+    def fetch_dynamic_results(instruments_config, previous)
+      instruments = resolve_dynamic_instruments(instruments_config)
+      return [] if instruments.empty?
+
+      prices = fetch_prices(instruments.filter_map { |inst| inst[:figi] })
+
+      instruments.filter_map do |inst|
+        price = prices[inst[:figi]]
+        next unless price
+
+        prev = previous[inst[:state_key]]
+        delta = prev ? price - prev : nil
+        delta_pct = prev && !prev.zero? ? (delta / prev * 100.0) : nil
+
+        {
+          label: inst[:label],
+          query: inst[:query],
+          group: inst[:group],
+          sort_index: inst[:sort_index],
+          price: price,
+          prev_price: prev,
+          delta: delta,
+          delta_pct: delta_pct,
+          state_key: inst[:state_key]
+        }
+      end
+    end
+
+    def resolve_static_instruments(instruments_config)
       instruments_config.each_with_index.filter_map do |inst, idx|
-        query = inst['query']
+        url = inst['url'].to_s.strip
+        label = inst['label'] || url
+        if url.empty?
+          warn "PriceMonitor: static instrument missing url for '#{label}'"
+          next
+        end
+
+        {
+          label: label,
+          url: url,
+          group: :static,
+          sort_index: idx,
+          state_key: state_key_for_static(url)
+        }
+      end
+    end
+
+    def resolve_dynamic_instruments(instruments_config)
+      instruments_config.each_with_index.filter_map do |inst, idx|
+        query = inst['query'].to_s.strip
         label = inst['label'] || query
-        scale = inst['scale']&.to_f || 1.0
+        if query.empty?
+          warn "PriceMonitor: dynamic instrument missing query for '#{label}'"
+          next
+        end
+
         figi = resolve_figi(query)
         unless figi
           warn "PriceMonitor: instrument not found for query '#{query}'"
           next
         end
-        { label: label, query: query, figi: figi, scale: scale, group: group, sort_index: idx }
+
+        {
+          label: label,
+          query: query,
+          figi: figi,
+          group: :dynamic,
+          sort_index: idx,
+          state_key: state_key_for_dynamic(query)
+        }
       end
     end
 
@@ -151,7 +215,7 @@ module TradingLogic
 
     def save_current_prices(results)
       prices = {}
-      results.each { |r| prices[r[:query]] = r[:price] }
+      results.each { |r| prices[r[:state_key]] = r[:price] }
       FileUtils.mkdir_p(File.dirname(STATE_PATH))
       File.write(STATE_PATH, JSON.pretty_generate({
                                                     'updated_at' => yek_now.iso8601,
@@ -206,6 +270,14 @@ module TradingLogic
       d = escape_md("#{sign}#{format_price(delta)}")
       p = escape_md("#{sign}#{delta_pct.round(2)}%")
       "#{arrow} #{d} \\(#{p}\\)"
+    end
+
+    def state_key_for_static(url)
+      "investing:#{url}"
+    end
+
+    def state_key_for_dynamic(query)
+      "tinkoff:#{query}"
     end
   end
 end
