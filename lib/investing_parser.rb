@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require 'net/http'
+require 'open3'
+require 'tempfile'
 require 'time'
 require 'uri'
 
@@ -40,6 +42,13 @@ module TradingLogic
     class ParseError < StandardError; end
     class HttpError < StandardError; end
 
+    CurlResponse = Struct.new(:code, :body, :headers) do
+      def get_fields(name)
+        headers[name.to_s.downcase] || []
+      end
+    end
+    private_constant :CurlResponse
+
     def initialize(sleep_range: DEFAULT_SLEEP_RANGE, http_getter: nil, now_proc: nil,
                    sleep_proc: nil, warn_proc: nil)
       @sleep_range = sleep_range
@@ -73,6 +82,7 @@ module TradingLogic
         response = @http_getter.call(uri, headers)
         collect_cookies(response)
         code = response.code.to_i
+        log_unsuccessful_response(uri, code, response, attempts) unless success_status?(code)
         raise HttpError, "HTTP #{code}" if retriable_status?(code)
         raise HttpError, "HTTP #{code}" unless success_status?(code)
 
@@ -302,13 +312,68 @@ module TradingLogic
     end
 
     def default_http_get(uri, headers)
-      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https',
-                                          open_timeout: 10,
-                                          read_timeout: 10) do |http|
-        request = Net::HTTP::Get.new(uri)
-        headers.each { |key, value| request[key] = value }
-        http.request(request)
+      header_file = Tempfile.new(['investing_headers', '.txt'])
+      header_file.close
+
+      cmd = [
+        'curl',
+        '--silent',
+        '--show-error',
+        '--location',
+        '--compressed',
+        '--connect-timeout', '10',
+        '--max-time', '20',
+        '--dump-header', header_file.path,
+        '--write-out', "\n__CURL_HTTP_CODE__:%{http_code}"
+      ]
+      headers.each { |key, value| cmd << '-H' << "#{key}: #{value}" }
+      cmd << uri.to_s
+
+      stdout, stderr, status = Open3.capture3(*cmd)
+      raise HttpError, "curl exited #{status.exitstatus}: #{stderr.to_s.strip}" unless status.success?
+
+      body, code = split_curl_output(stdout)
+      CurlResponse.new(code, body, parse_header_file(header_file.path))
+    ensure
+      header_file&.close
+      header_file&.unlink
+    end
+
+    def split_curl_output(stdout)
+      marker = "\n__CURL_HTTP_CODE__:"
+      idx = stdout.rindex(marker)
+      raise HttpError, 'curl: http_code marker not found' unless idx
+
+      body = stdout[0...idx]
+      code = stdout[(idx + marker.length)..].to_s.strip
+      raise HttpError, "curl: invalid http_code #{code.inspect}" unless code.match?(/\A\d{3}\z/)
+
+      [body, code]
+    end
+
+    def parse_header_file(path)
+      headers = Hash.new { |hash, key| hash[key] = [] }
+      return headers unless File.exist?(path)
+
+      File.read(path).each_line do |line|
+        line = line.strip
+        next if line.empty?
+        next if line.start_with?('HTTP/')
+
+        name, value = line.split(':', 2)
+        next unless name && value
+
+        headers[name.strip.downcase] << value.strip
       end
+      headers
+    end
+
+    def log_unsuccessful_response(uri, code, response, attempts)
+      body = response.body.to_s
+      @warn_proc.call(
+        "InvestingParser: #{uri} -> HTTP #{code} attempt=#{attempts}/#{MAX_ATTEMPTS} (body=#{body.bytesize}b)"
+      )
+      @warn_proc.call("InvestingParser: body[0..400]=#{body[0, 400].inspect}") if ENV['INVESTING_DEBUG']
     end
 
     def retriable_status?(code)

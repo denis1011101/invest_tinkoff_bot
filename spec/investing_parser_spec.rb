@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'spec_helper'
+require 'uri'
 require_relative '../lib/investing_parser'
 
 RSpec.describe TradingLogic::InvestingParser do
@@ -134,6 +135,9 @@ RSpec.describe TradingLogic::InvestingParser do
     expect(attempt).to eq(2)
     expect(quote[:price]).to eq(105.32)
     expect(sleep_calls).to include(1)
+    expect(warnings).to include(
+      'InvestingParser: https://ru.investing.com/commodities/brent-oil -> HTTP 503 attempt=1/3 (body=19b)'
+    )
   end
 
   it 'warns when quote anchors are missing and still scans from top of document' do
@@ -194,5 +198,42 @@ RSpec.describe TradingLogic::InvestingParser do
 
     expect(received_cookies).to include('__cf_bm=abc123')
     expect(received_cookies).to include('session_id=xyz')
+  end
+
+  it 'fetches default HTTP transport through curl and exposes response headers' do
+    captured_cmd = nil
+    status = double('status', success?: true, exitstatus: 0)
+
+    allow(Open3).to receive(:capture3) do |*cmd|
+      captured_cmd = cmd
+      header_path = cmd[cmd.index('--dump-header') + 1]
+      File.write(header_path, <<~HEADERS)
+        HTTP/2 200
+        content-type: text/html
+        set-cookie: __cf_bm=abc123; path=/; HttpOnly
+        set-cookie: session_id=xyz; path=/
+
+      HEADERS
+      ["<html>ok</html>\n__CURL_HTTP_CODE__:200", '', status]
+    end
+
+    parser = described_class.new
+    response = parser.send(
+      :default_http_get,
+      URI('https://ru.investing.com/currencies/usd-rub'),
+      { 'User-Agent' => 'UA', 'Accept-Language' => 'ru-RU' }
+    )
+
+    expect(captured_cmd).to include('curl', '--silent', '--show-error', '--location', '--compressed')
+    expect(captured_cmd).to include('--connect-timeout', '10', '--max-time', '20')
+    expect(captured_cmd).to include('-H', 'User-Agent: UA', '-H', 'Accept-Language: ru-RU')
+    expect(captured_cmd).not_to include('--fail')
+    expect(captured_cmd).not_to include('--http1.1')
+    expect(response.code).to eq('200')
+    expect(response.body).to eq('<html>ok</html>')
+    expect(response.get_fields('set-cookie')).to eq([
+                                                       '__cf_bm=abc123; path=/; HttpOnly',
+                                                       'session_id=xyz; path=/'
+                                                     ])
   end
 end
