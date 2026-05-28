@@ -324,7 +324,7 @@ module TradingLogic
         '--connect-timeout', '10',
         '--max-time', '20',
         '--dump-header', header_file.path,
-        '--write-out', "\n__CURL_HTTP_CODE__:%{http_code}"
+        '--write-out', format("\n__CURL_HTTP_CODE__:%%{%s}", 'http_code')
       ]
       headers.each { |key, value| cmd << '-H' << "#{key}: #{value}" }
       cmd << uri.to_s

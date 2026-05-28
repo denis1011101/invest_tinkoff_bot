@@ -231,9 +231,11 @@ RSpec.describe TradingLogic::InvestingParser do
     expect(captured_cmd).not_to include('--http1.1')
     expect(response.code).to eq('200')
     expect(response.body).to eq('<html>ok</html>')
-    expect(response.get_fields('set-cookie')).to eq([
-                                                       '__cf_bm=abc123; path=/; HttpOnly',
-                                                       'session_id=xyz; path=/'
-                                                     ])
+    expect(response.get_fields('set-cookie')).to eq(
+      [
+        '__cf_bm=abc123; path=/; HttpOnly',
+        'session_id=xyz; path=/'
+      ]
+    )
   end
 end

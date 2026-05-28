@@ -12,4 +12,5 @@ gem 'rspec', '~> 3.0'
 
 group :development, :test do
   gem 'ostruct'
+  gem 'rubocop', '~> 1.75'
 end
