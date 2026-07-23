@@ -74,16 +74,26 @@ RSpec.describe TradingLogic::DailyTradeReport do
     expect(agg[:sell_turnover]).to eq(263.0)
   end
 
-  it 'follows pagination across two pages and stops on repeated cursor' do
+  it 'follows pagination across two pages, terminating on has_next=false' do
+    pages = [
+      page([op(type: 'OPERATION_TYPE_BUY', figi: 'A', payment: -10)], has_next: true, next_cursor: 'c1'),
+      page([op(type: 'OPERATION_TYPE_BUY', figi: 'B', payment: -20)], has_next: false)
+    ]
+    call = 0
+    allow(operations).to receive(:operations_by_cursor) { pages[call].tap { call += 1 } }
+    agg = report.build[:aggregates]
+    expect(agg[:buys_count]).to eq(2)
+    expect(call).to eq(2)
+  end
+
+  it 'raises instead of silently truncating when has_next set but cursor repeats' do
     pages = [
       page([op(type: 'OPERATION_TYPE_BUY', figi: 'A', payment: -10)], has_next: true, next_cursor: 'c1'),
       page([op(type: 'OPERATION_TYPE_BUY', figi: 'B', payment: -20)], has_next: true, next_cursor: 'c1')
     ]
     call = 0
     allow(operations).to receive(:operations_by_cursor) { pages[call].tap { call += 1 } }
-    agg = report.build[:aggregates]
-    expect(agg[:buys_count]).to eq(2)
-    expect(call).to eq(2) # второй курсор совпал с первым → остановка
+    expect { report.build }.to raise_error(described_class::BrokerError, /pagination anomaly/)
   end
 
   it 'sums broker-fee operations and does not double count' do
@@ -138,6 +148,12 @@ RSpec.describe TradingLogic::DailyTradeReport do
   it 'raises BrokerError instead of pretending 0 trades on operations failure' do
     allow(operations).to receive(:operations_by_cursor).and_raise(StandardError, 'boom')
     expect { report.build }.to raise_error(described_class::BrokerError, /boom/)
+  end
+
+  it 'omits the portfolio block for a historical REPORT_DAY (avoids mislabeled today yield)' do
+    allow(operations).to receive(:operations_by_cursor).and_return(page([]))
+    text = described_class.new(client: client, now: now, market_cache_path: nil).build('2026-07-20')[:text]
+    expect(text).not_to include('Портфель')
   end
 
   it 'respects the +05:00 window boundaries' do
@@ -220,6 +236,16 @@ RSpec.describe TradingLogic::DailyReportDelivery do
       expect(sent).to eq(['oops'])
       expect(File).not_to exist(File.join(dir, 'state.json'))
       expect(Dir).not_to exist(File.join(dir, 'reports'))
+    end
+  end
+
+  it 'hard-splits a single over-limit line into multiple parts' do
+    Dir.mktmpdir do |dir|
+      d = delivery(dir)
+      giant = 'x' * ((TradingLogic::DailyReportDelivery::CHUNK_LIMIT * 2) + 10)
+      parts = d.chunk(giant)
+      expect(parts.size).to be >= 3
+      expect(parts.map(&:length).max).to be <= TradingLogic::DailyReportDelivery::CHUNK_LIMIT
     end
   end
 

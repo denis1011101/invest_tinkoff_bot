@@ -60,7 +60,9 @@ module TradingLogic
       fees = operations.select { |op| fee?(op) }
       aggregates = aggregate(day, trades, fees)
       index = index_snapshot(day)
-      portfolio = portfolio_snapshot
+      # daily_yield брокер отдаёт только за текущий торговый день — для
+      # исторического REPORT_DAY он не соответствует дате отчёта, поэтому не выводим.
+      portfolio = day == report_day(nil) ? portfolio_snapshot : { ok: false, reason: :historical }
       text = format_message(day, aggregates, index, portfolio, trades)
       { day: day.iso8601, text: text, aggregates: aggregates, index: index, portfolio: portfolio }
     end
@@ -104,8 +106,11 @@ module TradingLogic
     def next_cursor(resp, seen)
       return nil unless resp.respond_to?(:has_next) && resp.has_next
 
+      # has_next=true, но курсора для продолжения нет/он повторился — это аномалия
+      # API. Молча завершить = показать неполный список сделок как полный, поэтому
+      # для финансового отчёта считаем это ошибкой, а не концом пагинации.
       nc = resp.respond_to?(:next_cursor) ? resp.next_cursor.to_s : ''
-      return nil if nc.empty? || seen.include?(nc)
+      raise BrokerError, 'pagination anomaly: has_next set but next_cursor is empty or repeated' if nc.empty? || seen.include?(nc)
 
       seen << nc
       nc
@@ -288,7 +293,7 @@ module TradingLogic
 
     def format_totals(agg)
       lines = [
-        "Сделки: #{agg[:buys_count]} покупок / #{agg[:sells_count]} продаж",
+        "Сделки за 24ч: #{agg[:buys_count]} покупок / #{agg[:sells_count]} продаж",
         "Покупки: #{fmt(agg[:buy_turnover])} ₽",
         "Продажи: #{fmt(agg[:sell_turnover])} ₽",
         "Комиссии: #{fmt(agg[:fees])} ₽"
@@ -303,7 +308,8 @@ module TradingLogic
       rel = portfolio[:daily_yield_relative]
       abs = portfolio[:daily_yield]
       pct = rel ? " (#{signed_pct(rel)})" : ''
-      ['', "Портфель за день: #{abs ? "#{signed(abs)} ₽" : 'н/д'}#{pct}", 'Включает изменение старых позиций.']
+      ['', "Портфель (текущий торговый день брокера): #{abs ? "#{signed(abs)} ₽" : 'н/д'}#{pct}",
+       'Включает изменение старых позиций.']
     end
 
     def format_trades(trades)

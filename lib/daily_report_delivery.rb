@@ -41,7 +41,7 @@ module TradingLogic
       # служебные сообщения (напр. об ошибке) отправляем без побочных эффектов.
       if result[:aggregates]
         mark_sent!(day)
-        archive!(result)
+        archive_best_effort(result)
       end
       true
     end
@@ -49,18 +49,28 @@ module TradingLogic
     def chunk(text)
       parts = []
       current = +''
-      text.each_line do |line|
-        if current.length + line.length > CHUNK_LIMIT && !current.empty?
-          parts << current
-          current = +''
+      text.each_line do |raw_line|
+        hard_split(raw_line).each do |line|
+          if current.length + line.length > CHUNK_LIMIT && !current.empty?
+            parts << current
+            current = +''
+          end
+          current << line
         end
-        current << line
       end
       parts << current unless current.empty?
       parts
     end
 
     private
+
+    # Одна строка длиннее лимита сама по себе не влезет в сообщение Telegram —
+    # режем её на куски по CHUNK_LIMIT.
+    def hard_split(line)
+      return [line] if line.length <= CHUNK_LIMIT
+
+      line.chars.each_slice(CHUNK_LIMIT).map(&:join)
+    end
 
     def read_state
       return {} unless File.exist?(@state_path)
@@ -72,6 +82,14 @@ module TradingLogic
 
     def mark_sent!(day)
       write_atomic(@state_path, JSON.pretty_generate('last_sent_day' => day.to_s, 'sent_at' => Time.now.utc.iso8601))
+    end
+
+    # Архив — вспомогательный результат: Telegram уже доставлен, поэтому сбой
+    # записи логируем, но не роняем доставку и не откатываем state.
+    def archive_best_effort(result)
+      archive!(result)
+    rescue StandardError => e
+      @logger&.warn("daily report archive failed for #{result[:day]}: #{e.class}: #{e.message}")
     end
 
     def archive!(result)

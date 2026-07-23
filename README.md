@@ -105,7 +105,7 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `LEVEL_SELL_MIN_PROFIT` — minimal profit multiple required before resistance-based sell is allowed (default `1.005` = +0.5%).
 - `LEVEL_PIVOT_WINDOW` — pivot window size for local extrema detection on daily candles (default `5`).
 - `LEVEL_CLUSTER_PCT` — max relative distance for clustering nearby support/resistance pivots into one level (default `0.015` = 1.5%).
-- `SELL_THRESHOLD_UP` — profit multiplier to trigger SELL in UP trend (default `1.10` = +10%).
+- `SELL_THRESHOLD_UP` — nominal profit multiplier for the UP trend (default `1.10` = +10%). Not exercised in practice: the UP branch runs no per-trend sells, and this value coincides with the +10% force exit. See Exit signals above.
 - `SELL_THRESHOLD_SIDE` — profit multiplier to trigger SELL in SIDE trend (default `1.04` = +4%).
 - `SELL_THRESHOLD_DOWN` — profit multiplier to trigger SELL in DOWN trend (default `1.02` = +2%).
 - `MAX_POSITION_SHARE` — max fraction of the share portfolio that one ticker can occupy before BUY is blocked (default `0.33`).
@@ -177,3 +177,41 @@ journalctl -u cache-health.service -u market-cache-refresh.service --since today
 ```
 
 Before enabling `moex-cache-sync.timer` on the local machine, as user `denis` accept the server host key and confirm key-based access (`ssh -i "$MOEX_SYNC_SSH_KEY" -o BatchMode=yes "$MOEX_SYNC_USER@$MOEX_SYNC_HOST" true`), then run one manual `INDEX=IMOEX DRY_RUN=1 bundle exec rake moex_cache:sync` and only after a clean dry-run do one manual real sync. The remote install step executes `<MOEX_SYNC_REMOTE_DIR>/bin/systemd_exec` on the server, so the server checkout must be pulled to a revision that contains this wrapper first.
+
+## Daily trade report
+A once-a-day plain-text Telegram report of **actually executed** trades, independent of the trading strategy. Files: [`bin/daily_trade_report.rb`](bin/daily_trade_report.rb), [`lib/daily_trade_report.rb`](lib/daily_trade_report.rb), [`lib/daily_report_delivery.rb`](lib/daily_report_delivery.rb).
+
+- **Source of trades** — only `GetOperationsByCursor` (full pagination; it raises rather than silently truncating if the broker reports `has_next` without a usable cursor). Trades are never derived from strategy logs or `tmp/strategy_state.json`.
+- **Window** — a rolling 24h ending at the cutoff (default `21:00` `+05:00` = 21:00 YEKT), so trades in the evening session are never dropped; they roll into the next day's report.
+- **Index** — IMOEX change vs the previous close, using the current (possibly still-forming) daily candle as the current value. For a *live* run this is the value near the cutoff. A historical `REPORT_DAY` re-run shows the finalized daily close, not the original cutoff snapshot — the machine archive is the authoritative record of what was sent.
+- **Portfolio** — whole-portfolio `daily_yield` for the broker's *current* trading day, explicitly labeled and including old positions. Omitted for a historical `REPORT_DAY` (the broker only exposes today's yield). Note the message mixes three periods on purpose: trades (rolling 24h), index (vs previous close), portfolio (current trading day).
+- **Realized P/L** — shown as `н/д` when sells exist (no reliable per-trade cost basis yet); to be wired to the operation `yield` field once a real SELL is available to validate it.
+
+### Manual run
+```bash
+# print to stdout, do not send, do not touch state/archive
+REPORT_DAY=2026-07-23 DRY_RUN=1 bundle exec ruby bin/daily_trade_report.rb
+
+# resend a day that was already sent
+REPORT_DAY=2026-07-23 FORCE_SEND=1 bundle exec ruby bin/daily_trade_report.rb
+```
+- `REPORT_DAY` — optional date (defaults to today in the configured offset).
+- `DRY_RUN=1` — print only; never sends, never writes state or archive.
+- `FORCE_SEND=1` — allow resending a day already marked as sent.
+
+### Persistence
+- **Dedup state** — `tmp/daily_trade_report_state.json` (`last_sent_day`); a day is marked sent only after all Telegram parts succeed.
+- **Machine archive** — `logs/daily_reports/YYYY-MM.txt` (human-readable) and `YYYY-MM.jsonl` (structured, for monthly analysis), appended after a successful send. Archive failures are logged but never break delivery or roll back state.
+
+### Schedule (cron, server on UTC)
+```cron
+5 16 * * * /usr/bin/flock -n /tmp/daily_trade_report.lock /bin/bash -lc 'cd /root/apps/invest_tinkoff_bot && bundle exec ruby bin/daily_trade_report.rb >> /root/apps/invest_tinkoff_bot/logs/daily_trade_report.log 2>&1'
+```
+`16:05 UTC = 21:05 YEKT`, five minutes after the cutoff so the last operations settle at the broker.
+
+### Config (`DAILY_REPORT_*`)
+- `DAILY_REPORT_UTC_OFFSET` — local offset for the window/labels (default `+05:00`).
+- `DAILY_REPORT_TIME_LABEL` — label shown in the message (default `YEKT`).
+- `DAILY_REPORT_CUTOFF` — window end time in the offset (default `21:00`).
+- `DAILY_REPORT_INDEX` — index ticker for the snapshot (default `IMOEX`).
+- Telegram uses `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, overridable via `DAILY_REPORT_TELEGRAM_BOT_TOKEN`/`DAILY_REPORT_TELEGRAM_CHAT_ID`.
