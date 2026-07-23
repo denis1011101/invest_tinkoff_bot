@@ -26,7 +26,7 @@ module TradingLogic
 
     private
 
-    def enc(val) = enc(val)
+    def enc(val) = URI.encode_www_form_component(val.to_s)
 
     public
 
@@ -57,7 +57,7 @@ module TradingLogic
 
     # Возвращает массив хэшей компонентов индекса (например 'IMOEX').
     # Пробует несколько известных URL-форматов ISS и парсит таблицы analytics/constituents/securities.
-    def index_constituents(index_id) # rubocop:disable Metrics
+    def index_constituents(index_id, cache_path: CACHE_PATH) # rubocop:disable Metrics
       candidates = [
         # 1) analytics — обычно даёт полный состав (нужна пагинация + limit)
         "statistics/engines/#{enc(@engine)}/markets/index/analytics/#{enc(index_id)}.json",
@@ -160,12 +160,12 @@ module TradingLogic
 
         # save cache
         begin
-          FileUtils.mkdir_p(File.dirname(CACHE_PATH))
-          File.write(CACHE_PATH,
+          FileUtils.mkdir_p(File.dirname(cache_path))
+          File.write(cache_path,
                      JSON.pretty_generate({ 'updated_at' => Time.now.utc.iso8601, 'index' => index_id,
                                             'instruments' => res }))
         rescue StandardError => e
-          warn "MoexISS: failed to write cache #{CACHE_PATH}: #{e.class}: #{e.message}"
+          warn "MoexISS: failed to write cache #{cache_path}: #{e.class}: #{e.message}"
         end
 
         return res

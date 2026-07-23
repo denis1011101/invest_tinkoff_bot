@@ -1,0 +1,15 @@
+# Local machine unit. Pulled in by moex-cache-sync.timer; not enabled on its own (no [Install] section).
+[Unit]
+Description=Invest Tinkoff Bot MOEX cache sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=denis
+Group=denis
+UMask=0077
+Environment=HOME=/home/denis
+WorkingDirectory=/home/denis/my/invest_tinkoff_bot
+EnvironmentFile=/etc/invest_tinkoff_bot.env
+ExecStart=/usr/bin/flock -n /tmp/invest_tinkoff_bot-moex-sync.lock /home/denis/my/invest_tinkoff_bot/bin/systemd_exec rake moex_cache:sync INDEX=IMOEX

@@ -1,0 +1,15 @@
+# Server unit. Pulled in by cache-health.timer; not enabled on its own (no [Install] section).
+# Deliberately runs as root: the server deployment lives in /root/apps and cron
+# already runs as root there. Non-root migration is deferred.
+[Unit]
+Description=Invest Tinkoff Bot cache health watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+Environment=HOME=/root
+WorkingDirectory=/root/apps/invest_tinkoff_bot
+EnvironmentFile=/etc/invest_tinkoff_bot.env
+ExecStart=/usr/bin/flock -n /tmp/invest_tinkoff_bot-cache-health.lock /root/apps/invest_tinkoff_bot/bin/systemd_exec rake cache:health

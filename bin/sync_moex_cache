@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'bundler/setup'
+require 'dotenv/load'
+require_relative '../lib/moex_cache_syncer'
+
+index = ENV['INDEX'] || 'IMOEX'
+dry_run = %w[1 true yes on].include?(ENV['DRY_RUN'].to_s.strip.downcase)
+
+result = TradingLogic::MoexCacheSyncer.new.perform(index: index, dry_run: dry_run)
+
+puts "moex cache #{result[:dry_run] ? 'validated' : 'synced'} -> #{result[:path]} sha256=#{result[:sha256]}"

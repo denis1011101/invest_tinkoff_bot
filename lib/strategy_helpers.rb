@@ -122,6 +122,19 @@ module TradingLogic
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
     def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:,
                                             max_lot_rub:, account_id:, lots_per_order: 1, logger: nil)
+      # Не торгуем по протухшим справочникам: устаревший состав IMOEX / рыночный кеш
+      # приводит к покупкам недоступных или чужих инструментов.
+      # Порог протухания должен быть заметно больше TTL обновления кеша (MarketCache
+      # CACHE_TTL_HOURS=24), иначе при ежедневном refresh покупки заблокируются.
+      max_age = (ENV['INTERSECTION_CACHE_MAX_AGE_HOURS'] || '72').to_i * 3600
+      unless cache_fresh?(market_cache_path, max_age) && cache_fresh?(moex_index_cache_path, max_age)
+        logger&.warn('intersection BUY skipped — stale caches ' \
+                     "(market updated=#{cache_updated_at(market_cache_path)&.iso8601.inspect}, " \
+                     "moex updated=#{cache_updated_at(moex_index_cache_path)&.iso8601.inspect}, " \
+                     "max_age_h=#{max_age / 3600})")
+        return false
+      end
+
       market = load_cache_normalized(market_cache_path)
       index  = load_cache_normalized(moex_index_cache_path)
 
@@ -138,7 +151,7 @@ module TradingLogic
 
       candidates = inter.filter_map do |ticker|
         build_intersection_candidate(
-          client, logic, state, market, ticker,
+          client, logic, state, ticker,
           max_lot_rub: max_lot_rub,
           account_id: account_id,
           lots_per_order: lots_per_order,
@@ -163,22 +176,29 @@ module TradingLogic
       false
     end
 
-    def build_intersection_candidate(client, logic, state, market, ticker, max_lot_rub:, account_id:, lots_per_order:,
+    def build_intersection_candidate(client, logic, state, ticker, max_lot_rub:, account_id:, lots_per_order:,
                                      logger: nil)
       logger&.debug("processing candidate #{ticker}")
       return nil if buy_already_processed_today?(state, ticker)
 
-      item = market.find { |market_item| market_item['ticker'] == ticker } || {}
-      logger&.debug("market item for #{ticker} => #{item.keys.inspect}")
+      # Авторитетный резолв: рублёвая акция TQBR, доступная для торгов через API.
+      # Не доверяем строковому совпадению тикера из кеша (защита от "T" -> AT&T).
+      share = resolve_tradable_share(client, ticker, logger: logger)
+      return nil unless share
 
-      figi = resolve_candidate_figi(client, ticker, item, logger: logger)
-      return nil unless figi
+      figi = share[:figi]
+      lot  = share[:lot]
+
+      if instrument_quarantined?(state, figi)
+        logger&.debug("skip #{ticker} (figi=#{figi}) — quarantined after permanent broker reject")
+        return nil
+      end
+
       return nil unless valid_momentum_candidate?(client, ticker, figi, logger: logger)
 
-      lot = (item.dig('raw', 'lot') || item.dig('raw', 'LOT') || 1).to_i
-      price = logic.last_price_for(figi) || item.dig('raw', 'price')
+      price = logic.last_price_for(figi)
       price_per_lot = price && lot ? (price * lot) : nil
-      logger&.debug("#{ticker} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{price_per_lot.inspect}")
+      logger&.debug("#{ticker} figi=#{figi} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{price_per_lot.inspect}")
 
       unless affordable_candidate?(price, lot, lots_per_order, max_lot_rub)
         logger&.debug("skip #{ticker} — price/lot missing or too expensive")
@@ -211,23 +231,6 @@ module TradingLogic
       acted_today?(state, 'last_buy', ticker)
     rescue StandardError
       false
-    end
-
-    def resolve_candidate_figi(client, ticker, item, logger: nil)
-      figi = item['figi']
-      if figi
-        logger&.debug("item already contains figi=#{figi}")
-        return figi
-      end
-
-      response = client.grpc_instruments.find_instrument(query: ticker)
-      figi = response&.instruments&.first&.figi
-      logger&.debug("resolved figi for #{ticker} => #{figi.inspect}")
-      logger&.debug("skip #{ticker} — no figi") unless figi
-      figi
-    rescue StandardError => e
-      logger&.debug("find_instrument(#{ticker}) error: #{e.class}: #{e.message}")
-      nil
     end
 
     def valid_momentum_candidate?(client, ticker, figi, logger: nil)
@@ -275,7 +278,8 @@ module TradingLogic
         logic.confirm_and_place_order_with_result(
           account_id: account_id,
           figi: candidate[:figi],
-          quantity: candidate[:lot] * candidate[:lots_per_order],
+          # quantity измеряется в ЛОТАХ, а не в штуках бумаг.
+          quantity: candidate[:lots_per_order],
           price: candidate[:price],
           direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
           order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
@@ -286,6 +290,13 @@ module TradingLogic
 
       sync_pending_order!(state, candidate[:tk], result)
       return handle_successful_intersection_buy!(state, candidate, result, logger: logger) if successful_buy_result?(result)
+
+      # Постоянный отказ (инструмент недоступен для торгов, 30079) — в карантин,
+      # чтобы не долбить брокера каждую минуту одним и тем же FIGI.
+      if permanent_instrument_reject?(result)
+        quarantine_instrument!(state, candidate[:figi], reason: result[:error_code] || result[:reject_reason],
+                                                        logger: logger)
+      end
 
       logger&.warn(buy_failure_message(candidate[:tk], result))
       false
@@ -341,7 +352,11 @@ module TradingLogic
         it = { figi: figi, ticker: ticker, lot: lot }
         next unless logic.should_sell?(p, it, trend: trend)
 
-        sell_qty = [qty_units, lot].min
+        # Продаём один лот. quantity в ЛОТАХ; ограничиваем числом удерживаемых лотов.
+        lots_held = qty_units / lot
+        sell_qty = [1, lots_held].min
+        next if sell_qty <= 0
+
         resp = begin
           logic.confirm_and_place_order(
             account_id: account_id,
@@ -355,11 +370,72 @@ module TradingLogic
           nil
         end
         if resp
-          logger&.info("SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})")
+          logger&.info("SELL #{ticker} lots=#{sell_qty} (order_id=#{resp.order_id})")
           mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'signal')
         else
           logger&.info("SELL #{ticker} skipped / not confirmed")
         end
+      end
+    end
+
+    def try_force_exit_positions_with_logic!(client, logic, account_id, figi_cache: {}, logger: nil)
+      port = client.grpc_operations.portfolio(account_id: account_id)
+      positions = port.positions
+      positions.each do |p|
+        try_force_exit_position!(client, logic, account_id, p, figi_cache: figi_cache, logger: logger)
+      end
+    end
+
+    def try_force_exit_position!(client, logic, account_id, position, figi_cache: {}, logger: nil)
+      figi = position.figi
+
+      if position.respond_to?(:instrument_type)
+        inst_type = position.instrument_type.to_s.upcase
+        return unless inst_type.include?('SHARE')
+      end
+
+      qty_units = position.quantity.units.to_i
+      return if qty_units <= 0
+      return unless logic.should_force_exit?(position, figi)
+
+      ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache, logger: logger) || figi
+
+      inst = begin
+        client.grpc_instruments.get_instrument_by(:figi, figi)
+      rescue StandardError
+        nil
+      end
+
+      lot = inst&.lot.to_i
+      if lot <= 0
+        logger&.warn("FORCE SELL #{ticker} skipped — unable to resolve positive lot size for figi=#{figi}")
+        return
+      end
+
+      lots = qty_units / lot
+      if lots <= 0
+        logger&.info("FORCE SELL #{ticker} skipped — holding #{qty_units} < lot=#{lot}")
+        return
+      end
+
+      cur_price = logic.last_price_for(figi)
+      resp = begin
+        logic.confirm_and_place_order(
+          account_id: account_id,
+          figi: figi,
+          quantity: lots,
+          price: cur_price,
+          direction: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
+          order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
+        )
+      rescue StandardError
+        nil
+      end
+
+      if resp
+        logger&.info("FORCE SELL +10% #{ticker} lots=#{lots} (#{qty_units} шт) @#{cur_price} (order_id=#{resp.order_id})")
+      else
+        logger&.info("FORCE SELL #{ticker} skipped / not confirmed")
       end
     end
 
@@ -372,7 +448,7 @@ module TradingLogic
     end
 
     def default_state
-      { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {} }
+      { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'quarantine' => {} }
     end
 
     def ensure_state_defaults!(state)
@@ -380,7 +456,108 @@ module TradingLogic
       state['last_buy'] ||= {}
       state['last_sell'] ||= {}
       state['pending_orders'] ||= {}
+      state['quarantine'] ||= {}
       state
+    end
+
+    # Возвращает время updated_at из кеша (Time) или nil.
+    def cache_updated_at(path)
+      raw = read_json(path)
+      ts = raw['updated_at'] || raw['updatedAt']
+      return nil unless ts
+
+      Time.parse(ts.to_s)
+    rescue StandardError
+      nil
+    end
+
+    # true если кеш свежее max_age_seconds. Пустой/битый updated_at => false (протух).
+    def cache_fresh?(path, max_age_seconds)
+      updated = cache_updated_at(path)
+      return false unless updated
+
+      (Time.now.utc - updated.utc) <= max_age_seconds
+    end
+
+    # Помещён ли инструмент в карантин (после постоянного отказа брокера вроде 30079).
+    def instrument_quarantined?(state, figi)
+      entry = (state['quarantine'] || {})[figi.to_s]
+      return false unless entry.is_a?(Hash)
+
+      ts = begin
+        Time.parse(entry['ts'].to_s)
+      rescue StandardError
+        nil
+      end
+      return false unless ts
+
+      ttl = (ENV['QUARANTINE_TTL_HOURS'] || '24').to_i * 3600
+      (Time.now.utc - ts) < ttl
+    end
+
+    def quarantine_instrument!(state, figi, reason:, logger: nil)
+      ensure_state_defaults!(state)
+      state['quarantine'][figi.to_s] = { 'ts' => Time.now.utc.iso8601, 'reason' => reason.to_s }
+      logger&.warn("QUARANTINE figi=#{figi} reason=#{reason}")
+    end
+
+    # Постоянный (не временный) отказ брокера: инструмент недоступен для торгов.
+    def permanent_instrument_reject?(result)
+      text = "#{result[:error_code]} #{result[:reject_reason]}".downcase
+      text.include?('30079') ||
+        text.include?('not available for trading') ||
+        text.include?('недоступен')
+    end
+
+    # Авторитетный резолв торгуемой рублёвой акции по тикеру+class_code.
+    # Возвращает hash с figi/lot/uid/currency или nil, если инструмент нельзя торговать.
+    # Это защищает от подмены тикера иностранным инструментом (например "T" -> AT&T).
+    # Резолвим строго по указанному class_code (fail-closed): запрашиваем share_by_ticker
+    # ИМЕННО с class_code и затем подтверждаем, что вернувшийся инструмент того же класса.
+    # НЕ используем безклассовый fallback — иначе на BUY мог бы пройти чужой рублёвый
+    # инструмент с тем же тикером на другой доске.
+    def resolve_tradable_share(client, ticker, class_code: 'TQBR', logger: nil)
+      resp =
+        begin
+          client.grpc_instruments.share_by_ticker(ticker: ticker, class_code: class_code)
+        rescue StandardError => e
+          logger&.debug("share_by_ticker(#{ticker}, #{class_code}) error: #{e.class}: #{e.message}")
+          nil
+        end
+      return nil unless resp
+
+      share = resp.respond_to?(:instrument) ? resp.instrument : nil
+      return nil unless share
+
+      unless share_tradable?(share, class_code: class_code)
+        logger&.debug("skip #{ticker} — not tradable (class=#{share_attr(share, :class_code)} " \
+                      "currency=#{share_attr(share, :currency)} buy=#{share_attr(share, :buy_available_flag)} " \
+                      "api=#{share_attr(share, :api_trade_available_flag)} status=#{share_attr(share, :trading_status)})")
+        return nil
+      end
+
+      {
+        figi: share_attr(share, :figi),
+        lot: (share_attr(share, :lot) || 1).to_i,
+        uid: share_attr(share, :uid),
+        currency: share_attr(share, :currency).to_s.downcase,
+        class_code: share_attr(share, :class_code)
+      }
+    end
+
+    def share_tradable?(share, class_code: 'TQBR')
+      class_ok = share_attr(share, :class_code).to_s.upcase == class_code.to_s.upcase
+      currency_ok = share_attr(share, :currency).to_s.downcase == (ENV['CACHE_CURRENCY'] || 'rub').downcase
+      buy_ok = share_attr(share, :buy_available_flag) == true
+      api_ok = share_attr(share, :api_trade_available_flag) == true
+      status_ok = share_attr(share, :trading_status).to_s.upcase.include?('NORMAL_TRADING')
+      class_ok && currency_ok && buy_ok && api_ok && status_ok
+    end
+
+    def share_attr(obj, name)
+      obj.public_send(name) if obj.respond_to?(name)
+    rescue StandardError
+      nil
     end
 
     def pending_order_active?(state, ticker)

@@ -56,6 +56,18 @@ bundle exec rake moex:refresh
 # refresh MOEX index cache for a specific index
 INDEX=IMOEX bundle exec rake moex:refresh
 
+# validate and push MOEX cache from local machine to server
+INDEX=IMOEX bundle exec rake moex_cache:sync
+
+# dry-run local generation/validation without ssh upload
+INDEX=IMOEX DRY_RUN=1 bundle exec rake moex_cache:sync
+
+# install an uploaded MOEX artifact on the server
+INDEX=IMOEX SHA256=<sha256> FILE=tmp/incoming/moex_index_cache.json bundle exec rake moex_cache:install
+
+# cache freshness watchdog with Telegram alerts/recovery
+bundle exec rake cache:health
+
 # restore strategy state from broker (today UTC)
 bundle exec rake state:restore
 
@@ -64,12 +76,17 @@ DAY=2026-02-14 bundle exec rake state:restore
 ```
 
 ## Important files
+- `lib/moex_cache_artifact.rb` — MOEX cache artifact validation and atomic install helpers
+- `lib/moex_cache_syncer.rb` — local push-based MOEX cache sync via ssh/scp
+- `lib/cache_health_monitor.rb` — cache freshness watchdog and Telegram alert suppression/recovery state
 - `lib/trading_logic.rb` — main Runner and strategy methods (should_buy?, should_sell?, trend, etc.)
 - `lib/strategy_helpers.rb` — helpers, momentum routine, position limit check, and state helpers
 - `lib/market_cache.rb` — instruments + price caching
 - `lib/telegram_confirm.rb` — Telegram confirm/send helpers
 - `bin/current_strategy.rb` — main strategy runner
 - `bin/example.rb` — basic gRPC examples and helpers
+- `bin/sync_moex_cache` — command-line wrapper around the MOEX push sync flow
+- `systemd/` — sample systemd services, timers, and environment file templates for local/server automation
 
 ## Environment variables
 - `TINKOFF_TOKEN` — required API token for Tinkoff Invest.
@@ -79,7 +96,7 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `TICKERS` — comma-separated ticker list for main universe (example: `SBER,ROSN,VTBR`).
 - `MAX_LOT_RUB` — strategy/runtime per-order price limit (`price_per_lot * lots_per_order`) used in `Runner` and momentum buy helper.
 - `MAX_LOT_COUNT` — max instrument lot size allowed when building universe (`lot <= MAX_LOT_COUNT`).
-- `LOTS_PER_ORDER` — multiplier for order size (`quantity = lot * LOTS_PER_ORDER`).
+- `LOTS_PER_ORDER` — order quantity in lots (`quantity = LOTS_PER_ORDER`, shares = `lot_size * LOTS_PER_ORDER`).
 - `DIP_PCT` — intraday dip threshold for BUY (`cur <= today_high * (1 - DIP_PCT)`). Used in UP trend and as momentum dip filter in SIDE/DOWN.
 - `USE_LEVELS` — enables support/resistance levels logic (`1` by default, `0` disables all level lookups and related filters).
 - `LEVELS_LOOKBACK_DAYS` — number of closed daily candles to inspect when building support/resistance levels (default `120`).
@@ -95,11 +112,67 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `VOLUME_LOOKBACK_DAYS` — lookback `N` for average daily volume (default `20`).
 - `VOLUME_COMPARE_MODE` — volume ranking mode for universe: `none`, `relative`, `turnover`.
 - `SCAN_MAX_LOT_RUB` — cache-time filter in `MarketCache`; excludes instruments with `price_per_lot` above this threshold.
-- `INSTRUMENT_CACHE_DAYS` — market instruments cache TTL in days.
+- `INSTRUMENT_CACHE_HOURS` — market instruments cache TTL in hours.
 - `MARKET_CACHE_SLEEP` — optional sleep between `last_prices` batches during cache refresh (seconds).
 - `BUY_PENDING_COOLDOWN_MIN` — cooldown (minutes) to avoid repeated BUY attempts for tickers with pending statuses (`sent_not_filled`, `partially_filled`).
 - `RESTORE_STATE_FROM_BROKER` — if not `0`, auto-restores empty `tmp/strategy_state.json` from current-day broker operations and active buy orders.
 - `FORCE` — rake task flag for forced market cache refresh (`FORCE=true bundle exec rake market_cache:refresh`).
 - `INDEX` — MOEX index code for cache refresh task (`INDEX=IMOEX bundle exec rake moex:refresh`).
+- `MOEX_SYNC_HOST` — remote host used by `moex_cache:sync`.
+- `MOEX_SYNC_USER` — optional ssh user used by `moex_cache:sync`.
+- `MOEX_SYNC_REMOTE_DIR` — repository path on the remote server where the artifact is uploaded and installed.
+- `MOEX_SYNC_SSH_KEY` — optional path to a dedicated ssh private key for MOEX sync.
+- `MOEX_CACHE_MIN_INSTRUMENTS` — minimum acceptable number of MOEX index constituents in an artifact (default `20`).
+- `MOEX_CACHE_MAX_AGE_HOURS` — maximum artifact age accepted by validator/install before rejecting it (default `6`).
+- `MOEX_CACHE_MIN_COUNT_RATIO` — minimum acceptable current-to-previous constituent count ratio before rejecting a sudden drop (default `0.5`).
+- `CACHE_WARN_AGE_HOURS` — watchdog warning threshold for cache age (default `36`).
+- `CACHE_CRITICAL_AGE_HOURS` — watchdog critical threshold for cache age (default `60`).
+- `CACHE_ALERT_REPEAT_HOURS` — minimum delay before repeating the same cache alert level (default `12`).
 
 Note: `SCAN_MAX_LOT_RUB` and `MAX_LOT_RUB` are related but different. `SCAN_MAX_LOT_RUB` works at cache stage, `MAX_LOT_RUB` works at strategy stage. Keep `SCAN_MAX_LOT_RUB >= MAX_LOT_RUB` to avoid dropping valid candidates before strategy logic.
+
+## Push-based MOEX sync
+- Run `bundle exec rake market_cache:refresh FORCE=true` on the server; this cache only needs Tinkoff API.
+- Run `bundle exec rake moex_cache:sync INDEX=IMOEX` on the local machine; this generates a fresh MOEX artifact, validates it locally, uploads it to `tmp/incoming`, and installs it atomically on the server.
+- Avoid `bundle exec rake` / `generate:all` on a server that cannot reach MOEX ISS.
+- Schedule `bundle exec rake cache:health` hourly on the server and `bundle exec rake moex_cache:sync INDEX=IMOEX` daily on the local machine, including weekends.
+
+## systemd templates
+- All units read secrets from `/etc/invest_tinkoff_bot.env` (never from a file inside the repository), run with `UMask=0077`, and start ruby through `bin/systemd_exec`, which builds the RVM environment for the ruby pinned in `.ruby-version` (systemd's default `PATH` has no RVM/Bundler, and neither does non-interactive SSH).
+- Host roles and identities:
+  - `moex-cache-sync.timer` — local machine that can reach MOEX ISS; runs as `User=denis` from `/home/denis/my/invest_tinkoff_bot`.
+  - `cache-health.timer` + `market-cache-refresh.timer` — server; run as root from `/root/apps/invest_tinkoff_bot`, matching the existing root cron deployment (non-root migration deferred).
+- Services intentionally have no `[Install]` section: they are pulled in by their timers. Enable **only** the `.timer` units, never the oneshot `.service` units.
+- The sample units use `flock` to block parallel runs and `Persistent=true` on timers to catch up after missed starts.
+- The timers only manage caches; the strategy (`bin/current_strategy.rb`), wishlist scan, and price monitor stay in the server cron untouched.
+
+Installation steps (per host):
+
+```bash
+# 1. Secrets: create the env file outside the repo, root-owned, mode 0600.
+#    Use the local example on the local machine (no TINKOFF_TOKEN needed there)
+#    and the server example on the server (no MOEX_SYNC_* needed there).
+sudo install -m 0600 -o root -g root systemd/invest_tinkoff_bot.local.env.example /etc/invest_tinkoff_bot.env   # local machine
+sudo install -m 0600 -o root -g root systemd/invest_tinkoff_bot.server.env.example /etc/invest_tinkoff_bot.env  # server
+sudoedit /etc/invest_tinkoff_bot.env  # fill in the values
+
+# 2. Make sure working dirs exist and belong to the unit's user
+#    (denis on the local machine, root on the server).
+mkdir -p tmp/incoming tmp/cache_backups && chmod 700 tmp tmp/incoming tmp/cache_backups
+
+# 3. Install the units for this host and reload systemd.
+sudo cp systemd/moex-cache-sync.{service,timer} /etc/systemd/system/                            # local machine
+sudo cp systemd/{cache-health,market-cache-refresh}.{service,timer} /etc/systemd/system/        # server
+sudo systemctl daemon-reload
+
+# 4. Enable and start ONLY the timers.
+sudo systemctl enable --now moex-cache-sync.timer                          # local machine
+sudo systemctl enable --now cache-health.timer market-cache-refresh.timer  # server
+
+# 5. Verify.
+systemctl list-timers --all | grep -E 'moex|cache'
+systemctl status cache-health.timer market-cache-refresh.timer
+journalctl -u cache-health.service -u market-cache-refresh.service --since today
+```
+
+Before enabling `moex-cache-sync.timer` on the local machine, as user `denis` accept the server host key and confirm key-based access (`ssh -i "$MOEX_SYNC_SSH_KEY" -o BatchMode=yes "$MOEX_SYNC_USER@$MOEX_SYNC_HOST" true`), then run one manual `INDEX=IMOEX DRY_RUN=1 bundle exec rake moex_cache:sync` and only after a clean dry-run do one manual real sync. The remote install step executes `<MOEX_SYNC_REMOTE_DIR>/bin/systemd_exec` on the server, so the server checkout must be pulled to a revision that contains this wrapper first.

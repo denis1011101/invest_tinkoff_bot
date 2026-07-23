@@ -23,8 +23,10 @@ module TradingLogic
       Time.at(now_utc.to_i - (n * 86_400)).utc
     end
 
-    def fetch_candles(client, figi:, from:, to:, interval:)
-      client.grpc_market_data.candles(figi: figi, from: from, to: to, interval: interval)
+    def fetch_candles(client, from:, to:, interval:, figi: nil, instrument_id: nil)
+      client.grpc_market_data.candles(
+        figi: figi, instrument_id: instrument_id, from: from, to: to, interval: interval
+      )
     rescue InvestTinkoff::GRPC::Error
       nil
     end

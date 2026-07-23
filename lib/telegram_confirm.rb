@@ -7,9 +7,11 @@ require 'time'
 
 module TradingLogic
   class TelegramConfirm
-    def self.send_message(bot_token:, chat_id:, text:)
+    def self.send_message(bot_token:, chat_id:, text:, parse_mode: nil)
       uri = URI("https://api.telegram.org/bot#{bot_token}/sendMessage")
-      body = { chat_id: chat_id.to_s, text: text, parse_mode: 'Markdown' }.to_json
+      payload = { chat_id: chat_id.to_s, text: text }
+      payload[:parse_mode] = parse_mode if parse_mode
+      body = payload.to_json
       res = Net::HTTP.post(uri, body, 'Content-Type' => 'application/json')
       return false unless res.code.to_i == 200
 
@@ -29,13 +31,15 @@ module TradingLogic
       @bot_token && !@bot_token.empty? && @chat_id && !@chat_id.empty?
     end
 
-    def send_message(text)
+    def send_message(text, parse_mode: 'Markdown')
       return unless enabled?
 
       uri = URI.join(@base.to_s, '/sendMessage')
       req = Net::HTTP::Post.new(uri)
       req['Content-Type'] = 'application/json'
-      req.body = { chat_id: @chat_id, text: text, parse_mode: 'Markdown' }.to_json
+      payload = { chat_id: @chat_id, text: text }
+      payload[:parse_mode] = parse_mode if parse_mode
+      req.body = payload.to_json
       Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |http| http.request(req) }
     rescue StandardError => e
       warn "Telegram send_message error: #{e.class}: #{e.message}"

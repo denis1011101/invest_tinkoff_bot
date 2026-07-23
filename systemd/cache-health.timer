@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Invest Tinkoff Bot cache health watchdog hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=cache-health.service
+
+[Install]
+WantedBy=timers.target

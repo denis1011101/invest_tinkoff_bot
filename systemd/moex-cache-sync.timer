@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Invest Tinkoff Bot MOEX cache sync daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=moex-cache-sync.service
+
+[Install]
+WantedBy=timers.target

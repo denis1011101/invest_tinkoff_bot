@@ -19,6 +19,14 @@ RSpec.describe TradingLogic::Runner do
     OpenStruct.new(units: units, nano: nano)
   end
 
+  def tradable_share(figi:, lot: 1)
+    OpenStruct.new(
+      figi: figi, lot: lot, uid: "uid_#{figi}", currency: 'rub', class_code: 'TQBR',
+      buy_available_flag: true, sell_available_flag: true, api_trade_available_flag: true,
+      trading_status: 'SECURITY_TRADING_STATUS_NORMAL_TRADING'
+    )
+  end
+
   it 'converts protobuf money (units/nano) to decimal' do
     expect(TradingLogic::Utils.q_to_decimal(q(123, 500_000_000))).to eq(123.5)
   end
@@ -36,9 +44,41 @@ RSpec.describe TradingLogic::Runner do
       expect(subject.trend('IDX')).to eq(:down)
     end
 
-    it 'returns :side when not enough data' do
+    it 'returns :unknown when not enough data (data gap, not a genuine sideways)' do
       allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: []))
-      expect(subject.trend('IDX')).to eq(:side)
+      expect(subject.trend('IDX')).to eq(:unknown)
+    end
+
+    it 'returns :unknown when index figi is missing' do
+      expect(subject.trend(nil)).to eq(:unknown)
+    end
+
+    it 'computes trend from index candles by instrument_id (uid), without a figi' do
+      closes = [q(10), q(11), q(12), q(13)].map { |x| OpenStruct.new(close: x) }
+      allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: closes))
+      expect(subject.trend(nil, instrument_id: 'IMOEX_UID')).to eq(:up)
+    end
+  end
+
+  describe '#resolve_index_uid' do
+    it 'resolves the index uid via Indicatives by ticker' do
+      allow(instruments).to receive(:indicatives).and_return(
+        [OpenStruct.new(ticker: 'RTSI', uid: 'U2'), OpenStruct.new(ticker: 'IMOEX', uid: 'U1')]
+      )
+      expect(subject.resolve_index_uid(ticker: 'IMOEX')).to eq('U1')
+    end
+
+    it 'returns nil when the index is not present' do
+      allow(instruments).to receive(:indicatives).and_return([OpenStruct.new(ticker: 'RTSI', uid: 'U2')])
+      expect(subject.resolve_index_uid(ticker: 'IMOEX')).to be_nil
+    end
+  end
+
+  describe '#index_daily_closes' do
+    it 'returns [] without requesting candles when both figi and instrument_id are missing' do
+      expect(market_data).not_to receive(:candles)
+
+      expect(subject.index_daily_closes).to eq([])
     end
   end
 
@@ -60,6 +100,13 @@ RSpec.describe TradingLogic::Runner do
   end
 
   describe 'selling helpers' do
+    # should_sell? при :side заходит в анализ уровней (levels_for -> дневные свечи).
+    # Даём пустые свечи, чтобы уровни были пусты и проверялся именно порог по тренду,
+    # а не поведение непроштабленного gRPC-дабла.
+    before do
+      allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: []))
+    end
+
     it 'should_sell? returns true when current >= avg * 1.10 (default side threshold 1.04)' do
       position = OpenStruct.new(quantity: OpenStruct.new(units: 2), average_position_price: q(100))
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(110))]))
@@ -101,8 +148,11 @@ RSpec.describe TradingLogic::Runner do
 
   describe '#build_universe' do
     it 'builds universe entries when instrument and price present' do
+      # subject торгует SBER и ROSN — по умолчанию ROSN не резолвится (instrument nil),
+      # SBER — валидный. Проверяем, что вселенная строится из валидного тикера.
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: nil))
       allow(instruments).to receive(:share_by_ticker).with(ticker: 'SBER', class_code: 'TQBR').and_return(
-        OpenStruct.new(instrument: OpenStruct.new(figi: 'F1', lot: 1))
+        OpenStruct.new(instrument: tradable_share(figi: 'F1', lot: 1))
       )
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
       u = subject.build_universe
@@ -111,10 +161,44 @@ RSpec.describe TradingLogic::Runner do
       expect(u.first[:figi]).to eq('F1')
     end
 
+    it 'skips a same-ticker instrument that is not tradable on TQBR in rubles' do
+      foreign_share = OpenStruct.new(
+        figi: 'F_FOREIGN', lot: 1, uid: 'UID_F', currency: 'usd', class_code: 'SPBXM',
+        buy_available_flag: true, sell_available_flag: true, api_trade_available_flag: true,
+        trading_status: 'SECURITY_TRADING_STATUS_NORMAL_TRADING'
+      )
+      allow(instruments).to receive(:share_by_ticker)
+        .with(ticker: 'SBER', class_code: 'TQBR')
+        .and_return(OpenStruct.new(instrument: foreign_share))
+      allow(instruments).to receive(:share_by_ticker)
+        .with(ticker: 'ROSN', class_code: 'TQBR')
+        .and_return(OpenStruct.new(instrument: nil))
+
+      expect(subject).not_to receive(:last_price_for)
+      expect(subject.build_universe).to eq([])
+    end
+
+    it 'skips a same-ticker instrument that is not buyable via api' do
+      blocked_share = OpenStruct.new(
+        figi: 'F_BLOCKED', lot: 1, uid: 'UID_B', currency: 'rub', class_code: 'TQBR',
+        buy_available_flag: false, sell_available_flag: true, api_trade_available_flag: false,
+        trading_status: 'SECURITY_TRADING_STATUS_NORMAL_TRADING'
+      )
+      allow(instruments).to receive(:share_by_ticker)
+        .with(ticker: 'SBER', class_code: 'TQBR')
+        .and_return(OpenStruct.new(instrument: blocked_share))
+      allow(instruments).to receive(:share_by_ticker)
+        .with(ticker: 'ROSN', class_code: 'TQBR')
+        .and_return(OpenStruct.new(instrument: nil))
+
+      expect(subject).not_to receive(:last_price_for)
+      expect(subject.build_universe).to eq([])
+    end
+
     it 'filters out by max_lot_rub' do
       # set tiny max_lot to force filter
       runner = described_class.new(client, tickers: %w[SBER], max_lot_rub: 10.0)
-      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: OpenStruct.new(figi: 'F1',
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: tradable_share(figi: 'F1',
                                                                                                            lot: 1)))
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
       expect(runner.build_universe).to eq([])
@@ -122,7 +206,7 @@ RSpec.describe TradingLogic::Runner do
 
     it 'does not request volume metrics when volume features are disabled' do
       runner = described_class.new(client, tickers: %w[SBER], volume_compare_mode: 'none')
-      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: OpenStruct.new(figi: 'F1',
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: tradable_share(figi: 'F1',
                                                                                                            lot: 1)))
       allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(300))]))
 

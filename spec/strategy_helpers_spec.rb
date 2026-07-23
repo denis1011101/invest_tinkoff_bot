@@ -13,9 +13,26 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
   def write_cache(rows)
     f = Tempfile.new(['cache', '.json'])
-    f.write(JSON.generate({ 'instruments' => rows }))
+    # updated_at свежий — иначе срабатывает защита от протухших кешей.
+    f.write(JSON.generate({ 'updated_at' => Time.now.utc.iso8601, 'instruments' => rows }))
     f.flush
     f
+  end
+
+  # Торгуемая рублёвая акция TQBR (то, что теперь возвращает авторитетный резолв
+  # через share_by_ticker вместо строкового совпадения тикера из кеша).
+  def tradable_share(figi:, lot: 1)
+    OpenStruct.new(
+      figi: figi, lot: lot, uid: "uid_#{figi}", currency: 'rub', class_code: 'TQBR',
+      buy_available_flag: true, sell_available_flag: true, api_trade_available_flag: true,
+      trading_status: 'SECURITY_TRADING_STATUS_NORMAL_TRADING'
+    )
+  end
+
+  def stub_share(instruments, ticker, figi:, lot: 1)
+    allow(instruments).to receive(:share_by_ticker)
+      .with(hash_including(ticker: ticker))
+      .and_return(OpenStruct.new(instrument: tradable_share(figi: figi, lot: lot)))
   end
 
   def rising_daily_candles
@@ -49,6 +66,10 @@ RSpec.describe TradingLogic::StrategyHelpers do
     allow(operations).to receive(:portfolio).and_return(
       OpenStruct.new(total_amount_shares: q(10_000), positions: [])
     )
+    # По умолчанию тикер X резолвится в торгуемую акцию с figi "F_X".
+    allow(instruments).to receive(:share_by_ticker) do |ticker:, **_|
+      OpenStruct.new(instrument: tradable_share(figi: "F_#{ticker}"))
+    end
 
     [client, market_data, operations, instruments]
   end
@@ -69,8 +90,13 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
     client = double('client')
     market_data = double('market_data')
+    instruments = double('instruments')
     allow(client).to receive(:grpc_market_data).and_return(market_data)
+    allow(client).to receive(:grpc_instruments).and_return(instruments)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
+    allow(instruments).to receive(:share_by_ticker) do |ticker:, **_|
+      OpenStruct.new(instrument: tradable_share(figi: "F_#{ticker}"))
+    end
 
     operations = double('operations')
     allow(client).to receive(:grpc_operations).and_return(operations)
@@ -126,8 +152,13 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
     client = double('client')
     market_data = double('market_data')
+    instruments = double('instruments')
     allow(client).to receive(:grpc_market_data).and_return(market_data)
+    allow(client).to receive(:grpc_instruments).and_return(instruments)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
+    allow(instruments).to receive(:share_by_ticker) do |ticker:, **_|
+      OpenStruct.new(instrument: tradable_share(figi: "F_#{ticker}"))
+    end
 
     operations = double('operations')
     allow(client).to receive(:grpc_operations).and_return(operations)
@@ -167,8 +198,10 @@ RSpec.describe TradingLogic::StrategyHelpers do
     index_cache&.close!
   end
 
-  it 'resolves figi through instruments service when cache entry has no figi' do
-    market_cache = write_cache([{ 'ticker' => 'AAA', 'lot' => 1 }])
+  it 'resolves figi authoritatively via share_by_ticker, ignoring any figi in cache' do
+    # В кеше намеренно "чужой" figi (как AT&T для тикера T) — он должен игнорироваться,
+    # а торговаться авторитетный figi из share_by_ticker.
+    market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_WRONG', 'lot' => 1 }])
     index_cache = write_cache([{ 'ticker' => 'AAA' }])
 
     client = double('client')
@@ -180,9 +213,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     allow(client).to receive(:grpc_instruments).and_return(instruments)
     allow(client).to receive(:grpc_operations).and_return(operations)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
-    allow(instruments).to receive(:find_instrument)
-      .with(query: 'AAA')
-      .and_return(OpenStruct.new(instruments: [OpenStruct.new(figi: 'F_AAA')]))
+    stub_share(instruments, 'AAA', figi: 'F_AAA')
     allow(operations).to receive(:portfolio).and_return(
       OpenStruct.new(total_amount_shares: q(10_000), positions: [])
     )
@@ -211,6 +242,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     expect(result).to be true
     expect(logic).to have_received(:last_price_for).with('F_AAA')
     expect(logic).to have_received(:dip_today?).with('F_AAA')
+    expect(logic).not_to have_received(:last_price_for).with('F_WRONG')
   ensure
     market_cache&.close!
     index_cache&.close!
@@ -337,7 +369,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     index_cache = write_cache([{ 'ticker' => 'AAA' }])
     client, _market_data, _operations, instruments = build_buy_flow_client(market_candles: rising_daily_candles)
 
-    allow(instruments).to receive(:find_instrument).with(query: 'AAA').and_raise(StandardError, 'lookup failed')
+    allow(instruments).to receive(:share_by_ticker).and_raise(StandardError, 'lookup failed')
 
     logic = double('logic')
     expect(logic).not_to receive(:last_price_for)
@@ -389,6 +421,208 @@ RSpec.describe TradingLogic::StrategyHelpers do
   ensure
     market_cache&.close!
     index_cache&.close!
+  end
+
+  it 'halts intersection BUY when caches are stale (older than max age)' do
+    stale = Time.now.utc - (10 * 24 * 3600)
+    market_cache = Tempfile.new(['m', '.json'])
+    market_cache.write(JSON.generate({ 'updated_at' => stale.iso8601,
+                                       'instruments' => [{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }] }))
+    market_cache.flush
+    index_cache = Tempfile.new(['i', '.json'])
+    index_cache.write(JSON.generate({ 'updated_at' => stale.iso8601, 'instruments' => [{ 'ticker' => 'AAA' }] }))
+    index_cache.flush
+
+    logic = double('logic')
+    expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+    result = described_class.buy_one_momentum_from_intersection!(
+      double('client'), logic, described_class.default_state,
+      market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc'
+    )
+    expect(result).to be false
+  ensure
+    market_cache&.close!
+    index_cache&.close!
+  end
+
+  it 'sends BUY quantity in LOTS (lots_per_order), not lot_size * lots, when lot_size > 1' do
+    market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 10 }])
+    index_cache = write_cache([{ 'ticker' => 'AAA' }])
+    client, _md, _ops, instruments = build_buy_flow_client(market_candles: rising_daily_candles)
+    allow(instruments).to receive(:share_by_ticker)
+      .with(hash_including(ticker: 'AAA'))
+      .and_return(OpenStruct.new(instrument: tradable_share(figi: 'F_AAA', lot: 10)))
+
+    logic = double('logic')
+    allow(logic).to receive(:last_price_for).with('F_AAA').and_return(10.0)
+    allow(logic).to receive(:dip_today?).with('F_AAA').and_return(true)
+    allow(logic).to receive(:respond_to?).with(:near_support?).and_return(false)
+    captured = nil
+    allow(logic).to receive(:confirm_and_place_order_with_result) do |**kw|
+      captured = kw
+      { ok: true, category: :filled, response: OpenStruct.new(order_id: 'o'), client_order_id: 'c' }
+    end
+
+    result = described_class.buy_one_momentum_from_intersection!(
+      client, logic, described_class.default_state,
+      market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0, lots_per_order: 2, account_id: 'acc'
+    )
+
+    expect(result).to be true
+    # 2 лота, а НЕ 10*2=20 бумаг
+    expect(captured[:quantity]).to eq(2)
+  ensure
+    market_cache&.close!
+    index_cache&.close!
+  end
+
+  it 'quarantines the figi after a permanent 30079 reject and skips it on the next run' do
+    market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+    index_cache = write_cache([{ 'ticker' => 'AAA' }])
+    client, = build_buy_flow_client(market_candles: rising_daily_candles)
+
+    logic = double('logic')
+    allow(logic).to receive(:last_price_for).with('F_AAA').and_return(100.0)
+    allow(logic).to receive(:dip_today?).with('F_AAA').and_return(true)
+    allow(logic).to receive(:respond_to?).with(:near_support?).and_return(false)
+    allow(logic).to receive(:confirm_and_place_order_with_result).and_return(
+      { ok: false, category: :broker_rejected, error_code: '30079',
+        reject_reason: 'instrument not available for trading', client_order_id: 'c' }
+    )
+
+    state = described_class.default_state
+    args = {
+      market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc'
+    }
+
+    described_class.buy_one_momentum_from_intersection!(client, logic, state, **args)
+    expect(state['quarantine']).to have_key('F_AAA')
+
+    described_class.buy_one_momentum_from_intersection!(client, logic, state, **args)
+    # confirm вызван РОВНО один раз: на втором проходе кандидат в карантине
+    expect(logic).to have_received(:confirm_and_place_order_with_result).once
+  ensure
+    market_cache&.close!
+    index_cache&.close!
+  end
+
+  it 'skips a same-ticker instrument that is not TQBR/rub (fail-closed resolution)' do
+    market_cache = write_cache([{ 'ticker' => 'T', 'figi' => 'F_ATT', 'lot' => 1 }])
+    index_cache = write_cache([{ 'ticker' => 'T' }])
+    client, = build_buy_flow_client(market_candles: rising_daily_candles)
+    foreign = OpenStruct.new(
+      figi: 'F_ATT', lot: 1, uid: 'u', currency: 'usd', class_code: 'SPBXM',
+      buy_available_flag: true, sell_available_flag: true, api_trade_available_flag: true,
+      trading_status: 'SECURITY_TRADING_STATUS_NORMAL_TRADING'
+    )
+    allow(client.grpc_instruments).to receive(:share_by_ticker)
+      .with(hash_including(ticker: 'T')).and_return(OpenStruct.new(instrument: foreign))
+
+    logic = double('logic')
+    expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+    result = described_class.buy_one_momentum_from_intersection!(
+      client, logic, described_class.default_state,
+      market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc'
+    )
+    expect(result).to be false
+  ensure
+    market_cache&.close!
+    index_cache&.close!
+  end
+
+  describe '.try_sell_positions_with_logic!' do
+    it 'sells ONE lot (quantity in lots), not the raw share count, for a multi-lot position' do
+      position = OpenStruct.new(figi: 'F1', instrument_type: 'SHARE', quantity: OpenStruct.new(units: 100))
+      client = double('client')
+      ops = double('ops')
+      instruments = double('instruments')
+      allow(client).to receive(:grpc_operations).and_return(ops)
+      allow(client).to receive(:grpc_instruments).and_return(instruments)
+      allow(ops).to receive(:portfolio).and_return(OpenStruct.new(positions: [position]))
+      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 10))
+
+      logic = double('logic')
+      allow(logic).to receive(:should_sell?).and_return(true)
+      allow(logic).to receive(:last_price_for).with('F1').and_return(50.0)
+      captured = nil
+      allow(logic).to receive(:confirm_and_place_order) do |**kw|
+        captured = kw
+        OpenStruct.new(order_id: 'o')
+      end
+
+      described_class.try_sell_positions_with_logic!(
+        client, logic, 'acc', described_class.default_state,
+        figi_cache: { 'F1' => 'AAA' }, trend: :side
+      )
+
+      # 100 бумаг / лот 10 = 10 лотов, продаём 1 лот
+      expect(captured[:quantity]).to eq(1)
+    end
+  end
+
+  describe '.try_force_exit_positions_with_logic!' do
+    it 'force-sells the full held lots even when the buy universe would be empty' do
+      position = OpenStruct.new(
+        figi: 'F1',
+        instrument_type: 'SHARE',
+        quantity: OpenStruct.new(units: 100),
+        average_position_price: q(100)
+      )
+      client = double('client')
+      ops = double('ops')
+      instruments = double('instruments')
+      allow(client).to receive(:grpc_operations).and_return(ops)
+      allow(client).to receive(:grpc_instruments).and_return(instruments)
+      allow(ops).to receive(:portfolio).and_return(OpenStruct.new(positions: [position]))
+      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 10, ticker: 'AAA'))
+
+      logic = double('logic')
+      allow(logic).to receive(:should_force_exit?).with(position, 'F1').and_return(true)
+      allow(logic).to receive(:last_price_for).with('F1').and_return(150.0)
+      captured = nil
+      allow(logic).to receive(:confirm_and_place_order) do |**kw|
+        captured = kw
+        OpenStruct.new(order_id: 'force-1')
+      end
+
+      described_class.try_force_exit_positions_with_logic!(
+        client, logic, 'acc', figi_cache: { 'F1' => 'AAA' }
+      )
+
+      expect(captured[:figi]).to eq('F1')
+      expect(captured[:quantity]).to eq(10)
+    end
+
+    it 'skips force-exit when instrument lot size cannot be resolved' do
+      position = OpenStruct.new(
+        figi: 'F1',
+        instrument_type: 'SHARE',
+        quantity: OpenStruct.new(units: 100),
+        average_position_price: q(100)
+      )
+      client = double('client')
+      ops = double('ops')
+      instruments = double('instruments')
+      allow(client).to receive(:grpc_operations).and_return(ops)
+      allow(client).to receive(:grpc_instruments).and_return(instruments)
+      allow(ops).to receive(:portfolio).and_return(OpenStruct.new(positions: [position]))
+      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_raise(StandardError, 'lookup failed')
+
+      logic = double('logic')
+      allow(logic).to receive(:should_force_exit?).with(position, 'F1').and_return(true)
+      expect(logic).not_to receive(:last_price_for)
+      expect(logic).not_to receive(:confirm_and_place_order)
+
+      described_class.try_force_exit_positions_with_logic!(
+        client, logic, 'acc', figi_cache: { 'F1' => 'AAA' }
+      )
+    end
   end
 
   describe '.position_within_limit?' do

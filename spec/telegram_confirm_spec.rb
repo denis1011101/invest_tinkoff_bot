@@ -18,6 +18,20 @@ RSpec.describe TradingLogic::TelegramConfirm do
       expect(result).to be true
     end
 
+    it 'sends plain text when parse_mode is nil' do
+      fake_resp = OpenStruct.new(code: '200', body: '{"ok":true,"result":{}}')
+      captured_body = nil
+      allow(Net::HTTP).to receive(:post) do |_uri, body, _headers|
+        captured_body = JSON.parse(body)
+        fake_resp
+      end
+
+      described_class.send_message(bot_token: token, chat_id: chat_id, text: 'bundle exec rake moex_cache:sync', parse_mode: nil)
+
+      expect(captured_body).not_to have_key('parse_mode')
+      expect(captured_body['text']).to include('moex_cache:sync')
+    end
+
     it 'returns false on non-200 response' do
       fake_resp = OpenStruct.new(code: '500', body: 'error')
       allow(Net::HTTP).to receive(:post).and_return(fake_resp)

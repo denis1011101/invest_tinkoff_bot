@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Systemd-friendly entrypoint: systemd's default PATH has no RVM/Bundler,
+# so `/usr/bin/env bundle` fails inside units. Sourcing rvm is also fragile
+# (the installed RVM cannot parse ruby 4.x version strings), so this wrapper
+# builds GEM_HOME/GEM_PATH/PATH directly from the RVM directory layout for
+# the ruby pinned in .ruby-version, then execs `bundle exec <args...>` from
+# the repository root. Falls back to whatever `bundle` is already in PATH.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+RUBY_NAME="ruby-$(sed -e 's/^ruby-//' .ruby-version)"
+
+for prefix in /usr/share/rvm /usr/local/rvm "${HOME:-/nonexistent}/.rvm"; do
+  if [[ -d "$prefix/rubies/$RUBY_NAME/bin" ]]; then
+    export GEM_HOME="$prefix/gems/$RUBY_NAME"
+    export GEM_PATH="$GEM_HOME:$prefix/gems/$RUBY_NAME@global"
+    export PATH="$GEM_HOME/bin:$prefix/gems/$RUBY_NAME@global/bin:$prefix/rubies/$RUBY_NAME/bin:$PATH"
+    break
+  fi
+done
+
+command -v bundle >/dev/null || { echo "systemd_exec: bundle not found for $RUBY_NAME" >&2; exit 127; }
+
+exec bundle exec "$@"

@@ -71,30 +71,30 @@ begin
   accounts = client.grpc_users.accounts
   account_id = accounts.accounts.first.id or abort('no accounts')
 
-  # Индекс IMOEX: пробуем найти напрямую, иначе TMOS/SBMX как прокси
-  index_figi = begin
-    resp = client.grpc_instruments.find_instrument(query: 'IMOEX')
-    resp.instruments.first&.figi
-  rescue InvestTinkoff::GRPC::Error
-    nil
-  end
-  if index_figi.nil?
+  # Индекс IMOEX: приоритетно через Indicatives (UID индекса — свечи по instrument_id).
+  # Индексы не отдаются last_prices и не имеют торгуемого figi, поэтому UID обязателен.
+  index_uid = logic.resolve_index_uid(ticker: ENV.fetch('INDEX_TICKER', 'IMOEX'))
+  LOGGER.debug("index_uid=#{index_uid.inspect}")
+
+  # Fallback на figi ETF-прокси (TMOS/SBMX), если UID индекса недоступен.
+  index_figi = nil
+  if index_uid.nil?
     index_figi = %w[TMOS SBMX].lazy.map do |ticker|
       r = client.grpc_instruments.find_instrument(query: ticker)
       r.instruments.first&.figi
     rescue InvestTinkoff::GRPC::Error
       nil
     end.find(&:itself)
+    LOGGER.debug("index UID unavailable — using proxy figi=#{index_figi.inspect}")
   end
 
-  LOGGER.debug("index_figi=#{index_figi.inspect}")
+  index_closes = logic.index_daily_closes(figi: index_figi, instrument_id: index_uid)
+  index_value = index_closes.last
+  LOGGER.debug("index_value=#{index_value.inspect} (closes=#{index_closes.size})")
 
-  # numeric current index value
-  index_value = index_figi ? logic.last_price_for(index_figi) : nil
-  LOGGER.debug("index_value=#{index_value.inspect}")
-
-  trend = logic.trend(index_figi)
+  trend = logic.trend_from_closes(index_closes)
   LOGGER.debug("trend=#{trend.inspect}")
+  LOGGER.warn('index closes < 4 — trend UNKNOWN; проверь резолв индекса (rake index:check)') if index_closes.size < 4
 
   universe = logic.rank_universe_by_volume(logic.build_universe)
   LOGGER.debug("universe (count=#{universe.size}):")
@@ -109,10 +109,7 @@ begin
                    u[:daily_turnover_rub] || 0.0
                  ))
   end
-  if universe.empty?
-    LOGGER.info("no instruments under limit: max_lot_rub=#{MAX_LOT_RUB}, lots_per_order=#{LOTS_PER_ORDER}")
-    exit 0
-  end
+  LOGGER.info("no buy instruments under limit: max_lot_rub=#{MAX_LOT_RUB}, lots_per_order=#{LOTS_PER_ORDER}") if universe.empty?
 
   if USE_LEVELS
     LOGGER.debug("levels (lookback=#{LEVELS_LOOKBACK_DAYS}d, proximity=#{(LEVEL_PROXIMITY_PCT * 100).round(1)}%):")
@@ -131,32 +128,9 @@ begin
 
   # Принудительная продажа всех лотов при профите >= +10% (до основной логики)
   begin
-    port_force = client.grpc_operations.portfolio(account_id: account_id)
-    positions_force = port_force.positions
-    positions_map = positions_force.to_h { |p| [p.figi, p] }
-
-    universe.each do |it|
-      p = positions_map[it[:figi]] or next
-      qty = p.quantity.units.to_i
-      next if qty <= 0
-      next unless logic.should_force_exit?(p, it[:figi])
-
-      cur_price = logic.last_price_for(it[:figi])
-      resp = logic.confirm_and_place_order(
-        account_id: account_id,
-        figi: it[:figi],
-        quantity: qty, # продаём весь объём
-        price: cur_price,
-        direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
-        order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
-      )
-      if resp
-        LOGGER.info("FORCE SELL +10% #{it[:ticker]} qty=#{qty} @#{cur_price} (order_id=#{resp.order_id})")
-        # mark_action! не обязателен: позиция обнулится, повтор не пройдёт
-      else
-        LOGGER.info("FORCE SELL #{it[:ticker]} skipped / not confirmed")
-      end
-    end
+    TradingLogic::StrategyHelpers.try_force_exit_positions_with_logic!(
+      client, logic, account_id, figi_cache: figi_cache, logger: LOGGER
+    )
   rescue InvestTinkoff::GRPC::Error => e
     LOGGER.error("Force exit gRPC error: #{e.class} #{e.message}")
   end
@@ -188,13 +162,13 @@ begin
       resp = logic.confirm_and_place_order(
         account_id: account_id,
         figi: it[:figi],
-        quantity: it[:lot] * LOTS_PER_ORDER,
+        quantity: LOTS_PER_ORDER, # в ЛОТАХ, не в штуках
         price: cur || it[:price],
         direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
         order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
       if resp
-        LOGGER.info("BUY #{it[:ticker]} lot=#{it[:lot]} @#{it[:price]} (order_id=#{resp.order_id})")
+        LOGGER.info("BUY #{it[:ticker]} lots=#{LOTS_PER_ORDER} lot_size=#{it[:lot]} @#{it[:price]} (order_id=#{resp.order_id})")
         TradingLogic::StrategyHelpers.mark_action!(state, 'last_buy', it[:ticker])
       else
         LOGGER.info("BUY #{it[:ticker]} skipped / not confirmed")
@@ -227,7 +201,12 @@ begin
       sell_it = it.merge(ticker: ticker)
       next unless logic.should_sell?(p, sell_it, trend: trend)
 
-      sell_qty = [qty_units, it[:lot]].min
+      # Продаём один лот. quantity в ЛОТАХ; ограничиваем числом удерживаемых лотов.
+      lot_size = [it[:lot].to_i, 1].max
+      lots_held = qty_units / lot_size
+      sell_qty = [1, lots_held].min
+      next if sell_qty <= 0
+
       resp = logic.confirm_and_place_order(
         account_id: account_id,
         figi: it[:figi],
@@ -237,7 +216,7 @@ begin
         order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
       if resp
-        LOGGER.info("SELL #{ticker} qty=#{sell_qty} (order_id=#{resp.order_id})")
+        LOGGER.info("SELL #{ticker} lots=#{sell_qty} (order_id=#{resp.order_id})")
         TradingLogic::StrategyHelpers.mark_action!(state, 'last_sell', ticker, figi: it[:figi], reason: 'signal')
       else
         LOGGER.info("SELL #{ticker} skipped / not confirmed")
@@ -259,6 +238,14 @@ begin
       logger: LOGGER
     )
     LOGGER.info('DOWN: no momentum candidates') unless bought
+
+  when :unknown
+    # Нет/мало данных по индексу — не путаем с боковиком. Новые покупки запрещаем,
+    # защитные продажи (в т.ч. force-exit выше) оставляем.
+    LOGGER.warn('Trend: UNKNOWN (нет данных по индексу) — только защитные продажи, без новых покупок')
+    TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
+      client, logic, account_id, state, figi_cache: figi_cache, trend: :side, logger: LOGGER
+    )
 
   else
     LOGGER.info('Trend: SIDE — SELL by same rules, and try momentum(3D up) BUY one per day')

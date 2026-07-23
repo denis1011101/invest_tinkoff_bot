@@ -11,7 +11,7 @@ require_relative 'level_analysis'
 require_relative 'utils'
 
 module TradingLogic
-  class Runner
+  class Runner # rubocop:disable Metrics/ClassLength
     include LevelAnalysis
 
     DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
@@ -82,10 +82,10 @@ module TradingLogic
     end
 
     def figi_and_lot(ticker, class_code: 'TQBR')
-      resp = Utils.safe_share_by_ticker(@client, ticker, class_code: class_code)
-      return [nil, nil] unless resp&.instrument
+      share = StrategyHelpers.resolve_tradable_share(@client, ticker, class_code: class_code)
+      return [nil, nil] unless share
 
-      [resp.instrument.figi, resp.instrument.lot]
+      [share[:figi], share[:lot]]
     end
 
     def last_price_for(figi)
@@ -173,14 +173,31 @@ module TradingLogic
       cur <= th * (1.0 - @dip_pct)
     end
 
-    # Тренд индекса: «стабильно больше 2 дней» = 3 последовательных дневных закрытия
-    # Возвращает :up, :down или :side
-    def trend(index_figi)
-      return :side unless index_figi
+    # Индекс через Indicatives: возвращает UID индекса по тикеру (например IMOEX) или nil.
+    # У индексов нет торгуемого figi, поэтому свечи берутся по instrument_id=UID.
+    def resolve_index_uid(ticker: 'IMOEX')
+      list = @client.grpc_instruments.indicatives
+      match = list.find { |i| i.respond_to?(:ticker) && i.ticker.to_s.upcase == ticker.to_s.upcase }
+      match&.uid
+    rescue StandardError
+      nil
+    end
 
-      resp = Utils.fetch_candles(@client, figi: index_figi, from: Utils.days_ago(6), to: Utils.now_utc, interval: DAY)
-      closes = resp&.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.close) }.compact : []
-      return :side if closes.size < 4
+    # Дневные закрытия индекса. Предпочитаем instrument_id (UID) — figi для индексов не работает.
+    def index_daily_closes(figi: nil, instrument_id: nil)
+      return [] unless figi || instrument_id
+
+      resp = Utils.fetch_candles(
+        @client,
+        figi: instrument_id ? nil : figi,
+        instrument_id: instrument_id,
+        from: Utils.days_ago(6), to: Utils.now_utc, interval: DAY
+      )
+      resp&.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.close) }.compact : []
+    end
+
+    def trend_from_closes(closes)
+      return :unknown if closes.size < 4
 
       # последние 4 закрытия => последние 3 изменения
       a = closes[-4]
@@ -193,18 +210,29 @@ module TradingLogic
       :side
     end
 
+    # Тренд индекса: «стабильно больше 2 дней» = 3 последовательных дневных закрытия
+    # Возвращает :up, :down, :side или :unknown.
+    # :unknown — данных по индексу нет/недостаточно (нельзя путать с настоящим боковиком).
+    def trend(index_figi, instrument_id: nil)
+      return :unknown unless index_figi || instrument_id
+
+      trend_from_closes(index_daily_closes(figi: index_figi, instrument_id: instrument_id))
+    end
+
     def build_universe
       volume_enabled = volume_features_enabled?
 
       @tickers.map do |t|
         figi, lot = figi_and_lot(t)
+        next unless figi && lot
+
         # skip if API lot count exceeds configured max_lot_count
         if @max_lot_count && lot.to_i > @max_lot_count.to_i
           warn "build_universe: skipping #{t} — lot=#{lot} > max_lot_count=#{@max_lot_count}"
           next
         end
         price = last_price_for(figi)
-        next unless price && lot
+        next unless price
 
         h = {
           ticker: t,
