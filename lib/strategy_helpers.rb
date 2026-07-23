@@ -240,8 +240,10 @@ module TradingLogic
         to: Time.now.utc,
         interval: ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
       )
-      closes = (response&.candles || []).map { |c| Utils.q_to_decimal(c.close) }.compact
-      logger&.debug("#{ticker} closes_count=#{closes.size} sample_last=#{closes.last(5).inspect}")
+      candles = response&.candles || []
+      completed = Utils.completed_daily_candles(candles, now: Time.now.utc)
+      closes = completed.map { |c| Utils.q_to_decimal(c.close) }.compact
+      logger&.debug("#{ticker} closes_count=#{closes.size} completed=#{completed.size}/#{candles.size} sample_last=#{closes.last(5).inspect}")
 
       if closes.size < 4
         logger&.debug("skip #{ticker} — not enough daily closes (need 4 for 3 consecutive increases)")
@@ -288,6 +290,8 @@ module TradingLogic
         { ok: false, category: :api_error, status: 'api_error', reject_reason: 'unexpected error', error_code: 'UNKNOWN' }
       end
 
+      result[:figi] ||= candidate[:figi]
+
       sync_pending_order!(state, candidate[:tk], result)
       return handle_successful_intersection_buy!(state, candidate, result, logger: logger) if successful_buy_result?(result)
 
@@ -308,11 +312,17 @@ module TradingLogic
 
     def handle_successful_intersection_buy!(state, candidate, result, logger: nil)
       response = result[:response]
-      logger&.debug("BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) order_id=#{response&.order_id}")
-      mark_action!(state, 'last_buy', candidate[:tk])
+      category = result[:category].to_s
+      logger&.debug("BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) category=#{category} order_id=#{response&.order_id}")
+      mark_action!(state, 'last_buy', candidate[:tk]) if buy_execution_result?(result)
       true
     rescue StandardError
       true
+    end
+
+    def buy_execution_result?(result)
+      category = result[:category].to_s
+      result[:ok] == true || %w[filled partially_filled].include?(category)
     end
 
     def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side, logger: nil)
@@ -565,17 +575,7 @@ module TradingLogic
       return false unless pending.is_a?(Hash)
 
       status = pending['status'].to_s
-      return false unless %w[sent_not_filled partially_filled].include?(status)
-
-      ts = begin
-        Time.parse(pending['ts'].to_s)
-      rescue StandardError
-        nil
-      end
-      return false unless ts
-
-      cooldown = (ENV['BUY_PENDING_COOLDOWN_MIN'] || '10').to_i * 60
-      (Time.now.utc - ts) < cooldown
+      %w[sent_not_filled partially_filled].include?(status)
     end
 
     # Проверяет, не превысит ли позиция по figi долю портфеля после покупки.
@@ -617,26 +617,226 @@ module TradingLogic
       pending = state['pending_orders']
       return if pending.empty?
 
-      active_order_ids = begin
-        resp = client.grpc_orders.get_orders(account_id: account_id)
-        orders = resp.respond_to?(:orders) ? resp.orders : []
-        Set.new(orders.filter_map do |o|
-          o.respond_to?(:order_id) ? o.order_id.to_s : nil
-        end)
-      rescue StandardError
-        nil
+      active_orders = fetch_active_orders(client, account_id)
+      unless active_orders[:ok]
+        logger&.warn('pending cleanup skipped: active orders response is malformed/unavailable')
+        return
       end
-      return unless active_order_ids
 
-      pending.delete_if do |ticker, info|
-        order_id = info['client_order_id'].to_s
-        next false if order_id.empty?
+      to_delete = []
+      pending.each do |ticker, info|
+        migrate_pending_order_metadata!(client, ticker, info, active_orders: active_orders, logger: logger)
 
-        unless active_order_ids.include?(order_id)
-          logger&.debug("cleaned up pending order for #{ticker} (order_id=#{order_id})")
-          true
+        unless pending_order_ids_present?(info)
+          logger&.warn("pending order for #{ticker} has no known IDs — keeping entry for safety")
+          next
+        end
+
+        next if active_pending_order?(info, active_orders)
+
+        reconciliation = reconcile_missing_pending_order!(client, account_id, state, ticker, info, logger: logger)
+        case reconciliation
+        when :executed, :not_executed
+          logger&.debug(
+            "cleaned up pending order for #{ticker} " \
+            "(client_id=#{info['client_order_id'].inspect}, broker_id=#{info['broker_order_id'].inspect})"
+          )
+          to_delete << ticker
+        when :unknown
+          logger&.warn("pending order for #{ticker} left untouched — execution status unknown")
         end
       end
+
+      to_delete.each { |ticker| pending.delete(ticker) }
+    end
+
+    def fetch_active_orders(client, account_id)
+      resp = client.grpc_orders.get_orders(account_id: account_id)
+      return { ok: false } if resp.nil? || !resp.respond_to?(:orders)
+
+      orders = resp.orders
+      return { ok: false } if orders.nil?
+
+      broker_ids = Set.new
+      client_ids = Set.new
+      broker_by_client = {}
+
+      orders.each do |order|
+        broker_id = order_broker_id(order)
+        client_id = order_request_id(order)
+
+        broker_ids << broker_id if broker_id
+        client_ids << client_id if client_id
+        broker_by_client[client_id] = broker_id if client_id && broker_id
+      end
+
+      {
+        ok: true,
+        broker_order_ids: broker_ids,
+        client_order_ids: client_ids,
+        broker_id_by_client_id: broker_by_client
+      }
+    rescue StandardError
+      { ok: false }
+    end
+
+    def migrate_pending_order_metadata!(client, ticker, info, active_orders:, logger: nil)
+      return unless info.is_a?(Hash)
+
+      if info['broker_order_id'].to_s.empty?
+        client_id = info['client_order_id'].to_s
+        mapped_broker_id = active_orders[:broker_id_by_client_id][client_id]
+        info['broker_order_id'] = mapped_broker_id if mapped_broker_id
+      end
+
+      return unless info['figi'].to_s.empty?
+      return unless client.respond_to?(:grpc_instruments)
+
+      share = resolve_tradable_share(client, ticker, logger: logger)
+      return unless share && share[:figi]
+
+      info['figi'] = share[:figi]
+      logger&.debug("pending metadata migrated for #{ticker}: figi=#{share[:figi]}")
+    rescue StandardError => e
+      logger&.warn("pending metadata migration failed for #{ticker}: #{e.class}: #{e.message}")
+    end
+
+    def reconcile_missing_pending_order!(client, account_id, state, ticker, info, logger: nil)
+      status = pending_buy_execution_state(client, account_id, info, logger: logger)
+      return :not_executed if status == :not_executed
+      return :unknown if status == :unknown
+
+      logger&.info("pending BUY resolved with execution for #{ticker} — marking last_buy")
+      mark_action!(state, 'last_buy', ticker)
+      :executed
+    rescue StandardError => e
+      logger&.warn("pending reconciliation failed for #{ticker}: #{e.class}: #{e.message}")
+      :unknown
+    end
+
+    def pending_buy_execution_state(client, account_id, pending_info, logger: nil)
+      from = pending_order_ts(pending_info) || (Time.now.utc - (2 * 24 * 3600))
+      overlap = (ENV['PENDING_RECONCILE_OVERLAP_SECONDS'] || '120').to_i
+      from -= overlap if overlap.positive?
+      to = Time.now.utc
+      figi = pending_info['figi'].to_s
+      if figi.empty?
+        logger&.warn('pending reconciliation skipped: FIGI is missing')
+        return :unknown
+      end
+
+      fetched = operations_between(client, account_id, from: from, to: to)
+      return :unknown unless fetched[:ok]
+
+      executed = fetched[:operations].any? do |op|
+        operation_buy_executed_for_figi?(op, figi)
+      end
+      return :unknown if !executed && fetched[:has_next]
+
+      executed ? :executed : :not_executed
+    end
+
+    def operations_between(client, account_id, from:, to:)
+      ops = client.grpc_operations
+      if ops.respond_to?(:operations_by_cursor)
+        resp = ops.operations_by_cursor(account_id: account_id, from: from, to: to)
+        return { ok: false, operations: [] } if resp.nil? || !resp.respond_to?(:items)
+
+        operations = resp.items
+        return { ok: false, operations: [] } if operations.nil?
+
+        has_next = resp.respond_to?(:has_next) ? resp.has_next : false
+      elsif ops.respond_to?(:operations)
+        resp = ops.operations(account_id: account_id, from: from, to: to)
+        return { ok: false, operations: [] } if resp.nil? || !resp.respond_to?(:operations)
+
+        operations = resp.operations
+        return { ok: false, operations: [] } if operations.nil?
+
+        has_next = false
+      else
+        return { ok: false, operations: [] }
+      end
+      { ok: true, operations: operations, has_next: has_next }
+    rescue StandardError
+      { ok: false, operations: [] }
+    end
+
+    def operation_buy_executed_for_figi?(op, figi)
+      return false unless operation_kind(op) == :buy
+
+      op_figi = op.respond_to?(:figi) ? op.figi.to_s : ''
+      return false unless op_figi == figi
+
+      operation_has_execution?(op)
+    end
+
+    def operation_has_execution?(op)
+      qty = operation_quantity_done(op)
+      return true if qty&.positive?
+
+      trades = operation_trades(op)
+      return true if trades && !trades.empty?
+
+      status = operation_execution_status(op)
+      return true if status.include?('FILL') || status.include?('EXECUTED')
+
+      false
+    rescue StandardError
+      false
+    end
+
+    def operation_quantity_done(op)
+      raw =
+        if op.respond_to?(:quantity_done)
+          op.quantity_done
+        elsif op.respond_to?(:lots_executed)
+          op.lots_executed
+        elsif op.respond_to?(:executed_lots)
+          op.executed_lots
+        end
+      return nil if raw.nil?
+
+      if raw.respond_to?(:units)
+        Utils.q_to_decimal(raw)
+      else
+        raw.to_f
+      end
+    rescue StandardError
+      nil
+    end
+
+    def operation_trades(op)
+      return op.trades if op.respond_to?(:trades)
+      return op.trade_items if op.respond_to?(:trade_items)
+
+      if op.respond_to?(:trades_info)
+        info = op.trades_info
+        return nil unless info
+        return info.trades if info.respond_to?(:trades)
+      end
+
+      nil
+    end
+
+    def operation_execution_status(op)
+      raw =
+        if op.respond_to?(:state)
+          op.state
+        elsif op.respond_to?(:status)
+          op.status
+        elsif op.respond_to?(:operation_state)
+          op.operation_state
+        end
+      raw.to_s.upcase
+    rescue StandardError
+      ''
+    end
+
+    def pending_order_ts(info)
+      Time.parse(info['ts'].to_s).utc
+    rescue StandardError
+      nil
     end
 
     def sync_pending_order!(state, ticker, result)
@@ -649,10 +849,15 @@ module TradingLogic
         end
 
       if pending_status
+        broker_order_id = pending_broker_order_id(result)
+        client_order_id = pending_client_order_id(result)
+        submitted_at = pending_submitted_at(result)
         state['pending_orders'][ticker] = {
-          'client_order_id' => result[:client_order_id],
+          'client_order_id' => client_order_id,
+          'broker_order_id' => broker_order_id,
           'ticker' => ticker,
-          'ts' => Time.now.utc.iso8601,
+          'figi' => result[:figi],
+          'ts' => submitted_at || Time.now.utc.iso8601,
           'status' => pending_status
         }
       else
@@ -816,7 +1021,10 @@ module TradingLogic
       return unless client.respond_to?(:grpc_orders)
 
       resp = client.grpc_orders.get_orders(account_id: account_id)
-      orders = resp.respond_to?(:orders) ? resp.orders : []
+      return if resp.nil? || !resp.respond_to?(:orders)
+
+      orders = resp.orders
+      return if orders.nil?
       return if orders.empty?
 
       orders.each do |ord|
@@ -832,6 +1040,7 @@ module TradingLogic
         next unless ticker
 
         state['pending_orders'][ticker] = restored_pending_order_payload(ord, ticker, pending_status)
+        mark_action!(state, 'last_buy', ticker) if order_has_executed_lots?(ord)
       end
     rescue StandardError => e
       logger&.error("pending orders restore failed: #{e.class}: #{e.message}")
@@ -871,19 +1080,119 @@ module TradingLogic
 
     def restored_pending_order_payload(order, ticker, pending_status)
       {
-        'client_order_id' => restored_order_id(order),
+        'client_order_id' => order_request_id(order),
+        'broker_order_id' => order_broker_id(order),
         'ticker' => ticker,
-        'ts' => Time.now.utc.iso8601,
+        'figi' => order_figi(order),
+        'ts' => order_submitted_at(order) || Time.now.utc.iso8601,
         'status' => pending_status
       }
     end
 
-    def restored_order_id(order)
-      if order.respond_to?(:order_id)
-        order.order_id
-      elsif order.respond_to?(:order_request_id)
-        order.order_request_id
+    def order_submitted_at(order)
+      candidate =
+        if order.respond_to?(:order_date) then order.order_date
+        elsif order.respond_to?(:created_at) then order.created_at
+        elsif order.respond_to?(:date) then order.date
+        end
+      return nil unless candidate
+
+      parse_time_candidate(candidate)&.iso8601
+    rescue StandardError
+      nil
+    end
+
+    def parse_time_candidate(candidate)
+      if candidate.respond_to?(:seconds)
+        Time.at(candidate.seconds).utc
+      elsif candidate.is_a?(Time)
+        candidate.utc
+      else
+        Time.parse(candidate.to_s).utc
       end
+    rescue StandardError
+      nil
+    end
+
+    def order_has_executed_lots?(order)
+      value =
+        if order.respond_to?(:lots_executed)
+          order.lots_executed
+        elsif order.respond_to?(:executed_order_lots)
+          order.executed_order_lots
+        end
+      numeric =
+        if value.respond_to?(:units)
+          Utils.q_to_decimal(value)
+        else
+          value.to_f
+        end
+      numeric.positive?
+    rescue StandardError
+      false
+    end
+
+    def order_broker_id(order)
+      return nil unless order.respond_to?(:order_id)
+
+      value = order.order_id.to_s
+      value.empty? ? nil : value
+    rescue StandardError
+      nil
+    end
+
+    def order_request_id(order)
+      return nil unless order.respond_to?(:order_request_id)
+
+      value = order.order_request_id.to_s
+      value.empty? ? nil : value
+    rescue StandardError
+      nil
+    end
+
+    def pending_order_ids_present?(info)
+      info['client_order_id'].to_s != '' || info['broker_order_id'].to_s != ''
+    end
+
+    def active_pending_order?(info, active_orders)
+      client_order_id = info['client_order_id'].to_s
+      broker_order_id = info['broker_order_id'].to_s
+
+      client_match = !client_order_id.empty? && active_orders[:client_order_ids].include?(client_order_id)
+      broker_match = !broker_order_id.empty? && active_orders[:broker_order_ids].include?(broker_order_id)
+      client_match || broker_match
+    end
+
+    def pending_broker_order_id(result)
+      response = result[:response]
+      return result[:broker_order_id].to_s if result[:broker_order_id].to_s != ''
+
+      if response.respond_to?(:order_id)
+        value = response.order_id.to_s
+        return value unless value.empty?
+      end
+
+      nil
+    end
+
+    def pending_client_order_id(result)
+      response = result[:response]
+      if response.respond_to?(:order_request_id)
+        value = response.order_request_id.to_s
+        return value unless value.empty?
+      end
+
+      fallback = result[:client_order_id].to_s
+      fallback.empty? ? nil : fallback
+    end
+
+    def pending_submitted_at(result)
+      value = result[:submitted_at].to_s
+      return nil if value.empty?
+
+      Time.parse(value).utc.iso8601
+    rescue StandardError
+      nil
     end
 
     def operation_kind(op)

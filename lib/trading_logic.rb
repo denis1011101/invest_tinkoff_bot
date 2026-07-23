@@ -191,9 +191,12 @@ module TradingLogic
         @client,
         figi: instrument_id ? nil : figi,
         instrument_id: instrument_id,
-        from: Utils.days_ago(6), to: Utils.now_utc, interval: DAY
+        from: Utils.days_ago(14), to: Utils.now_utc, interval: DAY
       )
-      resp&.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.close) }.compact : []
+      candles = resp&.candles || []
+      Utils.completed_daily_candles(candles, now: Utils.now_utc)
+           .map { |c| Utils.q_to_decimal(c.close) }
+           .compact
     end
 
     def trend_from_closes(closes)
@@ -353,10 +356,12 @@ module TradingLogic
       return { ok: false, category: :not_sent, status: 'not_sent', response: nil } unless confirmed
 
       client_order_id = SecureRandom.uuid
+      submitted_at = nil
       attempts = 0
 
       begin
         attempts += 1
+        submitted_at ||= Time.now.utc.iso8601
         response = @client.grpc_orders.post_order(
           account_id: account_id,
           figi: figi,
@@ -378,6 +383,7 @@ module TradingLogic
           status: status,
           response: response,
           client_order_id: client_order_id,
+          submitted_at: submitted_at,
           reject_reason: reject_reason,
           error_code: error_code
         }
@@ -395,6 +401,7 @@ module TradingLogic
           status: 'api_error',
           response: nil,
           client_order_id: client_order_id,
+          submitted_at: submitted_at,
           reject_reason: e.message,
           error_code: e.class.to_s,
           technical_error: technical

@@ -5,6 +5,7 @@ require_relative '../lib/strategy_helpers'
 require 'tempfile'
 require 'json'
 require 'ostruct'
+require 'google/protobuf/timestamp_pb'
 
 RSpec.describe TradingLogic::StrategyHelpers do
   def q(units, nano = 0)
@@ -44,6 +45,17 @@ RSpec.describe TradingLogic::StrategyHelpers do
     ]
   end
 
+  def rising_daily_candles_with_incomplete_today_drop
+    now = Time.now.utc
+    [
+      OpenStruct.new(close: q(10), is_complete: true,  time: OpenStruct.new(seconds: (now - (4 * 86_400)).to_i)),
+      OpenStruct.new(close: q(11), is_complete: true,  time: OpenStruct.new(seconds: (now - (3 * 86_400)).to_i)),
+      OpenStruct.new(close: q(12), is_complete: true,  time: OpenStruct.new(seconds: (now - (2 * 86_400)).to_i)),
+      OpenStruct.new(close: q(13), is_complete: true,  time: OpenStruct.new(seconds: (now - 86_400).to_i)),
+      OpenStruct.new(close: q(7),  is_complete: false, time: OpenStruct.new(seconds: now.to_i))
+    ]
+  end
+
   def flat_daily_candles
     [
       OpenStruct.new(close: q(10)),
@@ -74,7 +86,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     [client, market_data, operations, instruments]
   end
 
-  it 'stops after first accepted BUY when category is sent_not_filled' do
+  it 'tracks pending BUY without last_buy mark when category is sent_not_filled' do
     market_cache = write_cache(
       [
         { 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 },
@@ -130,13 +142,13 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
     expect(result).to be true
     expect(state.fetch('pending_orders').fetch('AAA').fetch('status')).to eq('sent_not_filled')
-    expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
+    expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d'), {})).not_to have_key('AAA')
   ensure
     market_cache&.close!
     index_cache&.close!
   end
 
-  it 'stops after first accepted BUY when category is partially_filled' do
+  it 'tracks pending BUY and marks last_buy when category is partially_filled' do
     market_cache = write_cache(
       [
         { 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 },
@@ -192,6 +204,47 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
     expect(result).to be true
     expect(state.fetch('pending_orders').fetch('AAA').fetch('status')).to eq('partially_filled')
+    expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
+  ensure
+    market_cache&.close!
+    index_cache&.close!
+  end
+
+  it 'uses only completed daily candles for momentum validation' do
+    market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+    index_cache = write_cache([{ 'ticker' => 'AAA' }])
+    client, market_data = build_buy_flow_client(market_candles: rising_daily_candles)
+    allow(market_data).to receive(:candles).and_return(
+      OpenStruct.new(candles: rising_daily_candles_with_incomplete_today_drop)
+    )
+
+    logic = double('logic')
+    allow(logic).to receive(:last_price_for).with('F_AAA').and_return(100.0)
+    allow(logic).to receive(:dip_today?).with('F_AAA').and_return(true)
+    allow(logic).to receive(:respond_to?).with(:near_support?).and_return(false)
+    expect(logic).to receive(:confirm_and_place_order_with_result).once.and_return(
+      {
+        ok: true,
+        category: :filled,
+        response: OpenStruct.new(order_id: 'order-complete-1'),
+        client_order_id: 'client-complete-1'
+      }
+    )
+
+    state = { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {} }
+
+    result = described_class.buy_one_momentum_from_intersection!(
+      client,
+      logic,
+      state,
+      market_cache_path: market_cache.path,
+      moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0,
+      lots_per_order: 1,
+      account_id: 'acc'
+    )
+
+    expect(result).to be true
     expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
   ensure
     market_cache&.close!
@@ -287,6 +340,388 @@ RSpec.describe TradingLogic::StrategyHelpers do
     index_cache&.close!
   end
 
+  it 'skips candidate when pending buy is old but still active in state' do
+    market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+    index_cache = write_cache([{ 'ticker' => 'AAA' }])
+    client, = build_buy_flow_client(market_candles: rising_daily_candles)
+
+    logic = double('logic')
+    allow(logic).to receive(:last_price_for).with('F_AAA').and_return(100.0)
+    allow(logic).to receive(:dip_today?).with('F_AAA').and_return(true)
+    allow(logic).to receive(:respond_to?).with(:near_support?).and_return(false)
+    expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+    state = {
+      'last_buy' => {},
+      'last_sell' => {},
+      'pending_orders' => {
+        'AAA' => {
+          'status' => 'sent_not_filled',
+          'ts' => (Time.now.utc - (24 * 3600)).iso8601
+        }
+      }
+    }
+
+    result = described_class.buy_one_momentum_from_intersection!(
+      client,
+      logic,
+      state,
+      market_cache_path: market_cache.path,
+      moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0,
+      lots_per_order: 1,
+      account_id: 'acc'
+    )
+
+    expect(result).to be false
+  ensure
+    market_cache&.close!
+    index_cache&.close!
+  end
+
+  describe '.cleanup_pending_orders!' do
+    it 'keeps pending when get_orders returns nil (malformed response)' do
+      client = double('client')
+      orders = double('orders')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(nil)
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'req-uuid-1',
+            'broker_order_id' => '82057073067',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+    end
+
+    it 'keeps pending when active order has matching order_request_id but different broker order_id' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      active_order = OpenStruct.new(order_id: '82057073067', order_request_id: 'req-uuid-1')
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: [active_order]))
+      expect(operations).not_to receive(:operations_by_cursor)
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'req-uuid-1',
+            'broker_order_id' => '999999',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(state.fetch('last_buy')).to eq({})
+    end
+
+    it 'marks last_buy when pending order disappears and buy execution is present in broker operations' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+
+      buy_op = OpenStruct.new(type: 'OPERATION_TYPE_BUY', figi: 'F_AAA', date: Time.now.utc.iso8601, quantity_done: 1)
+      allow(operations).to receive(:operations_by_cursor).and_return(OpenStruct.new(items: [buy_op], has_next: false))
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-1',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to eq({})
+      expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
+    end
+
+    it 'keeps pending when operations API fails (reconciliation unknown)' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+      allow(operations).to receive(:operations_by_cursor).and_raise(StandardError, 'temporary outage')
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-unknown',
+            'broker_order_id' => 'brk-unknown',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(state.fetch('last_buy')).to eq({})
+    end
+
+    it 'keeps pending when operations_by_cursor returns nil (malformed response)' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+      allow(operations).to receive(:operations_by_cursor).and_return(nil)
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-nil-ops',
+            'broker_order_id' => 'brk-nil-ops',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(state.fetch('last_buy')).to eq({})
+    end
+
+    it 'keeps pending when operations service has no supported history method' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-no-ops-method',
+            'broker_order_id' => 'brk-no-ops-method',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(state.fetch('last_buy')).to eq({})
+    end
+
+    it 'keeps pending when operations response has_next=true and execution is not in first page' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+      page1 = OpenStruct.new(items: [OpenStruct.new(type: 'OPERATION_TYPE_BUY', figi: 'F_AAA')], has_next: true)
+      allow(operations).to receive(:operations_by_cursor).and_return(page1)
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-page-1',
+            'broker_order_id' => 'brk-page-1',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(state.fetch('last_buy')).to eq({})
+    end
+
+    it 'keeps pending when FIGI is missing to avoid cross-instrument false matches' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+      buy_op = OpenStruct.new(type: 'OPERATION_TYPE_BUY', figi: 'F_OTHER', date: Time.now.utc.iso8601)
+      allow(operations).to receive(:operations_by_cursor).and_return(OpenStruct.new(items: [buy_op]))
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-no-figi',
+            'broker_order_id' => 'brk-no-figi',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(state.fetch('last_buy')).to eq({})
+    end
+
+    it 'does not mark last_buy from BUY operation without execution evidence' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+      buy_op = OpenStruct.new(type: 'OPERATION_TYPE_BUY', figi: 'F_AAA', state: 'OPERATION_STATE_CANCELLED')
+      allow(operations).to receive(:operations_by_cursor).and_return(OpenStruct.new(items: [buy_op], has_next: false))
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-no-exec',
+            'broker_order_id' => 'brk-no-exec',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to eq({})
+      expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d'), {})).not_to have_key('AAA')
+    end
+
+    it 'marks last_buy when BUY operation has execution in trades_info.trades' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+      trades_info = OpenStruct.new(trades: [OpenStruct.new(quantity: 1)])
+      buy_op = OpenStruct.new(type: 'OPERATION_TYPE_BUY', figi: 'F_AAA', trades_info: trades_info)
+      allow(operations).to receive(:operations_by_cursor).and_return(OpenStruct.new(items: [buy_op], has_next: false))
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-trades-info',
+            'broker_order_id' => 'brk-trades-info',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to eq({})
+      expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
+    end
+
+    it 'removes pending order without marking last_buy when there is no buy execution' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+      allow(operations).to receive(:operations_by_cursor).and_return(OpenStruct.new(items: []))
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'order-2',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to eq({})
+      expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d'), {})).not_to have_key('AAA')
+    end
+  end
+
   it 'skips candidate when daily candles do not confirm momentum' do
     market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
     index_cache = write_cache([{ 'ticker' => 'AAA' }])
@@ -313,6 +748,66 @@ RSpec.describe TradingLogic::StrategyHelpers do
   ensure
     market_cache&.close!
     index_cache&.close!
+  end
+
+  it 'stores both broker_order_id and client_order_id for pending orders' do
+    state = described_class.default_state
+    response = OpenStruct.new(order_id: '82057073067', order_request_id: 'req-uuid-42')
+
+    described_class.sync_pending_order!(
+      state,
+      'AAA',
+      { category: :sent_not_filled, response: response, client_order_id: 'fallback-client', figi: 'F_AAA' }
+    )
+
+    pending = state.fetch('pending_orders').fetch('AAA')
+    expect(pending.fetch('broker_order_id')).to eq('82057073067')
+    expect(pending.fetch('client_order_id')).to eq('req-uuid-42')
+  end
+
+  it 'stores pending ts from submitted_at when present' do
+    state = described_class.default_state
+    submitted_at = '2026-07-23T10:00:00Z'
+
+    described_class.sync_pending_order!(
+      state,
+      'AAA',
+      { category: :sent_not_filled, client_order_id: 'fallback-client', figi: 'F_AAA', submitted_at: submitted_at }
+    )
+
+    pending = state.fetch('pending_orders').fetch('AAA')
+    expect(pending.fetch('ts')).to eq(submitted_at)
+  end
+
+  describe '.restore_pending_buy_orders!' do
+    it 'restores pending ts from protobuf order_date and marks last_buy when lots_executed > 0' do
+      client = double('client')
+      orders = double('orders')
+      instruments = double('instruments')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_instruments).and_return(instruments)
+
+      order_time = Time.utc(2026, 7, 23, 9, 15, 0)
+      order_date = Google::Protobuf::Timestamp.new(seconds: order_time.to_i)
+      restored = OpenStruct.new(
+        direction: 'ORDER_DIRECTION_BUY',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_PARTIALLYFILL',
+        figi: 'F_AAA',
+        order_id: '82057073067',
+        order_request_id: 'req-uuid-restored',
+        order_date: order_date,
+        lots_executed: 1
+      )
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: [restored]))
+      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F_AAA').and_return(OpenStruct.new(ticker: 'AAA'))
+
+      state = described_class.default_state
+      described_class.restore_pending_buy_orders!(client, 'acc', state)
+
+      pending = state.fetch('pending_orders').fetch('AAA')
+      expect(pending.fetch('ts')).to eq(order_time.iso8601)
+      expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
+    end
   end
 
   it 'prioritizes candidate closer to support before placing order' do

@@ -58,6 +58,20 @@ RSpec.describe TradingLogic::Runner do
       allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: closes))
       expect(subject.trend(nil, instrument_id: 'IMOEX_UID')).to eq(:up)
     end
+
+    it 'ignores incomplete daily index candle when computing trend' do
+      now = Time.now.utc
+      candles = [
+        OpenStruct.new(close: q(10), is_complete: true,  time: OpenStruct.new(seconds: (now - (4 * 86_400)).to_i)),
+        OpenStruct.new(close: q(11), is_complete: true,  time: OpenStruct.new(seconds: (now - (3 * 86_400)).to_i)),
+        OpenStruct.new(close: q(12), is_complete: true,  time: OpenStruct.new(seconds: (now - (2 * 86_400)).to_i)),
+        OpenStruct.new(close: q(13), is_complete: true,  time: OpenStruct.new(seconds: (now - 86_400).to_i)),
+        OpenStruct.new(close: q(8),  is_complete: false, time: OpenStruct.new(seconds: now.to_i))
+      ]
+      allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: candles))
+
+      expect(subject.trend('IDX')).to eq(:up)
+    end
   end
 
   describe '#resolve_index_uid' do

@@ -151,6 +151,7 @@ begin
       LOGGER.debug("#{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} " \
                    "dip_threshold=#{dip_thr.inspect} should_buy=#{logic.should_buy?(it_live, trend: trend)}")
       next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
+      next if TradingLogic::StrategyHelpers.pending_order_active?(state, it[:ticker])
       next unless logic.should_buy?(it_live, trend: trend)
 
       buy_value = (cur || it[:price]) * it[:lot] * LOTS_PER_ORDER
@@ -159,7 +160,7 @@ begin
         planned_buy_value: buy_value, portfolio: up_portfolio, logger: LOGGER
       )
 
-      resp = logic.confirm_and_place_order(
+      result = logic.confirm_and_place_order_with_result(
         account_id: account_id,
         figi: it[:figi],
         quantity: LOTS_PER_ORDER, # в ЛОТАХ, не в штуках
@@ -167,11 +168,18 @@ begin
         direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
         order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
-      if resp
-        LOGGER.info("BUY #{it[:ticker]} lots=#{LOTS_PER_ORDER} lot_size=#{it[:lot]} @#{it[:price]} (order_id=#{resp.order_id})")
+      result[:figi] ||= it[:figi]
+      TradingLogic::StrategyHelpers.sync_pending_order!(state, it[:ticker], result)
+
+      if TradingLogic::StrategyHelpers.buy_execution_result?(result)
+        resp = result[:response]
+        LOGGER.info(
+          "BUY #{it[:ticker]} lots=#{LOTS_PER_ORDER} lot_size=#{it[:lot]} " \
+          "@#{it[:price]} category=#{result[:category]} (order_id=#{resp&.order_id})"
+        )
         TradingLogic::StrategyHelpers.mark_action!(state, 'last_buy', it[:ticker])
       else
-        LOGGER.info("BUY #{it[:ticker]} skipped / not confirmed")
+        LOGGER.info(TradingLogic::StrategyHelpers.buy_failure_message(it[:ticker], result))
       end
     end
 
