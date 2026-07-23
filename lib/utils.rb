@@ -34,7 +34,11 @@ module TradingLogic
     end
 
     def candle_time_utc(candle)
-      raw_time = candle.respond_to?(:time) ? candle.time : nil
+      timestamp_to_utc(candle.respond_to?(:time) ? candle.time : nil)
+    end
+
+    # Google::Protobuf::Timestamp (или Time/строка) -> UTC Time.
+    def timestamp_to_utc(raw_time)
       return nil unless raw_time
 
       if raw_time.respond_to?(:seconds)
