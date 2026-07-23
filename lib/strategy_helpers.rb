@@ -617,9 +617,12 @@ module TradingLogic
       pending = state['pending_orders']
       return if pending.empty?
 
-      active_orders = fetch_active_orders(client, account_id)
+      active_orders = fetch_active_orders(client, account_id, logger: logger)
       unless active_orders[:ok]
-        logger&.warn('pending cleanup skipped: active orders response is malformed/unavailable')
+        logger&.warn(
+          'pending cleanup skipped: active orders response is malformed/unavailable ' \
+          "(reason=#{active_orders[:reason].inspect})"
+        )
         return
       end
 
@@ -650,12 +653,23 @@ module TradingLogic
       to_delete.each { |ticker| pending.delete(ticker) }
     end
 
-    def fetch_active_orders(client, account_id)
+    def fetch_active_orders(client, account_id, logger: nil)
       resp = client.grpc_orders.get_orders(account_id: account_id)
-      return { ok: false } if resp.nil? || !resp.respond_to?(:orders)
+      if resp.nil?
+        logger&.warn('get_orders: nil response')
+        return { ok: false, reason: 'nil response' }
+      end
+
+      unless resp.respond_to?(:orders)
+        logger&.warn('get_orders: response missing orders')
+        return { ok: false, reason: 'response missing orders' }
+      end
 
       orders = resp.orders
-      return { ok: false } if orders.nil?
+      if orders.nil?
+        logger&.warn('get_orders: orders is nil')
+        return { ok: false, reason: 'orders is nil' }
+      end
 
       broker_ids = Set.new
       client_ids = Set.new
@@ -676,8 +690,9 @@ module TradingLogic
         client_order_ids: client_ids,
         broker_id_by_client_id: broker_by_client
       }
-    rescue StandardError
-      { ok: false }
+    rescue StandardError => e
+      logger&.warn("get_orders exception: #{e.class}: #{e.message}")
+      { ok: false, reason: 'get_orders exception' }
     end
 
     def migrate_pending_order_metadata!(client, ticker, info, active_orders:, logger: nil)

@@ -383,6 +383,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     it 'keeps pending when get_orders returns nil (malformed response)' do
       client = double('client')
       orders = double('orders')
+      logger = double('logger', warn: nil)
       allow(client).to receive(:grpc_orders).and_return(orders)
 
       allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(nil)
@@ -402,9 +403,71 @@ RSpec.describe TradingLogic::StrategyHelpers do
         }
       }
 
-      described_class.cleanup_pending_orders!(client, 'acc', state)
+      described_class.cleanup_pending_orders!(client, 'acc', state, logger: logger)
 
       expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(logger).to have_received(:warn).with(include('get_orders: nil response'))
+      expect(logger).to have_received(:warn).with(include('reason="nil response"'))
+    end
+
+    it 'keeps pending when get_orders response does not have orders field' do
+      client = double('client')
+      orders = double('orders')
+      logger = double('logger', warn: nil)
+      allow(client).to receive(:grpc_orders).and_return(orders)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(foo: []))
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'req-uuid-1',
+            'broker_order_id' => '82057073067',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state, logger: logger)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(logger).to have_received(:warn).with(include('get_orders: response missing orders'))
+      expect(logger).to have_received(:warn).with(include('reason="response missing orders"'))
+    end
+
+    it 'keeps pending when get_orders orders is nil' do
+      client = double('client')
+      orders = double('orders')
+      logger = double('logger', warn: nil)
+      allow(client).to receive(:grpc_orders).and_return(orders)
+
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: nil))
+
+      state = {
+        'last_buy' => {},
+        'last_sell' => {},
+        'pending_orders' => {
+          'AAA' => {
+            'client_order_id' => 'req-uuid-1',
+            'broker_order_id' => '82057073067',
+            'figi' => 'F_AAA',
+            'ticker' => 'AAA',
+            'ts' => (Time.now.utc - 600).iso8601,
+            'status' => 'sent_not_filled'
+          }
+        }
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state, logger: logger)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(logger).to have_received(:warn).with(include('get_orders: orders is nil'))
+      expect(logger).to have_received(:warn).with(include('reason="orders is nil"'))
     end
 
     it 'keeps pending when active order has matching order_request_id but different broker order_id' do
