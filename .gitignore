@@ -4,3 +4,4 @@ logs/
 .codex
 systemd/invest_tinkoff_bot.env
 systemd/*.env
+analysis/
