@@ -197,7 +197,7 @@ REPORT_DAY=2026-07-23 FORCE_SEND=1 bundle exec ruby bin/daily_trade_report.rb
 ```
 - `REPORT_DAY` — optional date (defaults to today in the configured offset).
 - `DRY_RUN=1` — print only; never sends, never writes state or archive.
-- `FORCE_SEND=1` — allow resending a day already marked as sent.
+- `FORCE_SEND=1` — emergency override: bypasses **both** guards — resends a day already marked as sent, and permits a real send for a not-yet-closed current day or a future date (which are otherwise skipped).
 
 ### Persistence
 - **Dedup state** — `tmp/daily_trade_report_state.json` (`last_sent_day`); a day is marked sent only after all Telegram parts succeed.

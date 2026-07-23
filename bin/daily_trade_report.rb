@@ -49,29 +49,31 @@ bot, chat = telegram_creds
 
 delivery = TradingLogic::DailyReportDelivery.new(state_path: STATE_PATH, archive_dir: ARCHIVE_DIR, logger: LOGGER)
 
-begin
-  client = build_client
-  report = TradingLogic::DailyTradeReport.new(
-    client: client, market_cache_path: MARKET_CACHE_PATH, logger: LOGGER
-  )
-  result = report.build(report_day)
-rescue TradingLogic::DailyTradeReport::BrokerError => e
-  LOGGER.error("daily report broker error: #{e.class}: #{e.message}")
-  notify_failure(delivery, bot, chat, dry_run)
-  exit 1
-end
+client = build_client
+report = TradingLogic::DailyTradeReport.new(
+  client: client, market_cache_path: MARKET_CACHE_PATH, logger: LOGGER
+)
 
 unless dry_run || (bot && chat && !bot.to_s.empty? && !chat.to_s.empty?)
   LOGGER.error('daily report: Telegram credentials missing')
   exit 1
 end
 
-# Реальная отправка неполного текущего дня (до cutoff) или будущей даты пометит
-# день отправленным и заблокирует вечерний cron. Разрешаем только через FORCE_SEND.
+# Гейт ДО обращения к брокеру: реальная отправка неполного текущего дня (до
+# cutoff) или будущей даты пометила бы день отправленным и заблокировала вечерний
+# cron. premature? не трогает API, поэтому проверяем до build. FORCE_SEND — обход.
 if !dry_run && !force && report.premature?(report_day)
-  LOGGER.info("daily report: window for #{result[:day]} not closed yet (or future date); " \
+  LOGGER.info("daily report: window for #{report_day || 'today'} not closed yet (or future date); " \
               'skipping real send. Use FORCE_SEND=1 to override or DRY_RUN=1 to preview.')
   exit 0
+end
+
+begin
+  result = report.build(report_day)
+rescue TradingLogic::DailyTradeReport::BrokerError => e
+  LOGGER.error("daily report broker error: #{e.class}: #{e.message}")
+  notify_failure(delivery, bot, chat, dry_run)
+  exit 1
 end
 
 sent = delivery.deliver(result, bot_token: bot, chat_id: chat, dry_run: dry_run, force: force)

@@ -165,6 +165,12 @@ RSpec.describe TradingLogic::DailyTradeReport do
     expect(after_cutoff.premature?('2026-07-20')).to be false # прошлое
   end
 
+  it 'premature? does not touch the broker (safe to gate before build)' do
+    expect(operations).not_to receive(:operations_by_cursor)
+    r = described_class.new(client: client, now: Time.utc(2026, 7, 23, 9, 0), market_cache_path: nil)
+    expect(r.premature?(nil)).to be true
+  end
+
   it 'includes window bounds and structured trades in the build result' do
     allow(operations).to receive(:operations_by_cursor).and_return(page([
                                                                           op(type: 'OPERATION_TYPE_BUY', figi: 'RUAL', payment: -227.85,
