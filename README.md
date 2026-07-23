@@ -183,7 +183,7 @@ A once-a-day plain-text Telegram report of **actually executed** trades, indepen
 
 - **Source of trades** — only `GetOperationsByCursor` (full pagination; it raises rather than silently truncating if the broker reports `has_next` without a usable cursor). Trades are never derived from strategy logs or `tmp/strategy_state.json`.
 - **Window** — a rolling 24h ending at the cutoff (default `21:00` `+05:00` = 21:00 YEKT), so trades in the evening session are never dropped; they roll into the next day's report.
-- **Index** — IMOEX change vs the previous close, using the current (possibly still-forming) daily candle as the current value. For a *live* run this is the value near the cutoff. A historical `REPORT_DAY` re-run shows the finalized daily close, not the original cutoff snapshot — the machine archive is the authoritative record of what was sent.
+- **Index** — IMOEX change vs the previous close, using the current (possibly still-forming) daily candle as the current value. For a *live* run this is the value near the cutoff. A historical `REPORT_DAY` re-run shows the finalized daily close, not the original cutoff snapshot. The **sent Telegram message is the source of truth** for the cutoff snapshot; the machine archive is a best-effort copy and may be absent if archiving failed after a successful send.
 - **Portfolio** — whole-portfolio `daily_yield` for the broker's *current* trading day, explicitly labeled and including old positions. Omitted for a historical `REPORT_DAY` (the broker only exposes today's yield). Note the message mixes three periods on purpose: trades (rolling 24h), index (vs previous close), portfolio (current trading day).
 - **Realized P/L** — shown as `н/д` when sells exist (no reliable per-trade cost basis yet); to be wired to the operation `yield` field once a real SELL is available to validate it.
 
@@ -201,7 +201,7 @@ REPORT_DAY=2026-07-23 FORCE_SEND=1 bundle exec ruby bin/daily_trade_report.rb
 
 ### Persistence
 - **Dedup state** — `tmp/daily_trade_report_state.json` (`last_sent_day`); a day is marked sent only after all Telegram parts succeed.
-- **Machine archive** — `logs/daily_reports/YYYY-MM.txt` (human-readable) and `YYYY-MM.jsonl` (structured, for monthly analysis), appended after a successful send. Archive failures are logged but never break delivery or roll back state.
+- **Machine archive** — `logs/daily_reports/YYYY-MM.txt` (human-readable) and `YYYY-MM.jsonl` (structured, for monthly analysis), appended after a successful send. The JSONL line carries `window_from`/`window_to`, daily aggregates, the index snapshot, portfolio (when shown) and a `trades` array (time, side, ticker, qty, price, amount) so history can be analyzed per instrument programmatically. Archive failures are logged but never break delivery or roll back state.
 
 ### Schedule (cron, server on UTC)
 ```cron

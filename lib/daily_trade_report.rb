@@ -64,7 +64,20 @@ module TradingLogic
       # исторического REPORT_DAY он не соответствует дате отчёта, поэтому не выводим.
       portfolio = day == report_day(nil) ? portfolio_snapshot : { ok: false, reason: :historical }
       text = format_message(day, aggregates, index, portfolio, trades)
-      { day: day.iso8601, text: text, aggregates: aggregates, index: index, portfolio: portfolio }
+      { day: day.iso8601, text: text, aggregates: aggregates, index: index, portfolio: portfolio,
+        window_from: from_utc.iso8601, window_to: to_utc.iso8601, trades: structured_trades(trades) }
+    end
+
+    # Окно ещё не закрылось (текущий день до cutoff) или дата в будущем — реальную
+    # отправку такого отчёта надо запрещать, иначе неполный отчёт займёт day в
+    # state и вечерний cron ничего не пришлёт. DRY_RUN/FORCE_SEND — в обход.
+    def premature?(report_day_str = nil)
+      day = report_day(report_day_str)
+      today = report_day(nil)
+      return true if day > today
+
+      _, to_utc = window_for(day)
+      day == today && @now < to_utc
     end
 
     private
@@ -159,6 +172,20 @@ module TradingLogic
 
     def payment_abs(op)
       (Utils.q_to_decimal(op.payment) || 0.0).abs
+    end
+
+    # Структурированные сделки для JSONL-архива (помесячный анализ по бумагам).
+    def structured_trades(trades)
+      trades.sort_by { |op| Utils.timestamp_to_utc(op.date) || Time.at(0) }.map do |op|
+        {
+          time: Utils.timestamp_to_utc(op.date)&.iso8601,
+          side: buy?(op) ? 'BUY' : 'SELL',
+          ticker: resolve_ticker(op),
+          qty: op.respond_to?(:quantity_done) ? op.quantity_done.to_i : 0,
+          price: Utils.q_to_decimal(op.price),
+          amount: payment_abs(op).round(2)
+        }
+      end
     end
 
     # -- индекс IMOEX ------------------------------------------------------------

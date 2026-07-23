@@ -66,6 +66,14 @@ unless dry_run || (bot && chat && !bot.to_s.empty? && !chat.to_s.empty?)
   exit 1
 end
 
+# Реальная отправка неполного текущего дня (до cutoff) или будущей даты пометит
+# день отправленным и заблокирует вечерний cron. Разрешаем только через FORCE_SEND.
+if !dry_run && !force && report.premature?(report_day)
+  LOGGER.info("daily report: window for #{result[:day]} not closed yet (or future date); " \
+              'skipping real send. Use FORCE_SEND=1 to override or DRY_RUN=1 to preview.')
+  exit 0
+end
+
 sent = delivery.deliver(result, bot_token: bot, chat_id: chat, dry_run: dry_run, force: force)
 if sent
   LOGGER.info("daily report ok for #{result[:day]} (dry_run=#{dry_run})")

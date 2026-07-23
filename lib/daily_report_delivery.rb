@@ -104,11 +104,13 @@ module TradingLogic
       idx = result[:index]
       JSON.generate(
         day: result[:day],
+        window_from: result[:window_from], window_to: result[:window_to],
         buys: agg[:buys_count], sells: agg[:sells_count],
         buy_turnover: agg[:buy_turnover], sell_turnover: agg[:sell_turnover],
         fees: agg[:fees], realized: agg[:realized],
         index: idx[:ok] ? { value: idx[:current], delta_points: idx[:delta_points], delta_percent: idx[:delta_percent] } : nil,
-        portfolio: result[:portfolio][:ok] ? result[:portfolio].except(:ok) : nil
+        portfolio: result[:portfolio][:ok] ? result[:portfolio].except(:ok) : nil,
+        trades: result[:trades]
       )
     end
 

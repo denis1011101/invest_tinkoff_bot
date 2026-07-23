@@ -156,6 +156,26 @@ RSpec.describe TradingLogic::DailyTradeReport do
     expect(text).not_to include('Портфель')
   end
 
+  it 'flags premature real sends (today before cutoff, and future dates)' do
+    before_cutoff = described_class.new(client: client, now: Time.utc(2026, 7, 23, 9, 0), market_cache_path: nil)
+    after_cutoff = described_class.new(client: client, now: now, market_cache_path: nil)
+    expect(before_cutoff.premature?(nil)).to be true          # сегодня до 21:00 YEKT
+    expect(after_cutoff.premature?(nil)).to be false          # сегодня после cutoff
+    expect(after_cutoff.premature?('2026-07-25')).to be true  # будущее
+    expect(after_cutoff.premature?('2026-07-20')).to be false # прошлое
+  end
+
+  it 'includes window bounds and structured trades in the build result' do
+    allow(operations).to receive(:operations_by_cursor).and_return(page([
+                                                                          op(type: 'OPERATION_TYPE_BUY', figi: 'RUAL', payment: -227.85,
+                                                                             price: 22.79, qty: 10, at: Time.utc(2026, 7, 23, 7, 20))
+                                                                        ]))
+    res = report.build
+    expect(res[:window_from]).to eq('2026-07-22T16:00:00Z')
+    expect(res[:window_to]).to eq('2026-07-23T16:00:00Z')
+    expect(res[:trades].first).to include(side: 'BUY', qty: 10, price: 22.79, amount: 227.85)
+  end
+
   it 'respects the +05:00 window boundaries' do
     captured = nil
     allow(operations).to receive(:operations_by_cursor) do |args|
@@ -185,9 +205,11 @@ RSpec.describe TradingLogic::DailyReportDelivery do
 
   def result(day: '2026-07-23', text: 'hello')
     { day: day, text: text,
+      window_from: '2026-07-22T16:00:00Z', window_to: '2026-07-23T16:00:00Z',
       aggregates: { buys_count: 1, sells_count: 0, buy_turnover: 10.0, sell_turnover: 0.0, fees: 0.1, realized: 0.0 },
       index: { ok: true, current: 2134.28, delta_points: 12.52, delta_percent: 0.59 },
-      portfolio: { ok: false } }
+      portfolio: { ok: false },
+      trades: [{ time: '2026-07-23T07:20:00Z', side: 'BUY', ticker: 'RUAL', qty: 10, price: 22.79, amount: 227.85 }] }
   end
 
   it 'dry-run prints and does not change state or archive' do
@@ -210,13 +232,27 @@ RSpec.describe TradingLogic::DailyReportDelivery do
     end
   end
 
-  it 'archives text and jsonl after a successful send' do
+  it 'archives text and jsonl (with window bounds and per-trade list) after a successful send' do
     Dir.mktmpdir do |dir|
       delivery(dir).deliver(result, bot_token: 'B', chat_id: 'C')
       txt = File.read(File.join(dir, 'reports', '2026-07.txt'))
-      jsonl = File.read(File.join(dir, 'reports', '2026-07.jsonl'))
+      row = JSON.parse(File.read(File.join(dir, 'reports', '2026-07.jsonl')))
       expect(txt).to include('hello')
-      expect(JSON.parse(jsonl)['buys']).to eq(1)
+      expect(row['buys']).to eq(1)
+      expect(row['window_from']).to eq('2026-07-22T16:00:00Z')
+      expect(row['trades'].first).to include('ticker' => 'RUAL', 'side' => 'BUY', 'qty' => 10)
+    end
+  end
+
+  it 'treats archive failure as best-effort: Telegram still counts as delivered and state is kept' do
+    Dir.mktmpdir do |dir|
+      # archive_dir указывает на существующий ФАЙЛ → mkdir_p внутри archive! бросит.
+      clash = File.join(dir, 'reports')
+      File.write(clash, 'not a dir')
+      d = described_class.new(state_path: File.join(dir, 'state.json'), archive_dir: clash, sender: sender)
+      expect(d.deliver(result, bot_token: 'B', chat_id: 'C')).to be true
+      expect(sent.size).to eq(1)
+      expect(d.already_sent?('2026-07-23')).to be true
     end
   end
 
