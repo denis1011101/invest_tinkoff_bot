@@ -1,6 +1,6 @@
 GIT
   remote: https://github.com/denis1011101/invest_tinkoff.git
-  revision: 4ded65689ca18f420276c13e59f548372bf8692c
+  revision: 08733a82d5063bec9b85cff2ad047abc444e4a6c
   specs:
     invest_tinkoff_grpc (0.9.6.8)
       google-protobuf (~> 4.31, >= 4.31.1)
