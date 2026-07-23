@@ -8,13 +8,14 @@ A small automated trading helper for MOEX using Tinkoff gRPC API. It implements 
 - **Intraday dip buy (UP trend)** — when the market index trend is up and a ticker's current price <= today's high * (1 - dip_pct), the bot may place a BUY. If support/resistance levels are enabled, UP-trend BUY also requires the live price to be near a support level; if levels cannot be computed, the strategy falls back to the original dip logic. See [`TradingLogic::Runner`](lib/trading_logic.rb).
 - **Momentum buy with dip filter (SIDE/DOWN trend)** — from intersection of market universe and IMOEX index constituents, buy one instrument showing 3 consecutive daily closes up **and** an intraday dip on the current day. If support/resistance levels are enabled, candidates closer to support are prioritized, but this does not block buying. See [`TradingLogic::StrategyHelpers`](lib/strategy_helpers.rb).
 
-### Exit signals
-- **Trend-dependent profit exit** — sell threshold depends on the current market trend:
-  - UP: +10% (`SELL_THRESHOLD_UP`, default `1.10`)
+Exits are intentionally asymmetric by trend. In an **UP** trend the bot holds positions (letting winners run) and the only sell is the full-position force exit at +10%; the per-lot profit exit and resistance exit are applied only once the trend is no longer UP. In **SIDE/DOWN** the bot trims one lot at a time on the trend threshold, and still exits the whole position at +10%.
+
+- **Force exit** — sell the entire position when profit reaches +10% (`>= 1.10`), in any trend, including UP. Runs before the per-trend logic below.
+- **Trend-dependent profit exit (SIDE/DOWN only)** — sell **one lot** per ticker per day when the position reaches the trend threshold:
   - SIDE: +4% (`SELL_THRESHOLD_SIDE`, default `1.04`)
   - DOWN: +2% (`SELL_THRESHOLD_DOWN`, default `1.02`)
-- **Resistance-based exit** — if support/resistance levels are enabled, the bot may also sell near the nearest resistance level when the position already has at least minimal profit (`LEVEL_SELL_MIN_PROFIT`).
-- **Force exit** — sell the entire position when profit reaches +10% regardless of trend (runs before main strategy logic).
+  - `SELL_THRESHOLD_UP` (default `1.10`) exists for completeness but is not exercised in UP, since the UP branch runs no per-trend sells and its value coincides with the +10% force exit.
+- **Resistance-based exit (SIDE/DOWN only)** — if support/resistance levels are enabled, the bot may also sell one lot near the nearest resistance level when the position already has at least minimal profit (`LEVEL_SELL_MIN_PROFIT`). Like the profit exit above, this is not evaluated in an UP trend.
 
 ### Risk management
 - **Position size limit** — the bot will not buy a ticker if the existing position already exceeds a fraction of the total share portfolio value. Controlled by `MAX_POSITION_SHARE` (default `0.33` = 1/3 of portfolio).
