@@ -140,8 +140,8 @@ Note: `SCAN_MAX_LOT_RUB` and `MAX_LOT_RUB` are related but different. `SCAN_MAX_
 ## systemd templates
 - All units read secrets from `/etc/invest_tinkoff_bot.env` (never from a file inside the repository), run with `UMask=0077`, and start ruby through `bin/systemd_exec`, which builds the RVM environment for the ruby pinned in `.ruby-version` (systemd's default `PATH` has no RVM/Bundler, and neither does non-interactive SSH).
 - Host roles and identities:
-  - `moex-cache-sync.timer` — local machine that can reach MOEX ISS; runs as `User=denis` from `/home/denis/my/invest_tinkoff_bot`.
-  - `cache-health.timer` + `market-cache-refresh.timer` — server; run as root from `/root/apps/invest_tinkoff_bot`, matching the existing root cron deployment (non-root migration deferred).
+  - `cache-health.timer` + `market-cache-refresh.timer` — server; run as root from `/root/apps/invest_tinkoff_bot`, matching the existing root cron deployment (non-root migration deferred). Installed and enabled on 2026-07-23.
+  - `moex-cache-sync.timer` — template for a local machine with systemd that can reach MOEX ISS (runs as `User=denis`). The current local machine is WSL without systemd, so the MOEX sync is run **manually** instead: `bundle exec rake moex_cache:sync INDEX=IMOEX` (MOEX_SYNC_* values live in the local `.env`); the cache-health watchdog reminds about it in Telegram when the cache ages out.
 - Services intentionally have no `[Install]` section: they are pulled in by their timers. Enable **only** the `.timer` units, never the oneshot `.service` units.
 - The sample units use `flock` to block parallel runs and `Persistent=true` on timers to catch up after missed starts.
 - The timers only manage caches; the strategy (`bin/current_strategy.rb`), wishlist scan, and price monitor stay in the server cron untouched.
