@@ -324,10 +324,8 @@ module TradingLogic
       response = result[:response]
       category = result[:category].to_s
       logger&.debug("BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) category=#{category} order_id=#{response&.order_id}")
-      if buy_execution_result?(result)
-        mark_action!(state, 'last_buy', candidate[:tk])
-        register_daily_buy!(state, candidate[:price] * candidate[:lot] * candidate[:lots_per_order])
-      end
+      mark_action!(state, 'last_buy', candidate[:tk]) if buy_execution_result?(result)
+      register_daily_buy!(state, candidate[:price] * candidate[:lot] * candidate[:lots_per_order])
       true
     rescue StandardError
       true
@@ -596,6 +594,14 @@ module TradingLogic
     # Расширение универсума повышает частоту покупок, поэтому нужны два потолка:
     # сколько рублей в день бот вообще может потратить и какую долю счёта держать
     # в акциях (остаток — «сухой порох» под будущие просадки).
+
+    # Считаем деньги ЗАНЯТЫМИ в момент отправки ордера, а не исполнения: лимитные
+    # заявки исполняются асинхронно, и если ждать факта, за день можно наотправлять
+    # заявок далеко за бюджет. Неисполненная заявка «съест» лимит до конца дня —
+    # намеренный перекос в безопасную сторону.
+    def buy_committed_result?(result)
+      successful_buy_result?(result)
+    end
 
     def daily_buy_total(state, day: today_key)
       ensure_state_defaults!(state)

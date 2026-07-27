@@ -204,6 +204,8 @@ begin
       )
       result[:figi] ||= it[:figi]
       TradingLogic::StrategyHelpers.sync_pending_order!(state, it[:ticker], result)
+      helpers = TradingLogic::StrategyHelpers
+      helpers.register_daily_buy!(state, buy_value) if helpers.buy_committed_result?(result)
 
       if TradingLogic::StrategyHelpers.buy_execution_result?(result)
         resp = result[:response]
@@ -212,7 +214,6 @@ begin
           "@#{it[:price]} category=#{result[:category]} (order_id=#{resp&.order_id})"
         )
         TradingLogic::StrategyHelpers.mark_action!(state, 'last_buy', it[:ticker])
-        TradingLogic::StrategyHelpers.register_daily_buy!(state, buy_value)
       else
         LOGGER.info(TradingLogic::StrategyHelpers.buy_failure_message(it[:ticker], result))
       end

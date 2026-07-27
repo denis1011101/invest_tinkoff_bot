@@ -1299,6 +1299,13 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(described_class.daily_buy_within_limit?(state, 700, max_daily_rub: 1_000)).to be false
     end
 
+    # Лимитная заявка исполняется асинхронно, поэтому бюджет занимаем при отправке.
+    it 'treats an unfilled sent order as committed money' do
+      expect(described_class.buy_committed_result?({ category: 'sent_not_filled' })).to be true
+      expect(described_class.buy_committed_result?({ category: 'filled' })).to be true
+      expect(described_class.buy_committed_result?({ category: 'rejected' })).to be_falsey
+    end
+
     it 'keeps only recent days in state' do
       state = described_class.default_state
       state['daily_buys'] = (1..10).to_h { |i| ["2026-07-#{i.to_s.rjust(2, '0')}", 100.0] }
