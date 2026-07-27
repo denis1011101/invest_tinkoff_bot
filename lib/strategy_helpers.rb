@@ -641,7 +641,10 @@ module TradingLogic
       port = portfolio || client.grpc_operations.portfolio(account_id: account_id)
       shares = Utils.q_to_decimal(port.total_amount_shares).to_f
       total = portfolio_total_amount(port)
-      return true unless total.positive?
+      unless total.positive?
+        logger&.warn('cash reserve guard: portfolio total is non-positive — BUY blocked (fail-closed)')
+        return false
+      end
 
       share = (shares + planned_buy_value.to_f) / total
       return true if share <= max_share
@@ -651,8 +654,12 @@ module TradingLogic
         "> MAX_SHARES_SHARE=#{(max_share * 100).round(1)}%"
       )
       false
-    rescue StandardError
-      true
+    rescue StandardError => e
+      # Fail-closed, в отличие от соседнего position_within_limit?: это лимит на общий
+      # риск счёта, и «не смогли посчитать» не должно молча означать «разрешено».
+      # Счёт боевой, ордера уходят без подтверждения.
+      logger&.warn("cash reserve guard: check failed (#{e.class}: #{e.message}) — BUY blocked (fail-closed)")
+      false
     end
 
     def portfolio_total_amount(port)

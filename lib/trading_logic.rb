@@ -175,15 +175,21 @@ module TradingLogic
       return nil if avg <= 0
 
       raw = current / avg
-      { raw: raw, normalized: raw / partial_day_fraction(candles[-1]) }
+      fraction = elapsed_day_fraction(candles[-1])
+      {
+        raw: raw,
+        normalized: raw / [fraction, MIN_SESSION_FRACTION].max,
+        session_fraction: fraction.round(3),
+        reliable: fraction >= MIN_SESSION_FRACTION
+      }
     end
 
     # Доля дневного объёма, которую можно ожидать к текущему моменту.
     # 1.0 для завершённого дня (последняя свеча — не сегодняшняя): поправка не нужна.
-    def partial_day_fraction(last_candle)
+    def elapsed_day_fraction(last_candle)
       return 1.0 unless Utils.candle_of_today?(last_candle)
 
-      [Utils.session_volume_fraction, MIN_SESSION_FRACTION].max
+      Utils.session_volume_fraction
     end
 
     # Денежный объём за текущий день по дневной свече: close * volume
@@ -205,17 +211,32 @@ module TradingLogic
 
     def volume_ok?(stats)
       return true unless @min_relative_volume&.positive?
+      return false unless stats
 
-      !stats.nil? && stats[:normalized] >= @min_relative_volume
+      # Пока прошла ничтожная доля сессии, делитель мал и rvol — чистый шум: одна
+      # крупная утренняя сделка даёт кратный «всплеск». Не пропускаем покупку, пока
+      # метрике нельзя верить — счёт боевой и AUTO_CONFIRM=1.
+      return false unless stats[:reliable]
+
+      stats[:normalized] >= @min_relative_volume
     end
 
     # Покупать только на «дневной просадке»: текущая цена <= (сегодняшний максимум * (1 - @dip_pct))
     def dip_today?(figi)
-      cur = last_price_for(figi)
-      th = today_high(figi)
-      return false unless cur && th
+      dip?(last_price_for(figi), today_high(figi))
+    end
 
-      cur <= th * (1.0 - @dip_pct)
+    def dip?(price, day_high)
+      return false unless price && day_high
+
+      price <= day_high * (1.0 - @dip_pct)
+    end
+
+    # Снимок передан вызывающим — считаем по нему; иначе запрашиваем сами.
+    def dip_for(it, price: nil, high: nil)
+      return dip_today?(it[:figi]) unless price && high
+
+      dip?(price, high)
     end
 
     # Индекс через Indicatives: возвращает UID индекса по тикеру (например IMOEX) или nil.
@@ -322,12 +343,16 @@ module TradingLogic
     # Единая точка решения о покупке + разложение на подусловия (для shadow-логов:
     # видно, какой именно гейт отсекает кандидата). Каждое обращение к API — по
     # одному разу: метод зовётся каждые 5 минут по всему универсуму.
-    def buy_gate(it, trend: :side)
+    # price/high — снимок, по которому вызывающий уже работает. Передаём его внутрь,
+    # чтобы (а) не запрашивать те же цену и максимум повторно и (б) решение и цена
+    # лимитной заявки считались по одним и тем же числам, а не по двум разным снимкам.
+    def buy_gate(it, trend: :side, price: nil, high: nil)
       stats = daily_volume_stats(it[:figi])
       gate = {
-        dip: dip_today?(it[:figi]),
+        dip: dip_for(it, price: price, high: high),
         rvol: stats && stats[:normalized].round(2),
         rvol_raw: stats && stats[:raw].round(2),
+        session: stats && stats[:session_fraction],
         volume_ok: volume_spike?(it[:figi])
       }
       gate[:should_buy] = gate[:dip] && gate[:volume_ok] && up_entry_gate(gate, it, trend)

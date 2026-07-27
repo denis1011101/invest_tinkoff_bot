@@ -84,6 +84,8 @@ FileUtils.mkdir_p(File.dirname(STATE_PATH))
 MARKET_CACHE_PATH = File.expand_path('../tmp/market_instruments_cache.json', __dir__)
 MOEX_INDEX_CACHE_PATH = File.expand_path('../tmp/moex_index_cache.json', __dir__)
 
+state = nil
+
 begin
   accounts = client.grpc_users.accounts
   account_id = accounts.accounts.first.id or abort('no accounts')
@@ -159,6 +161,9 @@ begin
   when :up
     LOGGER.info('Trend: UP — intraday dip BUY (max once per ticker per day)')
     up_portfolio = client.grpc_operations.portfolio(account_id: account_id)
+    # Портфель читается один раз за проход, поэтому лимиты доли акций сами по себе не
+    # увидят предыдущие заявки этого же прохода. Накапливаем занятые рубли вручную.
+    run_committed = 0.0
     universe.each do |it| # rubocop:disable Metrics/BlockLength
       next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
       next if TradingLogic::StrategyHelpers.pending_order_active?(state, it[:ticker])
@@ -172,8 +177,9 @@ begin
       dip_thr = today_high ? (today_high * (1.0 - DIP_PCT)) : nil
       it_live = cur ? it.merge(price: cur) : it
       # buy_gate считает все подусловия за один проход по API и заодно даёт shadow-лог:
-      # видно, какой именно гейт отсёк кандидата.
-      gate = logic.buy_gate(it_live, trend: trend)
+      # видно, какой именно гейт отсёк кандидата. Цену и максимум передаём внутрь —
+      # решение и цена лимитной заявки должны считаться по одному снимку.
+      gate = logic.buy_gate(it_live, trend: trend, price: cur, high: today_high)
       LOGGER.debug("#{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} " \
                    "dip_threshold=#{dip_thr.inspect} gate=#{gate.inspect}")
       next unless gate[:should_buy]
@@ -185,7 +191,8 @@ begin
       )
       next unless TradingLogic::StrategyHelpers.daily_buy_within_limit?(state, buy_value, logger: LOGGER)
       next unless TradingLogic::StrategyHelpers.shares_share_within_limit?(
-        client, account_id, planned_buy_value: buy_value, portfolio: up_portfolio, logger: LOGGER
+        client, account_id,
+        planned_buy_value: buy_value + run_committed, portfolio: up_portfolio, logger: LOGGER
       )
 
       if SHADOW_BUYS
@@ -205,7 +212,10 @@ begin
       result[:figi] ||= it[:figi]
       TradingLogic::StrategyHelpers.sync_pending_order!(state, it[:ticker], result)
       helpers = TradingLogic::StrategyHelpers
-      helpers.register_daily_buy!(state, buy_value) if helpers.buy_committed_result?(result)
+      if helpers.buy_committed_result?(result)
+        helpers.register_daily_buy!(state, buy_value)
+        run_committed += buy_value
+      end
 
       if TradingLogic::StrategyHelpers.buy_execution_result?(result)
         resp = result[:response]
@@ -309,9 +319,20 @@ begin
   end
 
   TradingLogic::StrategyHelpers.check_sell_consistency!(client, account_id, state, logger: LOGGER)
-  TradingLogic::StrategyHelpers.save_state(STATE_PATH, state)
 
   LOGGER.debug('---')
 rescue InvestTinkoff::GRPC::Error => e
   LOGGER.error("gRPC error: #{e.class} #{e.message}")
+ensure
+  # Сохраняем ВСЕГДА, а не только на успешном пути. Если ошибка прилетит после отправки
+  # заявки (следующий кандидат, портфель, любой API-вызов), потерянный state означает
+  # забытый pending_order — то есть риск дубля покупки на следующем запуске — и
+  # обнулённый дневной бюджет.
+  if state
+    begin
+      TradingLogic::StrategyHelpers.save_state(STATE_PATH, state)
+    rescue StandardError => e
+      LOGGER.error("save_state failed: #{e.class} #{e.message}")
+    end
+  end
 end

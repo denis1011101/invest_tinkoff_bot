@@ -1341,5 +1341,37 @@ RSpec.describe TradingLogic::StrategyHelpers do
       port = portfolio_with_cash(shares: 1_000, cash: 1_000)
       expect(described_class.portfolio_total_amount(port)).to eq(2_000)
     end
+
+    # Портфель читается один раз за проход, поэтому вызывающий обязан накапливать уже
+    # занятые в этом проходе рубли — иначе две заявки подряд пройдут по одному снимку.
+    it 'blocks the second buy of a run when accumulated value crosses the cap' do
+      port = portfolio_with_cash(shares: 6_800, cash: 3_200)
+      first = 150
+      second = 150
+
+      expect(
+        described_class.shares_share_within_limit?(nil, nil, portfolio: port, planned_buy_value: first, max_share: 0.7)
+      ).to be true
+      expect(
+        described_class.shares_share_within_limit?(
+          nil, nil, portfolio: port, planned_buy_value: second + first, max_share: 0.7
+        )
+      ).to be false
+    end
+
+    # Гейт на общий риск счёта: «не смогли посчитать» не должно означать «разрешено».
+    it 'fails closed when the portfolio cannot be read' do
+      broken = double('client')
+      allow(broken).to receive(:grpc_operations).and_raise(StandardError, 'boom')
+
+      expect(described_class.shares_share_within_limit?(broken, 'acc', planned_buy_value: 100, max_share: 0.7)).to be false
+    end
+
+    it 'fails closed when the portfolio total is non-positive' do
+      port = portfolio_with_cash(shares: 0, cash: 0)
+      expect(
+        described_class.shares_share_within_limit?(nil, nil, portfolio: port, planned_buy_value: 100, max_share: 0.7)
+      ).to be false
+    end
   end
 end

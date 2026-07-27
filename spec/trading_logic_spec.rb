@@ -648,11 +648,11 @@ RSpec.describe TradingLogic::Runner do
     it 'requires relative volume spike when min_relative_volume is set' do
       runner = described_class.new(client, tickers: %w[SBER], min_relative_volume: 1.5)
       allow(runner).to receive(:dip_today?).and_return(true)
-      allow(runner).to receive(:daily_volume_stats).and_return({ raw: 0.9, normalized: 1.8 })
+      allow(runner).to receive(:daily_volume_stats).and_return({ raw: 0.9, normalized: 1.8, reliable: true })
 
       expect(runner.should_buy?({ figi: 'F1', price: 100 })).to be true
 
-      allow(runner).to receive(:daily_volume_stats).and_return({ raw: 0.9, normalized: 1.1 })
+      allow(runner).to receive(:daily_volume_stats).and_return({ raw: 0.9, normalized: 1.1, reliable: true })
       expect(runner.should_buy?({ figi: 'F1', price: 100 })).to be false
     end
 
@@ -673,6 +673,47 @@ RSpec.describe TradingLogic::Runner do
 
       expect(runner.relative_daily_volume('F1', normalize: false)).to be_within(0.001).of(0.5)
       expect(runner.relative_daily_volume('F1')).to be_within(0.001).of(0.5 / fraction)
+    end
+
+    # Акции на MOEX торгуются с утренней сессии (06:50–09:50 MSK = 03:50–06:50 UTC),
+    # и дневная свеча уже содержит её объём. Без утреннего сегмента он делился бы на
+    # пол MIN_SESSION_FRACTION и раздувал rvol в разы.
+    describe 'session coverage' do
+      {
+        Time.utc(2026, 7, 27, 3, 0) => 0.0, # до открытия утренней
+        Time.utc(2026, 7, 27, 4, 20) => 0.005, # середина утренней
+        Time.utc(2026, 7, 27, 6, 50) => 0.03,  # утренняя закрылась
+        Time.utc(2026, 7, 27, 7, 0) => 0.03, # перерыв перед основной
+        Time.utc(2026, 7, 27, 15, 45) => 0.90, # основная закрылась
+        Time.utc(2026, 7, 27, 20, 50) => 1.0   # вечерняя закрылась
+      }.each do |moment, expected|
+        it "returns ~#{expected} of daily volume at #{moment.strftime('%H:%M')} UTC" do
+          expect(TradingLogic::Utils.session_volume_fraction(now: moment)).to be_within(0.006).of(expected)
+        end
+      end
+
+      it 'never exceeds 1.0' do
+        expect(TradingLogic::Utils.session_volume_fraction(now: Time.utc(2026, 7, 27, 23, 59))).to eq(1.0)
+      end
+    end
+
+    # Fail-closed: в утренней сессии делитель крошечный, и одна крупная сделка даёт
+    # кратный «всплеск» — метрике верить нельзя, покупку не пропускаем.
+    it 'blocks the buy while too little of the session has elapsed to judge volume' do
+      runner = described_class.new(client, tickers: %w[SBER], volume_lookback_days: 5, min_relative_volume: 0.8)
+      morning = Time.utc(2026, 7, 27, 4, 30)
+      allow(TradingLogic::Utils).to receive(:now_utc).and_return(morning)
+
+      candles = 5.times.map { OpenStruct.new(volume: 100, time: OpenStruct.new(seconds: (morning - 86_400).to_i)) }
+      candles << OpenStruct.new(volume: 20, time: OpenStruct.new(seconds: morning.to_i))
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: candles))
+
+      stats = runner.daily_volume_stats('F1')
+      expect(stats[:raw]).to be_within(0.001).of(0.2)
+      expect(stats[:reliable]).to be false
+      # без пола нормализация дала бы ~30 — «всплеск объёма» на ровном месте
+      expect(stats[:normalized]).to be_within(0.001).of(0.2 / 0.05)
+      expect(runner.volume_spike?('F1')).to be false
     end
 
     it 'does not normalize a finished day' do
