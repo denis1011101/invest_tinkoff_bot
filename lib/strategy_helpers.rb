@@ -221,6 +221,16 @@ module TradingLogic
         return nil
       end
 
+      unless daily_buy_within_limit?(state, buy_value, logger: logger)
+        logger&.debug("BUY skipped for #{ticker} — daily buy budget reached")
+        return nil
+      end
+
+      unless shares_share_within_limit?(client, account_id, planned_buy_value: buy_value, logger: logger)
+        logger&.debug("BUY skipped for #{ticker} — cash reserve guard")
+        return nil
+      end
+
       support_distance = support_distance_for_candidate(logic, figi, price)
       logger&.debug("#{ticker} support_distance=#{support_distance.round(4)}")
 
@@ -314,7 +324,10 @@ module TradingLogic
       response = result[:response]
       category = result[:category].to_s
       logger&.debug("BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) category=#{category} order_id=#{response&.order_id}")
-      mark_action!(state, 'last_buy', candidate[:tk]) if buy_execution_result?(result)
+      if buy_execution_result?(result)
+        mark_action!(state, 'last_buy', candidate[:tk])
+        register_daily_buy!(state, candidate[:price] * candidate[:lot] * candidate[:lots_per_order])
+      end
       true
     rescue StandardError
       true
@@ -458,7 +471,7 @@ module TradingLogic
     end
 
     def default_state
-      { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'quarantine' => {} }
+      { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'quarantine' => {}, 'daily_buys' => {} }
     end
 
     def ensure_state_defaults!(state)
@@ -467,6 +480,7 @@ module TradingLogic
       state['last_sell'] ||= {}
       state['pending_orders'] ||= {}
       state['quarantine'] ||= {}
+      state['daily_buys'] ||= {}
       state
     end
 
@@ -576,6 +590,73 @@ module TradingLogic
 
       status = pending['status'].to_s
       %w[sent_not_filled partially_filled].include?(status)
+    end
+
+    # --- Ограничители downside -------------------------------------------------
+    # Расширение универсума повышает частоту покупок, поэтому нужны два потолка:
+    # сколько рублей в день бот вообще может потратить и какую долю счёта держать
+    # в акциях (остаток — «сухой порох» под будущие просадки).
+
+    def daily_buy_total(state, day: today_key)
+      ensure_state_defaults!(state)
+      state['daily_buys'][day].to_f
+    end
+
+    def register_daily_buy!(state, value, day: today_key)
+      ensure_state_defaults!(state)
+      state['daily_buys'][day] = daily_buy_total(state, day: day) + value.to_f
+      # Держим только недавние дни, иначе state растёт без границы.
+      state['daily_buys'] = state['daily_buys'].sort.last(7).to_h
+      state['daily_buys'][day]
+    end
+
+    def daily_buy_within_limit?(state, planned_buy_value, max_daily_rub: nil, logger: nil)
+      max_daily_rub = (max_daily_rub || ENV['MAX_DAILY_BUY_RUB'] || 0).to_f
+      return true unless max_daily_rub.positive?
+
+      spent = daily_buy_total(state)
+      planned = planned_buy_value.to_f
+      return true if (spent + planned) <= max_daily_rub
+
+      logger&.info(
+        "daily buy budget reached: spent=#{spent.round(2)} + planned=#{planned.round(2)} " \
+        "> MAX_DAILY_BUY_RUB=#{max_daily_rub}"
+      )
+      false
+    end
+
+    # Потолок суммарной доли акций в счёте (в отличие от MAX_POSITION_SHARE, который
+    # ограничивает только одну бумагу).
+    def shares_share_within_limit?(client, account_id, planned_buy_value: 0, portfolio: nil, max_share: nil,
+                                   logger: nil)
+      max_share = (max_share || ENV['MAX_SHARES_SHARE'] || 0).to_f
+      return true unless max_share.positive? && max_share < 1.0
+
+      port = portfolio || client.grpc_operations.portfolio(account_id: account_id)
+      shares = Utils.q_to_decimal(port.total_amount_shares).to_f
+      total = portfolio_total_amount(port)
+      return true unless total.positive?
+
+      share = (shares + planned_buy_value.to_f) / total
+      return true if share <= max_share
+
+      logger&.info(
+        "cash reserve guard: post-trade shares share=#{(share * 100).round(1)}% " \
+        "> MAX_SHARES_SHARE=#{(max_share * 100).round(1)}%"
+      )
+      false
+    rescue StandardError
+      true
+    end
+
+    def portfolio_total_amount(port)
+      if port.respond_to?(:total_amount_portfolio)
+        total = Utils.q_to_decimal(port.total_amount_portfolio).to_f
+        return total if total.positive?
+      end
+
+      cash = port.respond_to?(:total_amount_currencies) ? Utils.q_to_decimal(port.total_amount_currencies).to_f : 0.0
+      Utils.q_to_decimal(port.total_amount_shares).to_f + cash
     end
 
     # Проверяет, не превысит ли позиция по figi долю портфеля после покупки.

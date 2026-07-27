@@ -5,7 +5,7 @@ A small automated trading helper for MOEX using Tinkoff gRPC API. It implements 
 ## Strategies (brief)
 
 ### Entry signals
-- **Intraday dip buy (UP trend)** — when the market index trend is up and a ticker's current price <= today's high * (1 - dip_pct), the bot may place a BUY. If support/resistance levels are enabled, UP-trend BUY also requires the live price to be near a support level; if levels cannot be computed, the strategy falls back to the original dip logic. See [`TradingLogic::Runner`](lib/trading_logic.rb).
+- **Intraday dip buy (UP trend)** — when the market index trend is up and a ticker's current price <= today's high * (1 - dip_pct), the bot may place a BUY. The UP universe is a separate, wider whitelist (`UP_TICKERS`, falls back to `TICKERS`): the narrow list starved the bot in exactly the trend where it should be investing. If support/resistance levels are enabled, UP-trend BUY additionally requires the price to be **above its short moving average** (`UP_ENTRY_MA_DAYS`) and **not near resistance**; if levels cannot be computed, the strategy falls back to the original dip logic. Set `UP_REQUIRE_SUPPORT=1` to restore the previous "near support" gate. See [`TradingLogic::Runner`](lib/trading_logic.rb).
 - **Momentum buy with dip filter (SIDE/DOWN trend)** — from intersection of market universe and IMOEX index constituents, buy one instrument showing 3 consecutive daily closes up **and** an intraday dip on the current day. If support/resistance levels are enabled, candidates closer to support are prioritized, but this does not block buying. See [`TradingLogic::StrategyHelpers`](lib/strategy_helpers.rb).
 
 Exits are intentionally asymmetric by trend. In an **UP** trend the bot holds positions (letting winners run) and the only sell is the full-position force exit at +10%; the per-lot profit exit and resistance exit are applied only once the trend is no longer UP. In **SIDE/DOWN** the bot trims one lot at a time on the trend threshold, and still exits the whole position at +10%.
@@ -19,14 +19,17 @@ Exits are intentionally asymmetric by trend. In an **UP** trend the bot holds po
 
 ### Risk management
 - **Position size limit** — the bot will not buy a ticker if the existing position already exceeds a fraction of the total share portfolio value. Controlled by `MAX_POSITION_SHARE` (default `0.33` = 1/3 of portfolio).
+- **Daily buy budget** — total rubles spent on BUYs per calendar day, capped by `MAX_DAILY_BUY_RUB` (disabled when unset/`0`). Counted in `tmp/strategy_state.json` (`daily_buys`) and enforced on both buy paths.
+- **Cash reserve guard** — caps the share of the account held in shares (`MAX_SHARES_SHARE`, disabled when unset/`0`), keeping dry powder for future dips. Complements `MAX_POSITION_SHARE`, which limits only one ticker.
 - **Pending order cooldown** — avoids duplicate BUY orders for a ticker that already has an unfilled order. Cooldown controlled by `BUY_PENDING_COOLDOWN_MIN`.
+- **Shadow mode** — `SHADOW_BUYS=1` evaluates and logs UP-trend buys (`SHADOW BUY ...` with the full gate breakdown) without sending any orders.
 
 ### Filters
 - **Non-share position filter** — the sell flow skips non-share positions (bonds, currencies, ETFs) using `instrument_type`.
 - **FIGI cache** — `market_instruments_cache.json` is used for fast figi-to-ticker resolution, reducing gRPC API calls.
 - **Pending order cleanup** — on startup, pending orders are reconciled with active broker orders; filled/cancelled orders are removed from state.
-- **Volume-aware filters and ranking** — optional relative volume filter for entries (`MIN_RELATIVE_VOLUME`) and cross-sectional ranking (`VOLUME_COMPARE_MODE=relative|turnover`).
-- **Support/resistance levels** — optional pivot-based levels are built from closed daily candles, cached once per `figi` for the whole run, and used as a hard BUY filter in UP trend plus a soft priority signal in SIDE/DOWN momentum buys.
+- **Volume-aware filters and ranking** — optional relative volume filter for entries (`MIN_RELATIVE_VOLUME`) and cross-sectional ranking (`VOLUME_COMPARE_MODE=relative|turnover`). The current day's candle is still accumulating volume, so the ratio is normalized by the elapsed share of the MOEX session before it is compared to the threshold — without that, rvol grows mechanically towards the close and any threshold above ~1 is unreachable during the day. Closed days are used as-is.
+- **Support/resistance levels** — optional pivot-based levels are built from closed daily candles, cached once per `figi` for the whole run, and used as a BUY filter in UP trend (resistance side) plus a soft priority signal in SIDE/DOWN momentum buys.
 
 ## How it works (high level)
 - Market data and instruments are fetched via Invest Tinkoff gRPC client.
@@ -95,8 +98,12 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `TELEGRAM_CHAT_ID` — target Telegram chat id for confirmations.
 - `AUTO_CONFIRM` — if `1`/`true`, skips Telegram/manual confirmation and sends orders immediately.
 - `TICKERS` — comma-separated ticker list for main universe (example: `SBER,ROSN,VTBR`).
+- `UP_TICKERS` — comma-separated whitelist used **only when the index trend is UP** (falls back to `TICKERS` when empty). SIDE/DOWN already get a wide pool from the IMOEX∩market intersection.
+- `UP_REQUIRE_SUPPORT` — `1` restores the legacy UP entry gate (price must be near support). Default `0` = trend gate (above MA, not near resistance).
+- `UP_ENTRY_MA_DAYS` — moving-average window (closed daily closes) for the UP entry gate (default `5`).
+- `SHADOW_BUYS` — `1` logs UP-trend buy decisions without placing orders.
 - `MAX_LOT_RUB` — strategy/runtime per-order price limit (`price_per_lot * lots_per_order`) used in `Runner` and momentum buy helper.
-- `MAX_LOT_COUNT` — max instrument lot size allowed when building universe (`lot <= MAX_LOT_COUNT`).
+- `MAX_LOT_COUNT` — max instrument lot size allowed when building universe (`lot <= MAX_LOT_COUNT`). `0`/unset disables the check — `MAX_LOT_RUB` already bounds the order size, and a value of `1` silently drops most liquid MOEX names (GAZP, SNGSP, IRAO, RUAL, NLMK, RTKM…).
 - `LOTS_PER_ORDER` — order quantity in lots (`quantity = LOTS_PER_ORDER`, shares = `lot_size * LOTS_PER_ORDER`).
 - `DIP_PCT` — intraday dip threshold for BUY (`cur <= today_high * (1 - DIP_PCT)`). Used in UP trend and as momentum dip filter in SIDE/DOWN.
 - `USE_LEVELS` — enables support/resistance levels logic (`1` by default, `0` disables all level lookups and related filters).
@@ -109,7 +116,9 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `SELL_THRESHOLD_SIDE` — profit multiplier to trigger SELL in SIDE trend (default `1.04` = +4%).
 - `SELL_THRESHOLD_DOWN` — profit multiplier to trigger SELL in DOWN trend (default `1.02` = +2%).
 - `MAX_POSITION_SHARE` — max fraction of the share portfolio that one ticker can occupy before BUY is blocked (default `0.33`).
-- `MIN_RELATIVE_VOLUME` — minimum `today_volume / avg_volume_N_days` ratio for BUY (disabled if unset).
+- `MAX_DAILY_BUY_RUB` — max total rubles spent on BUYs per calendar day (disabled when unset/`0`).
+- `MAX_SHARES_SHARE` — max fraction of the whole account (shares + cash) allowed to sit in shares after a BUY (disabled when unset/`0`).
+- `MIN_RELATIVE_VOLUME` — minimum relative volume for BUY (disabled if unset). Compared against the session-normalized ratio, so `1.0` means "on pace for an average day", not "an average full day's volume already traded".
 - `VOLUME_LOOKBACK_DAYS` — lookback `N` for average daily volume (default `20`).
 - `VOLUME_COMPARE_MODE` — volume ranking mode for universe: `none`, `relative`, `turnover`.
 - `SCAN_MAX_LOT_RUB` — cache-time filter in `MarketCache`; excludes instruments with `price_per_lot` above this threshold.

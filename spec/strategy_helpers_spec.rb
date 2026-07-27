@@ -1279,4 +1279,60 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(result).to be true
     end
   end
+
+  # Ограничители downside: расширение универсума повышает частоту покупок,
+  # поэтому нужны потолок дневных трат и запас кэша.
+  describe '.daily_buy_within_limit?' do
+    it 'is disabled when the limit is not set' do
+      state = described_class.default_state
+      expect(described_class.daily_buy_within_limit?(state, 1_000_000, max_daily_rub: 0)).to be true
+    end
+
+    it 'blocks a buy that would exceed the daily budget and counts executed buys' do
+      state = described_class.default_state
+
+      expect(described_class.daily_buy_within_limit?(state, 400, max_daily_rub: 1_000)).to be true
+      described_class.register_daily_buy!(state, 400)
+      expect(described_class.daily_buy_total(state)).to eq(400)
+
+      expect(described_class.daily_buy_within_limit?(state, 500, max_daily_rub: 1_000)).to be true
+      expect(described_class.daily_buy_within_limit?(state, 700, max_daily_rub: 1_000)).to be false
+    end
+
+    it 'keeps only recent days in state' do
+      state = described_class.default_state
+      state['daily_buys'] = (1..10).to_h { |i| ["2026-07-#{i.to_s.rjust(2, '0')}", 100.0] }
+      described_class.register_daily_buy!(state, 50)
+
+      expect(state['daily_buys'].size).to eq(7)
+      expect(state['daily_buys']).to have_key(described_class.today_key)
+    end
+  end
+
+  describe '.shares_share_within_limit?' do
+    def portfolio_with_cash(shares:, cash:)
+      OpenStruct.new(total_amount_shares: q(shares), total_amount_currencies: q(cash), positions: [])
+    end
+
+    it 'is disabled when max_share is not set' do
+      port = portfolio_with_cash(shares: 10_000, cash: 0)
+      expect(described_class.shares_share_within_limit?(nil, nil, portfolio: port, max_share: 0)).to be true
+    end
+
+    it 'blocks a buy that pushes the shares share above the cap' do
+      port = portfolio_with_cash(shares: 6_000, cash: 4_000)
+
+      expect(
+        described_class.shares_share_within_limit?(nil, nil, portfolio: port, planned_buy_value: 500, max_share: 0.7)
+      ).to be true
+      expect(
+        described_class.shares_share_within_limit?(nil, nil, portfolio: port, planned_buy_value: 1_500, max_share: 0.7)
+      ).to be false
+    end
+
+    it 'falls back to shares+cash when total_amount_portfolio is absent' do
+      port = portfolio_with_cash(shares: 1_000, cash: 1_000)
+      expect(described_class.portfolio_total_amount(port)).to eq(2_000)
+    end
+  end
 end

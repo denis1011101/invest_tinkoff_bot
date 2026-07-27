@@ -18,7 +18,7 @@ module TradingLogic
     MIN_5 = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_5_MIN
     DEFAULT_OPTIONS = {
       max_lot_rub: 500.0,
-      max_lot_count: 1,
+      max_lot_count: nil,
       lots_per_order: 1,
       dip_pct: 0.01,
       min_relative_volume: nil,
@@ -32,8 +32,14 @@ module TradingLogic
       level_sell_min_profit: 1.005,
       level_pivot_window: 5,
       level_cluster_pct: 0.015,
-      levels_cache_ttl_seconds: 300
+      levels_cache_ttl_seconds: 300,
+      up_require_support: false,
+      up_entry_ma_days: 5
     }.freeze
+
+    # Нижняя граница доли сессии при нормировке rvol: до открытия торгов делить
+    # на ~0 нельзя, а объём там и так near-zero → rvol выйдет низким, что верно.
+    MIN_SESSION_FRACTION = 0.05
 
     TECHNICAL_ERROR_PATTERNS = [
       /deadline/i,
@@ -70,7 +76,10 @@ module TradingLogic
       @level_pivot_window = settings[:level_pivot_window]
       @level_cluster_pct = settings[:level_cluster_pct]
       @levels_cache_ttl_seconds = settings[:levels_cache_ttl_seconds]
+      @up_require_support = settings[:up_require_support]
+      @up_entry_ma_days = settings[:up_entry_ma_days]
       @levels_cache = {}
+      @volume_stats_cache = {}
     end
 
     def refresh_market_cache(force: false)
@@ -114,8 +123,32 @@ module TradingLogic
     end
 
     # Оценка относительного дневного объёма:
-    # rvol = текущий дневной объём / средний объём предыдущих N дней
-    def relative_daily_volume(figi, lookback_days: @volume_lookback_days)
+    # rvol = текущий дневной объём / средний объём предыдущих N дней.
+    #
+    # ВАЖНО: дневная свеча текущего дня накапливает объём по ходу сессии, а история —
+    # это ПОЛНЫЕ дни. Без поправки метрика механически растёт к вечеру (факт по логу
+    # 27.07.2026, SBER: 0.43 → 0.52 → 0.68 → 0.83 → 0.94 → 1.18 → 1.32 к закрытию),
+    # и порог вроде 1.5 недостижим до последнего часа торгов.
+    # Поэтому при незакрытом дне делим на ожидаемую к этому моменту долю сессии.
+    # normalize: false возвращает сырое отношение (для диагностики/сравнения).
+    def relative_daily_volume(figi, lookback_days: @volume_lookback_days, normalize: true)
+      stats = daily_volume_stats(figi, lookback_days: lookback_days)
+      return nil unless stats
+
+      normalize ? stats[:normalized] : stats[:raw]
+    end
+
+    # Сырое и нормированное отношение за один запрос свечей — чтобы решение о покупке
+    # и его лог не удваивали обращения к API. Кеш живёт в пределах процесса, а каждый
+    # запуск по cron — новый процесс, поэтому протухнуть не может.
+    def daily_volume_stats(figi, lookback_days: @volume_lookback_days)
+      key = [figi, lookback_days]
+      return @volume_stats_cache[key] if @volume_stats_cache.key?(key)
+
+      @volume_stats_cache[key] = compute_daily_volume_stats(figi, lookback_days: lookback_days)
+    end
+
+    def compute_daily_volume_stats(figi, lookback_days: @volume_lookback_days)
       lookback = [lookback_days.to_i, 1].max
       # Берём заметно больший календарный диапазон, чтобы после выходных/праздников
       # осталось не меньше lookback торговых свечей в истории.
@@ -141,7 +174,16 @@ module TradingLogic
       avg = history.sum / history.size
       return nil if avg <= 0
 
-      current / avg
+      raw = current / avg
+      { raw: raw, normalized: raw / partial_day_fraction(candles[-1]) }
+    end
+
+    # Доля дневного объёма, которую можно ожидать к текущему моменту.
+    # 1.0 для завершённого дня (последняя свеча — не сегодняшняя): поправка не нужна.
+    def partial_day_fraction(last_candle)
+      return 1.0 unless Utils.candle_of_today?(last_candle)
+
+      [Utils.session_volume_fraction, MIN_SESSION_FRACTION].max
     end
 
     # Денежный объём за текущий день по дневной свече: close * volume
@@ -158,10 +200,13 @@ module TradingLogic
     end
 
     def volume_spike?(figi)
+      volume_ok?(daily_volume_stats(figi))
+    end
+
+    def volume_ok?(stats)
       return true unless @min_relative_volume&.positive?
 
-      rvol = relative_daily_volume(figi)
-      rvol && rvol >= @min_relative_volume
+      !stats.nil? && stats[:normalized] >= @min_relative_volume
     end
 
     # Покупать только на «дневной просадке»: текущая цена <= (сегодняшний максимум * (1 - @dip_pct))
@@ -222,15 +267,20 @@ module TradingLogic
       trend_from_closes(index_daily_closes(figi: index_figi, instrument_id: instrument_id))
     end
 
-    def build_universe
+    # tickers: — позволяет собрать универсум не из @tickers (в UP используется
+    # отдельный расширенный whitelist, см. UP_TICKERS в bin/current_strategy.rb).
+    def build_universe(tickers: @tickers)
       volume_enabled = volume_features_enabled?
 
-      @tickers.map do |t|
+      tickers.map do |t|
         figi, lot = figi_and_lot(t)
         next unless figi && lot
 
-        # skip if API lot count exceeds configured max_lot_count
-        if @max_lot_count && lot.to_i > @max_lot_count.to_i
+        # Отсев по числу акций в лоте. Ограничитель избыточен, когда задан max_lot_rub
+        # (рублёвый потолок и так режет дорогие лоты), а с max_lot_count=1 он выбрасывал
+        # половину ликвидного IMOEX: GAZP, SNGSP, IRAO, RUAL, NLMK, RTKM, ALRS, MAGN.
+        # Выключается пустым/нулевым MAX_LOT_COUNT.
+        if @max_lot_count&.positive? && lot.to_i > @max_lot_count.to_i
           warn "build_universe: skipping #{t} — lot=#{lot} > max_lot_count=#{@max_lot_count}"
           next
         end
@@ -263,16 +313,57 @@ module TradingLogic
     end
 
     # Покупаем на дневной просадке.
-    # trend: — если :up и уровни включены, применяем hard filter по near_support?.
+    # trend: — если :up и уровни включены, применяем трендовый гейт (см. up_entry_ok?).
     # Graceful degradation: если уровней нет — покупаем по старым правилам.
     def should_buy?(it, trend: :side)
-      return false unless dip_today?(it[:figi]) && volume_spike?(it[:figi])
+      buy_gate(it, trend: trend)[:should_buy]
+    end
+
+    # Единая точка решения о покупке + разложение на подусловия (для shadow-логов:
+    # видно, какой именно гейт отсекает кандидата). Каждое обращение к API — по
+    # одному разу: метод зовётся каждые 5 минут по всему универсуму.
+    def buy_gate(it, trend: :side)
+      stats = daily_volume_stats(it[:figi])
+      gate = {
+        dip: dip_today?(it[:figi]),
+        rvol: stats && stats[:normalized].round(2),
+        rvol_raw: stats && stats[:raw].round(2),
+        volume_ok: volume_spike?(it[:figi])
+      }
+      gate[:should_buy] = gate[:dip] && gate[:volume_ok] && up_entry_gate(gate, it, trend)
+      gate
+    end
+
+    # Гейт входа в растущем тренде. Применяется только при trend=:up и включённых
+    # уровнях; свои подусловия пишет в gate для логов.
+    #
+    # Раньше здесь стоял near_support? — но в UP цена по определению уходит от поддержки
+    # (27.07.2026: дистанции 11.8% / 14.8% / 17.2% при proximity 1.5%), поэтому условие
+    # читалось как «покупаем только после обвала» и блокировало ~все входы.
+    # Трендовая замена: бумага участвует в росте (выше своей SMA) и не упирается
+    # в сопротивление. UP_REQUIRE_SUPPORT=1 возвращает прежнее поведение.
+    def up_entry_gate(gate, it, trend)
       return true unless @use_levels && trend == :up
+      return true if levels_for(it[:figi]).empty?
 
-      levels = levels_for(it[:figi])
-      return true if levels.empty?
+      if @up_require_support
+        gate[:near_support] = near_support?(it[:figi], it[:price])
+      else
+        gate[:near_resistance] = near_resistance?(it[:figi], it[:price])
+        gate[:above_ma] = above_moving_average?(it[:figi], it[:price])
+        !gate[:near_resistance] && gate[:above_ma]
+      end
+    end
 
-      near_support?(it[:figi], it[:price])
+    # Цена выше простой скользящей по завершённым дневным закрытиям.
+    # Нет данных — не блокируем (graceful degradation, как с пустыми уровнями).
+    def above_moving_average?(figi, price, days: @up_entry_ma_days)
+      return true unless price
+
+      closes = Utils.last_daily_closes(@client, figi, days: days)
+      return true if closes.size < days
+
+      price > (closes.sum / closes.size)
     end
 
     # Сортировка кандидатов по объёмам между бумагами

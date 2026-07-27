@@ -218,6 +218,26 @@ RSpec.describe TradingLogic::Runner do
       expect(runner.build_universe).to eq([])
     end
 
+    it 'keeps instruments with lot > 1 when max_lot_count is disabled' do
+      runner = described_class.new(client, tickers: %w[GAZP], max_lot_rub: 1_000.0, max_lot_count: 0)
+      allow(instruments).to receive(:share_by_ticker)
+        .and_return(OpenStruct.new(instrument: tradable_share(figi: 'F1', lot: 10)))
+      allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(92))]))
+
+      universe = runner.build_universe
+      expect(universe.map { |u| u[:ticker] }).to eq(%w[GAZP])
+      expect(universe.first[:price_per_lot]).to be_within(0.01).of(920.0)
+    end
+
+    it 'builds a universe from an explicit ticker list (UP whitelist)' do
+      runner = described_class.new(client, tickers: %w[SBER], max_lot_rub: 1_000.0)
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: tradable_share(figi: 'F1',
+                                                                                                           lot: 1)))
+      allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(100))]))
+
+      expect(runner.build_universe(tickers: %w[T SBERP]).map { |u| u[:ticker] }).to eq(%w[T SBERP])
+    end
+
     it 'does not request volume metrics when volume features are disabled' do
       runner = described_class.new(client, tickers: %w[SBER], volume_compare_mode: 'none')
       allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: tradable_share(figi: 'F1',
@@ -241,7 +261,19 @@ RSpec.describe TradingLogic::Runner do
       enough = 6.times.map { OpenStruct.new(volume: 100) }
       enough[-1] = OpenStruct.new(volume: 200)
       allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: enough))
-      expect(runner.relative_daily_volume('F1')).to be_within(0.001).of(2.0)
+      # другой figi: результат кешируется на время процесса (см. daily_volume_stats)
+      expect(runner.relative_daily_volume('F2')).to be_within(0.001).of(2.0)
+    end
+
+    it 'caches stats per figi so a run does not refetch candles for the same ticker' do
+      runner = described_class.new(client, tickers: %w[SBER], volume_lookback_days: 5, min_relative_volume: 1.0)
+      candles = 6.times.map { OpenStruct.new(volume: 100) }
+      allow(TradingLogic::Utils).to receive(:fetch_candles).once.and_return(OpenStruct.new(candles: candles))
+
+      runner.relative_daily_volume('F1')
+      runner.volume_spike?('F1')
+
+      expect(TradingLogic::Utils).to have_received(:fetch_candles).once
     end
   end
 
@@ -460,7 +492,7 @@ RSpec.describe TradingLogic::Runner do
       end
     end
 
-    describe '#should_buy? with levels (UP trend = hard filter)' do
+    describe '#should_buy? with levels (UP trend = trend gate)' do
       let(:runner_up) do
         described_class.new(
           client,
@@ -480,17 +512,41 @@ RSpec.describe TradingLogic::Runner do
         allow(runner_up).to receive(:volume_spike?).and_return(true)
       end
 
-      it 'blocks buy in :up trend when price is far from support' do
-        expect(runner_up.should_buy?({ figi: 'FIGI', price: 999 }, trend: :up)).to be false
+      # Дистанция до поддержки больше не блокирует вход в UP: в растущем рынке цена
+      # уходит от поддержки, и старый гейт отсекал ~все входы.
+      it 'allows buy in :up trend when price is far above support but still above MA' do
+        expect(runner_up.should_buy?({ figi: 'FIGI', price: 999 }, trend: :up)).to be true
       end
 
-      it 'allows buy in :up trend when price is near support' do
-        levels = runner_up.levels_for('FIGI')
-        support_price = levels.select { |l| l[:type] == :support }.map { |l| l[:price] }.min
-        expect(support_price).not_to be_nil
+      it 'blocks buy in :up trend when price is below the moving average' do
+        expect(runner_up.should_buy?({ figi: 'FIGI', price: 1 }, trend: :up)).to be false
+      end
 
-        near_price = support_price * 1.02
-        expect(runner_up.should_buy?({ figi: 'FIGI', price: near_price }, trend: :up)).to be true
+      it 'blocks buy in :up trend when price sits at resistance' do
+        levels = runner_up.levels_for('FIGI')
+        resistance = levels.select { |l| l[:type] == :resistance }.map { |l| l[:price] }.max
+        expect(resistance).not_to be_nil
+
+        expect(runner_up.should_buy?({ figi: 'FIGI', price: resistance * 0.99 }, trend: :up)).to be false
+      end
+
+      it 'restores the old near_support? gate when up_require_support is set' do
+        legacy = described_class.new(
+          client,
+          tickers: %w[SBER],
+          use_levels: true,
+          level_pivot_window: 2,
+          level_proximity_pct: 0.05,
+          level_cluster_pct: 0.03,
+          up_require_support: true
+        )
+        allow(legacy).to receive(:dip_today?).and_return(true)
+        allow(legacy).to receive(:volume_spike?).and_return(true)
+
+        expect(legacy.should_buy?({ figi: 'FIGI', price: 999 }, trend: :up)).to be false
+
+        support_price = legacy.levels_for('FIGI').select { |l| l[:type] == :support }.map { |l| l[:price] }.min
+        expect(legacy.should_buy?({ figi: 'FIGI', price: support_price * 1.02 }, trend: :up)).to be true
       end
 
       it 'graceful degradation: allows buy in :up when levels are empty' do
@@ -592,12 +648,44 @@ RSpec.describe TradingLogic::Runner do
     it 'requires relative volume spike when min_relative_volume is set' do
       runner = described_class.new(client, tickers: %w[SBER], min_relative_volume: 1.5)
       allow(runner).to receive(:dip_today?).and_return(true)
-      allow(runner).to receive(:relative_daily_volume).and_return(1.8)
+      allow(runner).to receive(:daily_volume_stats).and_return({ raw: 0.9, normalized: 1.8 })
 
       expect(runner.should_buy?({ figi: 'F1', price: 100 })).to be true
 
-      allow(runner).to receive(:relative_daily_volume).and_return(1.1)
+      allow(runner).to receive(:daily_volume_stats).and_return({ raw: 0.9, normalized: 1.1 })
       expect(runner.should_buy?({ figi: 'F1', price: 100 })).to be false
+    end
+
+    # Дневная свеча текущего дня накапливает объём: без нормировки rvol механически
+    # растёт к вечеру и порог вроде 1.5 недостижим до последнего часа торгов.
+    it 'normalizes an unfinished day by the elapsed share of the session' do
+      runner = described_class.new(client, tickers: %w[SBER], volume_lookback_days: 5)
+      today = Time.utc(2026, 7, 27, 11, 0, 0) # середина основной сессии MOEX
+      allow(TradingLogic::Utils).to receive(:now_utc).and_return(today)
+
+      candles = 5.times.map { OpenStruct.new(volume: 100, time: OpenStruct.new(seconds: (today - 86_400).to_i)) }
+      candles << OpenStruct.new(volume: 50, time: OpenStruct.new(seconds: today.to_i))
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: candles))
+
+      fraction = TradingLogic::Utils.session_volume_fraction(now: today)
+      expect(fraction).to be > 0.3
+      expect(fraction).to be < 0.6
+
+      expect(runner.relative_daily_volume('F1', normalize: false)).to be_within(0.001).of(0.5)
+      expect(runner.relative_daily_volume('F1')).to be_within(0.001).of(0.5 / fraction)
+    end
+
+    it 'does not normalize a finished day' do
+      runner = described_class.new(client, tickers: %w[SBER], volume_lookback_days: 5)
+      now = Time.utc(2026, 7, 27, 11, 0, 0)
+      allow(TradingLogic::Utils).to receive(:now_utc).and_return(now)
+
+      yesterday = (now - 86_400).to_i
+      candles = 6.times.map { OpenStruct.new(volume: 100, time: OpenStruct.new(seconds: yesterday)) }
+      candles[-1] = OpenStruct.new(volume: 200, time: OpenStruct.new(seconds: yesterday))
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(OpenStruct.new(candles: candles))
+
+      expect(runner.relative_daily_volume('F1')).to be_within(0.001).of(2.0)
     end
 
     it 'can rank universe by relative volume or turnover' do

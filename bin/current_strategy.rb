@@ -25,8 +25,16 @@ client = InvestTinkoff::V2::Client.new(token: token, sandbox: false)
 
 # параметры стратегии
 TICKERS = (ENV['TICKERS'] || 'SBER,ROSN,VTBR').split(',').map(&:strip)
+# Универсум растущего тренда. Раньше UP торговал теми же 3 бумагами, что и всё
+# остальное, тогда как SIDE/DOWN работали по всему IMOEX∩Tinkoff — бот системно
+# недоинвестировал именно в благоприятном тренде (24.07 и 27.07.2026: два UP-дня,
+# ноль сделок). Список курируемый: ликвидные бумаги индекса, без расписок и новых
+# размещений. Пусто → падаем на TICKERS.
+UP_TICKERS = (ENV['UP_TICKERS'] || '').split(',').map(&:strip).reject(&:empty?)
+UP_UNIVERSE = UP_TICKERS.empty? ? TICKERS : UP_TICKERS
 MAX_LOT_RUB = (ENV['MAX_LOT_RUB'] || '1000.0').to_f
-MAX_LOT_COUNT = (ENV['MAX_LOT_COUNT'] || '1').to_i
+# 0/пусто — ограничитель выключен (рублёвого потолка MAX_LOT_RUB достаточно).
+MAX_LOT_COUNT = (ENV['MAX_LOT_COUNT'] || '0').to_i
 LOTS_PER_ORDER = (ENV['LOTS_PER_ORDER'] || '2').to_i
 DIP_PCT = (ENV['DIP_PCT'] || '0.01').to_f
 MIN_RELATIVE_VOLUME = ENV['MIN_RELATIVE_VOLUME']&.to_f
@@ -40,6 +48,13 @@ LEVEL_PROXIMITY_PCT  = (ENV['LEVEL_PROXIMITY_PCT'] || '0.02').to_f
 LEVEL_SELL_MIN_PROFIT = (ENV['LEVEL_SELL_MIN_PROFIT'] || '1.005').to_f
 LEVEL_PIVOT_WINDOW   = (ENV['LEVEL_PIVOT_WINDOW'] || '5').to_i
 LEVEL_CLUSTER_PCT    = (ENV['LEVEL_CLUSTER_PCT'] || '0.015').to_f
+
+# Вход в растущем тренде: near_support? заменён на «выше SMA и не у сопротивления».
+# UP_REQUIRE_SUPPORT=1 возвращает прежнее поведение.
+UP_REQUIRE_SUPPORT = ENV.fetch('UP_REQUIRE_SUPPORT', '0').strip == '1'
+UP_ENTRY_MA_DAYS   = (ENV['UP_ENTRY_MA_DAYS'] || '5').to_i
+# Shadow-режим: считаем и логируем сделки, но не отправляем ордера.
+SHADOW_BUYS = ENV.fetch('SHADOW_BUYS', '0').strip == '1'
 
 logic = TradingLogic::Runner.new(
   client,
@@ -58,7 +73,9 @@ logic = TradingLogic::Runner.new(
   level_proximity_pct: LEVEL_PROXIMITY_PCT,
   level_sell_min_profit: LEVEL_SELL_MIN_PROFIT,
   level_pivot_window: LEVEL_PIVOT_WINDOW,
-  level_cluster_pct: LEVEL_CLUSTER_PCT
+  level_cluster_pct: LEVEL_CLUSTER_PCT,
+  up_require_support: UP_REQUIRE_SUPPORT,
+  up_entry_ma_days: UP_ENTRY_MA_DAYS
 )
 
 STATE_PATH = File.expand_path('../tmp/strategy_state.json', __dir__)
@@ -96,8 +113,11 @@ begin
   LOGGER.debug("trend=#{trend.inspect}")
   LOGGER.warn('index closes < 4 — trend UNKNOWN; проверь резолв индекса (rake index:check)') if index_closes.size < 4
 
-  universe = logic.rank_universe_by_volume(logic.build_universe)
-  LOGGER.debug("universe (count=#{universe.size}):")
+  # В UP торгуем по расширенному whitelist'у, в остальных трендах — по базовому
+  # TICKERS (широкий пул там и так приходит из intersection-ветки).
+  universe_tickers = trend == :up ? UP_UNIVERSE : TICKERS
+  universe = logic.rank_universe_by_volume(logic.build_universe(tickers: universe_tickers))
+  LOGGER.debug("universe (count=#{universe.size}, source=#{trend == :up ? 'UP_TICKERS' : 'TICKERS'}):")
   universe.each do |u|
     LOGGER.debug(format(
                    '  - %-6s  price=%8.2f  lot=%3d  price_per_lot=%8.2f  rvol=%5.2f  turnover=%12.0f',
@@ -139,7 +159,10 @@ begin
   when :up
     LOGGER.info('Trend: UP — intraday dip BUY (max once per ticker per day)')
     up_portfolio = client.grpc_operations.portfolio(account_id: account_id)
-    universe.each do |it|
+    universe.each do |it| # rubocop:disable Metrics/BlockLength
+      next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
+      next if TradingLogic::StrategyHelpers.pending_order_active?(state, it[:ticker])
+
       cur = logic.last_price_for(it[:figi])
       today_high = begin
         logic.today_high(it[:figi])
@@ -148,17 +171,28 @@ begin
       end
       dip_thr = today_high ? (today_high * (1.0 - DIP_PCT)) : nil
       it_live = cur ? it.merge(price: cur) : it
+      # buy_gate считает все подусловия за один проход по API и заодно даёт shadow-лог:
+      # видно, какой именно гейт отсёк кандидата.
+      gate = logic.buy_gate(it_live, trend: trend)
       LOGGER.debug("#{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} " \
-                   "dip_threshold=#{dip_thr.inspect} should_buy=#{logic.should_buy?(it_live, trend: trend)}")
-      next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
-      next if TradingLogic::StrategyHelpers.pending_order_active?(state, it[:ticker])
-      next unless logic.should_buy?(it_live, trend: trend)
+                   "dip_threshold=#{dip_thr.inspect} gate=#{gate.inspect}")
+      next unless gate[:should_buy]
 
       buy_value = (cur || it[:price]) * it[:lot] * LOTS_PER_ORDER
       next unless TradingLogic::StrategyHelpers.position_within_limit?(
         client, account_id, it[:figi],
         planned_buy_value: buy_value, portfolio: up_portfolio, logger: LOGGER
       )
+      next unless TradingLogic::StrategyHelpers.daily_buy_within_limit?(state, buy_value, logger: LOGGER)
+      next unless TradingLogic::StrategyHelpers.shares_share_within_limit?(
+        client, account_id, planned_buy_value: buy_value, portfolio: up_portfolio, logger: LOGGER
+      )
+
+      if SHADOW_BUYS
+        LOGGER.info("SHADOW BUY #{it[:ticker]} lots=#{LOTS_PER_ORDER} @#{cur || it[:price]} " \
+                    "value=#{buy_value.round(2)} gate=#{gate.inspect}")
+        next
+      end
 
       result = logic.confirm_and_place_order_with_result(
         account_id: account_id,
@@ -178,6 +212,7 @@ begin
           "@#{it[:price]} category=#{result[:category]} (order_id=#{resp&.order_id})"
         )
         TradingLogic::StrategyHelpers.mark_action!(state, 'last_buy', it[:ticker])
+        TradingLogic::StrategyHelpers.register_daily_buy!(state, buy_value)
       else
         LOGGER.info(TradingLogic::StrategyHelpers.buy_failure_message(it[:ticker], result))
       end

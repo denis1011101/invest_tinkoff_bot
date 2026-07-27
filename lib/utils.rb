@@ -57,10 +57,39 @@ module TradingLogic
     def candle_complete?(candle, now: now_utc)
       return candle.is_complete == true if candle.respond_to?(:is_complete)
 
-      candle_time = candle_time_utc(candle)
-      return true unless candle_time
+      !candle_of_today?(candle, now: now)
+    end
 
-      candle_time.strftime('%Y-%m-%d') != now.utc.strftime('%Y-%m-%d')
+    # Сессии MOEX в UTC с долей дневного объёма на каждую.
+    # Основная 10:00–18:45 MSK = 07:00–15:45 UTC, вечерняя 19:05–23:50 MSK = 16:05–20:50 UTC.
+    # Веса — грубая оценка распределения оборота (вечерняя сессия ~10%); внутри сессии
+    # считаем объём равномерным. Модель приблизительная, но снимает главное искажение —
+    # сравнение неполного дня с полными.
+    SESSION_SEGMENTS = [
+      { from: 7 * 60, to: (15 * 60) + 45, weight: 0.9 },
+      { from: (16 * 60) + 5, to: (20 * 60) + 50, weight: 0.1 }
+    ].freeze
+
+    # Какая доля дневного объёма уже должна была наторговаться к моменту now.
+    def session_volume_fraction(now: now_utc)
+      minutes = (now.hour * 60) + now.min
+
+      SESSION_SEGMENTS.sum do |seg|
+        if minutes >= seg[:to]
+          seg[:weight]
+        elsif minutes <= seg[:from]
+          0.0
+        else
+          seg[:weight] * (minutes - seg[:from]).to_f / (seg[:to] - seg[:from])
+        end
+      end
+    end
+
+    def candle_of_today?(candle, now: now_utc)
+      candle_time = candle_time_utc(candle)
+      return false unless candle_time
+
+      candle_time.strftime('%Y-%m-%d') == now.utc.strftime('%Y-%m-%d')
     end
 
     def completed_daily_candles(candles, now: now_utc)
@@ -70,7 +99,11 @@ module TradingLogic
     end
 
     def last_daily_closes(client, figi, days: 10)
-      resp = fetch_candles(client, figi: figi, from: days_ago(days * 2), to: now_utc, interval: DAY)
+      # Константу берём по полному пути: раньше здесь был голый DAY, который
+      # резолвился только через top-level константу из bin/current_strategy.rb
+      # и падал бы NameError при вызове из любой другой точки входа.
+      day_interval = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
+      resp = fetch_candles(client, figi: figi, from: days_ago(days * 2), to: now_utc, interval: day_interval)
       return [] unless resp&.candles
 
       completed_daily_candles(resp.candles, now: now_utc)
