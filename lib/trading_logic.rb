@@ -16,12 +16,16 @@ module TradingLogic
 
     DAY = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
     MIN_5 = ::Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_5_MIN
+    # Временный fail-closed порог, пока линейная модель rvol не заменена типовой
+    # внутридневной кривой объёма.
+    MIN_SESSION_FRACTION = 0.15
     DEFAULT_OPTIONS = {
       max_lot_rub: 500.0,
       max_lot_count: nil,
       lots_per_order: 1,
       dip_pct: 0.01,
       min_relative_volume: nil,
+      min_rvol_session_fraction: MIN_SESSION_FRACTION,
       volume_lookback_days: 20,
       volume_compare_mode: 'none',
       telegram_bot_token: nil,
@@ -37,9 +41,7 @@ module TradingLogic
       up_entry_ma_days: 5
     }.freeze
 
-    # Нижняя граница доли сессии при нормировке rvol: до открытия торгов делить
-    # на ~0 нельзя, а объём там и так near-zero → rvol выйдет низким, что верно.
-    MIN_SESSION_FRACTION = 0.05
+    ARG_NOT_GIVEN = Object.new.freeze
 
     TECHNICAL_ERROR_PATTERNS = [
       /deadline/i,
@@ -62,6 +64,11 @@ module TradingLogic
       @lots_per_order = settings[:lots_per_order]
       @dip_pct = settings[:dip_pct]
       @min_relative_volume = settings[:min_relative_volume]
+      @min_rvol_session_fraction = settings[:min_rvol_session_fraction].to_f
+      unless @min_rvol_session_fraction.positive? && @min_rvol_session_fraction <= 1.0
+        raise ArgumentError, 'min_rvol_session_fraction must be > 0 and <= 1'
+      end
+
       @volume_lookback_days = settings[:volume_lookback_days]
       @volume_compare_mode = settings[:volume_compare_mode]
       @telegram = TelegramConfirm.new(
@@ -80,6 +87,7 @@ module TradingLogic
       @up_entry_ma_days = settings[:up_entry_ma_days]
       @levels_cache = {}
       @volume_stats_cache = {}
+      @intraday_price_stats_cache = {}
     end
 
     def refresh_market_cache(force: false)
@@ -112,14 +120,30 @@ module TradingLogic
       Utils.q_to_decimal(candles[-2].close)
     end
 
-    # Сегодняшний intraday максимум по 5-мин свечам
-    def today_high(figi)
+    # Сегодняшний intraday максимум и приближённый сессионный VWAP по одному
+    # снимку 5-минутных свечей. Кеш не переживает запуск процесса.
+    def intraday_price_stats(figi)
+      return @intraday_price_stats_cache[figi] if @intraday_price_stats_cache.key?(figi)
+
       from = Utils.today_utc_start
       resp = Utils.fetch_candles(@client, figi: figi, from: from, to: Utils.now_utc, interval: MIN_5)
-      highs = resp&.candles ? resp.candles.map { |c| Utils.q_to_decimal(c.high) }.compact : []
-      return nil if highs.empty?
+      candles = resp&.candles || []
+      highs = candles.filter_map { |c| Utils.q_to_decimal(c.high) }
+      weighted = candles.filter_map do |c|
+        close = Utils.q_to_decimal(c.close) if c.respond_to?(:close)
+        volume = c.volume.to_f if c.respond_to?(:volume)
+        [close, volume] if close && volume&.positive?
+      end
+      volume = weighted.sum { |(_close, candle_volume)| candle_volume }
 
-      highs.max
+      @intraday_price_stats_cache[figi] = {
+        high: highs.max,
+        vwap: volume.positive? ? weighted.sum { |close, candle_volume| close * candle_volume } / volume : nil
+      }
+    end
+
+    def today_high(figi)
+      intraday_price_stats(figi)[:high]
     end
 
     # Оценка относительного дневного объёма:
@@ -176,11 +200,17 @@ module TradingLogic
 
       raw = current / avg
       fraction = elapsed_day_fraction(candles[-1])
+      completed_closes = Utils.completed_daily_candles(candles)
+                              .filter_map { |c| Utils.q_to_decimal(c.close) if c.respond_to?(:close) }
+      has_ma_history = completed_closes.size >= @up_entry_ma_days
+      moving_average = completed_closes.last(@up_entry_ma_days).sum / @up_entry_ma_days if has_ma_history
       {
         raw: raw,
-        normalized: raw / [fraction, MIN_SESSION_FRACTION].max,
+        normalized: raw / [fraction, @min_rvol_session_fraction].max,
         session_fraction: fraction.round(3),
-        reliable: fraction >= MIN_SESSION_FRACTION
+        reliable: fraction >= @min_rvol_session_fraction,
+        prev_close: completed_closes.last,
+        moving_average: moving_average
       }
     end
 
@@ -232,9 +262,12 @@ module TradingLogic
       price <= day_high * (1.0 - @dip_pct)
     end
 
-    # Снимок передан вызывающим — считаем по нему; иначе запрашиваем сами.
-    def dip_for(it, price: nil, high: nil)
-      return dip_today?(it[:figi]) unless price && high
+    # Снимок передан вызывающим — считаем только по нему. Явно переданный неполный
+    # снимок fail-closed; самостоятельный запрос допустим лишь когда аргументов нет.
+    def dip_for(it, price: ARG_NOT_GIVEN, high: ARG_NOT_GIVEN)
+      snapshot_supplied = !price.equal?(ARG_NOT_GIVEN) || !high.equal?(ARG_NOT_GIVEN)
+      return dip_today?(it[:figi]) unless snapshot_supplied
+      return false if price.equal?(ARG_NOT_GIVEN) || high.equal?(ARG_NOT_GIVEN) || price.nil? || high.nil?
 
       dip?(price, high)
     end
@@ -346,17 +379,35 @@ module TradingLogic
     # price/high — снимок, по которому вызывающий уже работает. Передаём его внутрь,
     # чтобы (а) не запрашивать те же цену и максимум повторно и (б) решение и цена
     # лимитной заявки считались по одним и тем же числам, а не по двум разным снимкам.
-    def buy_gate(it, trend: :side, price: nil, high: nil)
+    def buy_gate(it, trend: :side, price: ARG_NOT_GIVEN, high: ARG_NOT_GIVEN,
+                 session_vwap: ARG_NOT_GIVEN)
       stats = daily_volume_stats(it[:figi])
+      metric_price = price.equal?(ARG_NOT_GIVEN) ? it[:price] : price
+      dip = dip_for(it, price: price, high: high)
+      stretch = entry_stretch_metrics(it[:figi], price: metric_price, session_vwap: session_vwap, stats: stats)
       gate = {
-        dip: dip_for(it, price: price, high: high),
+        dip: dip,
         rvol: stats && stats[:normalized].round(2),
         rvol_raw: stats && stats[:raw].round(2),
         session: stats && stats[:session_fraction],
-        volume_ok: volume_spike?(it[:figi])
-      }
-      gate[:should_buy] = gate[:dip] && gate[:volume_ok] && up_entry_gate(gate, it, trend)
+        volume_ok: volume_ok?(stats)
+      }.merge(stretch)
+      gate[:should_buy] = gate[:dip] && gate[:volume_ok] && up_entry_gate(gate, it, trend, price: metric_price)
       gate
+    end
+
+    def entry_stretch_metrics(figi, price:, session_vwap: ARG_NOT_GIVEN, stats: nil)
+      stats ||= daily_volume_stats(figi)
+      vwap = if session_vwap.equal?(ARG_NOT_GIVEN)
+               @intraday_price_stats_cache.dig(figi, :vwap)
+             else
+               session_vwap
+             end
+      {
+        distance_to_ma: relative_distance(price, stats && stats[:moving_average]),
+        gap_from_prev_close: relative_distance(price, stats && stats[:prev_close]),
+        distance_to_vwap: relative_distance(price, vwap)
+      }
     end
 
     # Гейт входа в растущем тренде. Применяется только при trend=:up и включённых
@@ -367,17 +418,27 @@ module TradingLogic
     # читалось как «покупаем только после обвала» и блокировало ~все входы.
     # Трендовая замена: бумага участвует в росте (выше своей SMA) и не упирается
     # в сопротивление. UP_REQUIRE_SUPPORT=1 возвращает прежнее поведение.
-    def up_entry_gate(gate, it, trend)
+    def up_entry_gate(gate, it, trend, price: it[:price])
       return true unless @use_levels && trend == :up
       return true if levels_for(it[:figi]).empty?
 
       if @up_require_support
-        gate[:near_support] = near_support?(it[:figi], it[:price])
+        gate[:near_support] = near_support?(it[:figi], price)
       else
-        gate[:near_resistance] = near_resistance?(it[:figi], it[:price])
-        gate[:above_ma] = above_moving_average?(it[:figi], it[:price])
+        gate[:near_resistance] = near_resistance?(it[:figi], price)
+        gate[:above_ma] = if gate[:distance_to_ma].nil?
+                            above_moving_average?(it[:figi], price)
+                          else
+                            gate[:distance_to_ma].positive?
+                          end
         !gate[:near_resistance] && gate[:above_ma]
       end
+    end
+
+    def relative_distance(price, reference)
+      return nil unless price && reference&.positive?
+
+      ((price / reference) - 1.0).round(4)
     end
 
     # Цена выше простой скользящей по завершённым дневным закрытиям.

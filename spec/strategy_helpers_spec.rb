@@ -12,6 +12,14 @@ RSpec.describe TradingLogic::StrategyHelpers do
     OpenStruct.new(units: units, nano: nano)
   end
 
+  def positions_snapshot(rub:, blocked: 0, loading: false)
+    OpenStruct.new(
+      money: [OpenStruct.new(currency: 'rub', units: rub, nano: 0)],
+      blocked: [OpenStruct.new(currency: 'rub', units: blocked, nano: 0)],
+      limits_loading_in_progress: loading
+    )
+  end
+
   def write_cache(rows)
     f = Tempfile.new(['cache', '.json'])
     # updated_at свежий — иначе срабатывает защита от протухших кешей.
@@ -76,14 +84,45 @@ RSpec.describe TradingLogic::StrategyHelpers do
     allow(client).to receive(:grpc_instruments).and_return(instruments)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: market_candles))
     allow(operations).to receive(:portfolio).and_return(
-      OpenStruct.new(total_amount_shares: q(10_000), positions: [])
+      OpenStruct.new(total_amount_shares: q(10_000), total_amount_currencies: q(10_000), positions: [])
     )
+    allow(client).to receive(:positions).and_return(positions_snapshot(rub: 10_000))
     # По умолчанию тикер X резолвится в торгуемую акцию с figi "F_X".
     allow(instruments).to receive(:share_by_ticker) do |ticker:, **_|
       OpenStruct.new(instrument: tradable_share(figi: "F_#{ticker}"))
     end
 
     [client, market_data, operations, instruments]
+  end
+
+  it 'loads a failed portfolio preflight only once for all intersection candidates' do
+    tickers = %w[AAA BBB CCC]
+    market_cache = write_cache(tickers.map { |ticker| { 'ticker' => ticker } })
+    index_cache = write_cache(tickers.map { |ticker| { 'ticker' => ticker } })
+    client, _market_data, operations, = build_buy_flow_client(market_candles: rising_daily_candles)
+    expect(operations).to receive(:portfolio).once.and_raise(StandardError, 'portfolio unavailable')
+    expect(client).not_to receive(:positions)
+
+    logic = double('logic')
+    allow(logic).to receive(:last_price_for).and_return(100.0)
+    allow(logic).to receive(:dip_today?).and_return(true)
+    expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+    result = described_class.buy_one_momentum_from_intersection!(
+      client,
+      logic,
+      described_class.default_state,
+      market_cache_path: market_cache.path,
+      moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0,
+      lots_per_order: 1,
+      account_id: 'acc'
+    )
+
+    expect(result).to be false
+  ensure
+    market_cache&.close!
+    index_cache&.close!
   end
 
   it 'tracks pending BUY without last_buy mark when category is sent_not_filled' do
@@ -113,8 +152,9 @@ RSpec.describe TradingLogic::StrategyHelpers do
     operations = double('operations')
     allow(client).to receive(:grpc_operations).and_return(operations)
     allow(operations).to receive(:portfolio).and_return(
-      OpenStruct.new(total_amount_shares: q(10_000), positions: [])
+      OpenStruct.new(total_amount_shares: q(10_000), total_amount_currencies: q(10_000), positions: [])
     )
+    allow(client).to receive(:positions).and_return(positions_snapshot(rub: 10_000))
 
     logic = double('logic')
     allow(logic).to receive(:last_price_for).and_return(100.0)
@@ -175,8 +215,9 @@ RSpec.describe TradingLogic::StrategyHelpers do
     operations = double('operations')
     allow(client).to receive(:grpc_operations).and_return(operations)
     allow(operations).to receive(:portfolio).and_return(
-      OpenStruct.new(total_amount_shares: q(10_000), positions: [])
+      OpenStruct.new(total_amount_shares: q(10_000), total_amount_currencies: q(10_000), positions: [])
     )
+    allow(client).to receive(:positions).and_return(positions_snapshot(rub: 10_000))
 
     logic = double('logic')
     allow(logic).to receive(:last_price_for).and_return(100.0)
@@ -268,8 +309,9 @@ RSpec.describe TradingLogic::StrategyHelpers do
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
     stub_share(instruments, 'AAA', figi: 'F_AAA')
     allow(operations).to receive(:portfolio).and_return(
-      OpenStruct.new(total_amount_shares: q(10_000), positions: [])
+      OpenStruct.new(total_amount_shares: q(10_000), total_amount_currencies: q(10_000), positions: [])
     )
+    allow(client).to receive(:positions).and_return(positions_snapshot(rub: 10_000))
 
     logic = double('logic')
     allow(logic).to receive(:last_price_for).with('F_AAA').and_return(100.0)
@@ -1185,7 +1227,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
   describe '.position_within_limit?' do
     def make_portfolio(total_shares:, positions: [])
-      OpenStruct.new(total_amount_shares: q(total_shares), positions: positions)
+      OpenStruct.new(total_amount_shares: q(total_shares), total_amount_currencies: q(10_000), positions: positions)
     end
 
     def make_position(figi:, qty:, avg_price:, current_price: nil)
@@ -1371,6 +1413,62 @@ RSpec.describe TradingLogic::StrategyHelpers do
       port = portfolio_with_cash(shares: 0, cash: 0)
       expect(
         described_class.shares_share_within_limit?(nil, nil, portfolio: port, planned_buy_value: 100, max_share: 0.7)
+      ).to be false
+    end
+  end
+
+  describe '.cash_sufficient_for_buy?' do
+    it 'allows a buy only when available RUB covers the order and commission buffer' do
+      positions = positions_snapshot(rub: 1_000)
+
+      expect(
+        described_class.cash_sufficient_for_buy?(
+          nil, nil, positions: positions, planned_buy_value: 990, buffer_rate: 0.01
+        )
+      ).to be true
+      expect(
+        described_class.cash_sufficient_for_buy?(
+          nil, nil, positions: positions, planned_buy_value: 995, buffer_rate: 0.01
+        )
+      ).to be false
+    end
+
+    it 'does not count foreign currency or RUB blocked by pending orders' do
+      positions = positions_snapshot(rub: 1_000, blocked: 300)
+      positions.money << OpenStruct.new(currency: 'usd', units: 100, nano: 0)
+
+      expect(
+        described_class.cash_sufficient_for_buy?(
+          nil, nil, positions: positions, planned_buy_value: 700, buffer_rate: 0
+        )
+      ).to be true
+      expect(
+        described_class.cash_sufficient_for_buy?(
+          nil, nil, positions: positions, planned_buy_value: 701, buffer_rate: 0
+        )
+      ).to be false
+    end
+
+    it 'parses the literal payload shape returned by the live REST GetPositions client' do
+      positions = {
+        'money' => [
+          { 'currency' => 'rub', 'units' => '188', 'nano' => 350_000_000 },
+          { 'currency' => 'usd', 'units' => '0', 'nano' => 100_000_000 }
+        ],
+        'blocked' => [],
+        'limitsLoadingInProgress' => false
+      }
+
+      expect(described_class.available_currency_amount(positions, currency: 'rub')).to eq(188.35)
+    end
+
+    it 'fails closed while position limits are loading' do
+      positions = positions_snapshot(rub: 1_000, loading: true)
+
+      expect(
+        described_class.cash_sufficient_for_buy?(
+          nil, nil, positions: positions, planned_buy_value: 100, buffer_rate: 0
+        )
       ).to be false
     end
   end

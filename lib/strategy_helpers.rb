@@ -149,12 +149,14 @@ module TradingLogic
 
       return false if inter.empty?
 
+      preflight = {}
       candidates = inter.filter_map do |ticker|
         build_intersection_candidate(
           client, logic, state, ticker,
           max_lot_rub: max_lot_rub,
           account_id: account_id,
           lots_per_order: lots_per_order,
+          preflight: preflight,
           logger: logger
         )
       end
@@ -177,7 +179,7 @@ module TradingLogic
     end
 
     def build_intersection_candidate(client, logic, state, ticker, max_lot_rub:, account_id:, lots_per_order:,
-                                     logger: nil)
+                                     preflight: {}, logger: nil)
       logger&.debug("processing candidate #{ticker}")
       return nil if buy_already_processed_today?(state, ticker)
 
@@ -209,6 +211,7 @@ module TradingLogic
         logger&.debug("skip #{ticker} — momentum OK but no intraday dip")
         return nil
       end
+      logger&.debug("#{ticker} entry_stretch=#{logic.entry_stretch_metrics(figi, price: price).inspect}")
 
       if pending_order_active?(state, ticker)
         logger&.debug("BUY skipped for #{ticker} — active pending order cooldown")
@@ -216,7 +219,13 @@ module TradingLogic
       end
 
       buy_value = price * lot * lots_per_order
-      unless position_within_limit?(client, account_id, figi, planned_buy_value: buy_value, logger: logger)
+      preflight[:portfolio] = load_portfolio_snapshot(client, account_id, logger: logger) unless preflight.key?(:portfolio)
+      portfolio = preflight[:portfolio]
+      return nil unless portfolio
+
+      unless position_within_limit?(
+        client, account_id, figi, planned_buy_value: buy_value, portfolio: portfolio, logger: logger
+      )
         logger&.debug("BUY skipped for #{ticker} — position share limit reached")
         return nil
       end
@@ -226,8 +235,20 @@ module TradingLogic
         return nil
       end
 
-      unless shares_share_within_limit?(client, account_id, planned_buy_value: buy_value, logger: logger)
-        logger&.debug("BUY skipped for #{ticker} — cash reserve guard")
+      preflight[:positions] = load_positions_snapshot(client, account_id, logger: logger) unless preflight.key?(:positions)
+      return nil unless preflight[:positions]
+
+      unless cash_sufficient_for_buy?(
+        client, account_id, planned_buy_value: buy_value, positions: preflight[:positions], logger: logger
+      )
+        logger&.debug("BUY skipped for #{ticker} — insufficient cash")
+        return nil
+      end
+
+      unless shares_share_within_limit?(
+        client, account_id, planned_buy_value: buy_value, portfolio: portfolio, logger: logger
+      )
+        logger&.debug("BUY skipped for #{ticker} — shares exposure guard")
         return nil
       end
 
@@ -235,6 +256,33 @@ module TradingLogic
       logger&.debug("#{ticker} support_distance=#{support_distance.round(4)}")
 
       { tk: ticker, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order, support_distance: support_distance }
+    end
+
+    def load_portfolio_snapshot(client, account_id, logger: nil)
+      client.grpc_operations.portfolio(account_id: account_id)
+    rescue StandardError => e
+      logger&.error(
+        'BUY HALTED: GetPortfolio preflight unavailable ' \
+        "(#{e.class}: #{e.message}) — all BUYs blocked for this run"
+      )
+      nil
+    end
+
+    # REST-клиент библиотеки уже предоставляет GetPositions, тогда как её текущая
+    # gRPC-обёртка этого метода не содержит. Ответ нужен для RUB и blocked отдельно.
+    def load_positions_snapshot(client, account_id, logger: nil)
+      response = client.positions(account_id: account_id)
+      if response.respond_to?(:success?) && !response.success?
+        raise "GetPositions returned HTTP #{response.respond_to?(:http_code) ? response.http_code : 'error'}"
+      end
+
+      response.respond_to?(:payload) ? response.payload : response
+    rescue StandardError => e
+      logger&.error(
+        'BUY HALTED: GetPositions cash preflight unavailable ' \
+        "(#{e.class}: #{e.message}) — all BUYs blocked for this run"
+      )
+      nil
     end
 
     def buy_already_processed_today?(state, ticker)
@@ -631,6 +679,59 @@ module TradingLogic
       false
     end
 
+    # Preflight доступности денег для конкретной BUY-заявки. Это не целевой
+    # MIN_CASH_SHARE: после покупки кэш может стать почти нулевым, но заведомо
+    # неисполнимая заявка до брокера не дойдёт.
+    def cash_sufficient_for_buy?(_client, _account_id, planned_buy_value:, positions:, buffer_rate: nil,
+                                 logger: nil)
+      buffer_rate = (buffer_rate || ENV['BUY_CASH_BUFFER_RATE'] || '0.01').to_f
+      buffer_rate = 0.0 if buffer_rate.negative?
+      cash = available_currency_amount(positions, currency: 'rub')
+      planned = planned_buy_value.to_f
+      required = planned * (1.0 + buffer_rate)
+      return true if planned.positive? && cash >= required
+
+      logger&.info(
+        "insufficient cash: available=#{cash.round(2)} required=#{required.round(2)} " \
+        "planned=#{planned.round(2)} buffer=#{(buffer_rate * 100).round(2)}% — BUY blocked"
+      )
+      false
+    rescue StandardError => e
+      logger&.warn("cash preflight failed (#{e.class}: #{e.message}) — BUY blocked (fail-closed)")
+      false
+    end
+
+    def available_currency_amount(positions, currency:)
+      raise 'positions snapshot missing' unless positions
+      raise 'positions limits are still loading' if structured_value(positions, :limits_loading_in_progress,
+                                                                     :limitsLoadingInProgress)
+
+      money = currency_amount(structured_value(positions, :money), currency)
+      blocked = currency_amount(structured_value(positions, :blocked), currency)
+      [money - blocked, 0.0].max
+    end
+
+    def currency_amount(values, currency)
+      Array(values).sum do |value|
+        next 0.0 unless structured_value(value, :currency).to_s.casecmp?(currency.to_s)
+
+        units = structured_value(value, :units).to_f
+        nano = structured_value(value, :nano).to_f
+        units + (nano / 1_000_000_000.0)
+      end
+    end
+
+    def structured_value(object, *names)
+      names.each do |name|
+        return object.public_send(name) if object.respond_to?(name)
+        return object[name] if object.is_a?(Hash) && object.key?(name)
+
+        string_name = name.to_s
+        return object[string_name] if object.is_a?(Hash) && object.key?(string_name)
+      end
+      nil
+    end
+
     # Потолок суммарной доли акций в счёте (в отличие от MAX_POSITION_SHARE, который
     # ограничивает только одну бумагу).
     def shares_share_within_limit?(client, account_id, planned_buy_value: 0, portfolio: nil, max_share: nil,
@@ -642,7 +743,7 @@ module TradingLogic
       shares = Utils.q_to_decimal(port.total_amount_shares).to_f
       total = portfolio_total_amount(port)
       unless total.positive?
-        logger&.warn('cash reserve guard: portfolio total is non-positive — BUY blocked (fail-closed)')
+        logger&.warn('shares exposure guard: portfolio total is non-positive — BUY blocked (fail-closed)')
         return false
       end
 
@@ -650,7 +751,7 @@ module TradingLogic
       return true if share <= max_share
 
       logger&.info(
-        "cash reserve guard: post-trade shares share=#{(share * 100).round(1)}% " \
+        "shares exposure guard: post-trade shares share=#{(share * 100).round(1)}% " \
         "> MAX_SHARES_SHARE=#{(max_share * 100).round(1)}%"
       )
       false
@@ -658,7 +759,7 @@ module TradingLogic
       # Fail-closed, в отличие от соседнего position_within_limit?: это лимит на общий
       # риск счёта, и «не смогли посчитать» не должно молча означать «разрешено».
       # Счёт боевой, ордера уходят без подтверждения.
-      logger&.warn("cash reserve guard: check failed (#{e.class}: #{e.message}) — BUY blocked (fail-closed)")
+      logger&.warn("shares exposure guard: check failed (#{e.class}: #{e.message}) — BUY blocked (fail-closed)")
       false
     end
 

@@ -111,6 +111,19 @@ RSpec.describe TradingLogic::Runner do
       allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: []))
       expect(subject.dip_today?('FIGI')).to be false
     end
+
+    it 'fails closed instead of refetching when an explicit snapshot is incomplete' do
+      expect(subject).not_to receive(:dip_today?)
+
+      expect(subject.dip_for({ figi: 'FIGI' }, price: 99, high: nil)).to be false
+      expect(subject.dip_for({ figi: 'FIGI' }, price: nil, high: 100)).to be false
+    end
+
+    it 'fetches its own dip snapshot only when no snapshot arguments were supplied' do
+      expect(subject).to receive(:dip_today?).with('FIGI').and_return(true)
+
+      expect(subject.dip_for({ figi: 'FIGI' })).to be true
+    end
   end
 
   describe 'selling helpers' do
@@ -642,6 +655,12 @@ RSpec.describe TradingLogic::Runner do
         described_class.new(client, tickers: %w[SBER], level_proximity_pct: -0.01)
       end.to raise_error(ArgumentError, /level_proximity_pct must be > 0/)
     end
+
+    it 'rejects a zero rvol session fraction instead of allowing division by zero' do
+      expect do
+        described_class.new(client, tickers: %w[SBER], min_rvol_session_fraction: 0)
+      end.to raise_error(ArgumentError, /min_rvol_session_fraction must be > 0 and <= 1/)
+    end
   end
 
   describe 'volume-aware buy filters' do
@@ -712,8 +731,54 @@ RSpec.describe TradingLogic::Runner do
       expect(stats[:raw]).to be_within(0.001).of(0.2)
       expect(stats[:reliable]).to be false
       # без пола нормализация дала бы ~30 — «всплеск объёма» на ровном месте
-      expect(stats[:normalized]).to be_within(0.001).of(0.2 / 0.05)
+      expect(stats[:normalized]).to be_within(0.001).of(0.2 / 0.15)
       expect(runner.volume_spike?('F1')).to be false
+    end
+
+    it 'keeps rvol blocked after the old 5% threshold and until 15% of the session' do
+      runner = described_class.new(client, tickers: %w[SBER], min_relative_volume: 0.8)
+
+      expect(runner.volume_ok?({ normalized: 4.31, reliable: false })).to be false
+      expect(runner.volume_ok?({ normalized: 0.81, reliable: true })).to be true
+    end
+
+    it 'logs entry stretch distances from the same daily and intraday snapshots' do
+      runner = described_class.new(client, tickers: %w[SBER])
+      allow(runner).to receive(:daily_volume_stats).and_return(
+        {
+          raw: 0.5, normalized: 1.0, session_fraction: 0.5, reliable: true,
+          prev_close: 95.0, moving_average: 90.0
+        }
+      )
+
+      gate = runner.buy_gate(
+        { figi: 'F1', price: 100.0 }, price: 100.0, high: 102.0, session_vwap: 98.0
+      )
+
+      expect(gate).to include(
+        distance_to_ma: 0.1111,
+        gap_from_prev_close: 0.0526,
+        distance_to_vwap: 0.0204
+      )
+    end
+
+    it 'collects VWAP after dip_for fills the intraday cache on the fallback path' do
+      runner = described_class.new(client, tickers: %w[SBER], use_levels: false)
+      allow(runner).to receive(:daily_volume_stats).and_return(
+        { raw: 0.5, normalized: 1.0, session_fraction: 0.5, reliable: true }
+      )
+      allow(market_data).to receive(:last_prices).and_return(
+        OpenStruct.new(last_prices: [OpenStruct.new(price: q(99))])
+      )
+      allow(TradingLogic::Utils).to receive(:fetch_candles).and_return(
+        OpenStruct.new(
+          candles: [OpenStruct.new(high: q(100), close: q(98), volume: 10)]
+        )
+      )
+
+      gate = runner.buy_gate({ figi: 'F1', price: 99.0 })
+
+      expect(gate[:distance_to_vwap]).to eq(0.0102)
     end
 
     it 'does not normalize a finished day' do

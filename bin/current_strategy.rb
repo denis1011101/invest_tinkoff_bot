@@ -16,8 +16,8 @@ log_level = Logger.const_defined?(log_level_name) ? Logger.const_get(log_level_n
 
 LOGGER = Logger.new($stdout)
 LOGGER.level = log_level
-LOGGER.formatter = proc do |severity, _datetime, _progname, message|
-  "#{severity}: #{message}\n"
+LOGGER.formatter = proc do |severity, datetime, _progname, message|
+  "#{datetime.utc.iso8601} #{severity}: #{message}\n"
 end
 
 token = ENV['TINKOFF_TOKEN'] || abort('Set TINKOFF_TOKEN')
@@ -38,6 +38,12 @@ MAX_LOT_COUNT = (ENV['MAX_LOT_COUNT'] || '0').to_i
 LOTS_PER_ORDER = (ENV['LOTS_PER_ORDER'] || '2').to_i
 DIP_PCT = (ENV['DIP_PCT'] || '0.01').to_f
 MIN_RELATIVE_VOLUME = ENV['MIN_RELATIVE_VOLUME']&.to_f
+min_rvol_session_fraction = ENV.fetch('MIN_RVOL_SESSION_FRACTION', '').strip
+MIN_RVOL_SESSION_FRACTION = if min_rvol_session_fraction.empty?
+                              TradingLogic::Runner::MIN_SESSION_FRACTION
+                            else
+                              min_rvol_session_fraction.to_f
+                            end
 VOLUME_LOOKBACK_DAYS = (ENV['VOLUME_LOOKBACK_DAYS'] || '20').to_i
 VOLUME_COMPARE_MODE = (ENV['VOLUME_COMPARE_MODE'] || 'none').strip
 DAY = Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
@@ -64,6 +70,7 @@ logic = TradingLogic::Runner.new(
   lots_per_order: LOTS_PER_ORDER,
   dip_pct: DIP_PCT,
   min_relative_volume: MIN_RELATIVE_VOLUME,
+  min_rvol_session_fraction: MIN_RVOL_SESSION_FRACTION,
   volume_lookback_days: VOLUME_LOOKBACK_DAYS,
   volume_compare_mode: VOLUME_COMPARE_MODE,
   telegram_bot_token: ENV.fetch('TELEGRAM_BOT_TOKEN', nil),
@@ -160,28 +167,36 @@ begin
   case trend
   when :up
     LOGGER.info('Trend: UP — intraday dip BUY (max once per ticker per day)')
-    up_portfolio = client.grpc_operations.portfolio(account_id: account_id)
+    up_portfolio = TradingLogic::StrategyHelpers.load_portfolio_snapshot(client, account_id, logger: LOGGER)
     # Портфель читается один раз за проход, поэтому лимиты доли акций сами по себе не
     # увидят предыдущие заявки этого же прохода. Накапливаем занятые рубли вручную.
     run_committed = 0.0
+    up_positions = nil
+    up_positions_loaded = false
     universe.each do |it| # rubocop:disable Metrics/BlockLength
       next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
       next if TradingLogic::StrategyHelpers.pending_order_active?(state, it[:ticker])
 
       cur = logic.last_price_for(it[:figi])
-      today_high = begin
-        logic.today_high(it[:figi])
+      intraday = begin
+        logic.intraday_price_stats(it[:figi])
       rescue StandardError
-        nil
+        {}
       end
+      today_high = intraday[:high]
       dip_thr = today_high ? (today_high * (1.0 - DIP_PCT)) : nil
       it_live = cur ? it.merge(price: cur) : it
       # buy_gate считает все подусловия за один проход по API и заодно даёт shadow-лог:
       # видно, какой именно гейт отсёк кандидата. Цену и максимум передаём внутрь —
       # решение и цена лимитной заявки должны считаться по одному снимку.
-      gate = logic.buy_gate(it_live, trend: trend, price: cur, high: today_high)
+      gate = logic.buy_gate(
+        it_live, trend: trend, price: cur, high: today_high, session_vwap: intraday[:vwap]
+      )
       LOGGER.debug("#{it[:ticker]} cur=#{cur.inspect} today_high=#{today_high.inspect} " \
                    "dip_threshold=#{dip_thr.inspect} gate=#{gate.inspect}")
+      # При аварии портфельного API сохраняем полную диагностику сигналов, но
+      # fail-closed блокируем любые действия и портфельные гейты.
+      next unless up_portfolio
       next unless gate[:should_buy]
 
       buy_value = (cur || it[:price]) * it[:lot] * LOTS_PER_ORDER
@@ -200,6 +215,19 @@ begin
                     "value=#{buy_value.round(2)} gate=#{gate.inspect}")
         next
       end
+
+      unless up_positions_loaded
+        up_positions = TradingLogic::StrategyHelpers.load_positions_snapshot(
+          client, account_id, logger: LOGGER
+        )
+        up_positions_loaded = true
+      end
+      next unless up_positions
+
+      next unless TradingLogic::StrategyHelpers.cash_sufficient_for_buy?(
+        client, account_id,
+        planned_buy_value: buy_value + run_committed, positions: up_positions, logger: LOGGER
+      )
 
       result = logic.confirm_and_place_order_with_result(
         account_id: account_id,
