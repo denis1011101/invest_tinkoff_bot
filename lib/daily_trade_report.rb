@@ -6,6 +6,9 @@ require 'fileutils'
 require 'net/http'
 require 'uri'
 require_relative 'utils'
+# StrategyHelpers использовался и раньше (build_figi_ticker_map), но подтягивался
+# только через точку входа — при загрузке одного daily_trade_report был NameError.
+require_relative 'strategy_helpers'
 
 module TradingLogic
   # Ежедневный Telegram-отчёт о реально исполненных сделках за rolling-24ч окно
@@ -62,10 +65,15 @@ module TradingLogic
       index = index_snapshot(day)
       # daily_yield брокер отдаёт только за текущий торговый день — для
       # исторического REPORT_DAY он не соответствует дате отчёта, поэтому не выводим.
-      portfolio = day == report_day(nil) ? portfolio_snapshot : { ok: false, reason: :historical }
-      text = format_message(day, aggregates, index, portfolio, trades)
+      # Баланс всегда «на сейчас», поэтому в исторический отчёт он не идёт — иначе
+      # текущий кэш читался бы как остаток на отчётную дату.
+      current = day == report_day(nil)
+      portfolio = current ? portfolio_snapshot : { ok: false, reason: :historical }
+      balance = current ? balance_snapshot : { ok: false, reason: :historical }
+      text = format_message(day, aggregates, index, portfolio, balance, trades)
       { day: day.iso8601, text: text, aggregates: aggregates, index: index, portfolio: portfolio,
-        window_from: from_utc.iso8601, window_to: to_utc.iso8601, trades: structured_trades(trades) }
+        balance: balance, window_from: from_utc.iso8601, window_to: to_utc.iso8601,
+        trades: structured_trades(trades) }
     end
 
     # Окно ещё не закрылось (текущий день до cutoff) или дата в будущем — реальную
@@ -246,16 +254,69 @@ module TradingLogic
 
     # -- портфель (весь, вкл. старые позиции) -----------------------------------
 
+    # Один GetPortfolio на отчёт: его читают и portfolio_snapshot (daily_yield),
+    # и balance_snapshot (итоговые суммы).
+    def broker_portfolio
+      return @broker_portfolio if defined?(@broker_portfolio)
+
+      @broker_portfolio = @client.grpc_operations.portfolio(account_id: account_id)
+    rescue StandardError => e
+      @logger&.warn("portfolio fetch failed: #{e.class}: #{e.message}")
+      @broker_portfolio = nil
+    end
+
     def portfolio_snapshot
-      port = @client.grpc_operations.portfolio(account_id: account_id)
+      port = broker_portfolio
+      return { ok: false } unless port
+
       yield_abs = port.respond_to?(:daily_yield) ? Utils.q_to_decimal(port.daily_yield) : nil
       yield_rel = port.respond_to?(:daily_yield_relative) ? Utils.q_to_decimal(port.daily_yield_relative) : nil
       return { ok: false } if yield_abs.nil? && yield_rel.nil?
 
       { ok: true, daily_yield: yield_abs&.round(2), daily_yield_relative: yield_rel&.round(2) }
+    end
+
+    # Свободные рубли берём из GetPositions (money минус blocked), как в
+    # cash-preflight стратегии: GetPortfolio отдаёт только суммарные деньги и
+    # не показывает, сколько из них зажато под активными заявками.
+    def balance_snapshot
+      positions = positions_snapshot
+      port = broker_portfolio
+      return { ok: false } unless positions || port
+
+      snapshot = { ok: true }
+      if positions
+        snapshot[:free_rub] = StrategyHelpers.available_currency_amount(positions, currency: 'rub').round(2)
+        snapshot[:blocked_rub] = StrategyHelpers.currency_amount(
+          StrategyHelpers.structured_value(positions, :blocked), 'rub'
+        ).round(2)
+      end
+      snapshot.merge!(portfolio_totals(port)) if port
+      snapshot
     rescue StandardError => e
-      @logger&.warn("portfolio snapshot failed: #{e.class}: #{e.message}")
+      @logger&.warn("balance snapshot failed: #{e.class}: #{e.message}")
       { ok: false }
+    end
+
+    def positions_snapshot
+      response = @client.positions(account_id: account_id)
+      if response.respond_to?(:success?) && !response.success?
+        raise(BrokerError, "GetPositions returned HTTP #{response.respond_to?(:http_code) ? response.http_code : '?'}")
+      end
+
+      response.respond_to?(:payload) ? response.payload : response
+    rescue StandardError => e
+      @logger&.warn("positions snapshot failed: #{e.class}: #{e.message}")
+      nil
+    end
+
+    def portfolio_totals(port)
+      {
+        total: Utils.q_to_decimal(port.total_amount_portfolio)&.round(2),
+        shares: Utils.q_to_decimal(port.total_amount_shares)&.round(2),
+        currencies: Utils.q_to_decimal(port.total_amount_currencies)&.round(2),
+        etf: Utils.q_to_decimal(port.total_amount_etf)&.round(2)
+      }.compact
     end
 
     # -- тикеры ------------------------------------------------------------------
@@ -285,7 +346,7 @@ module TradingLogic
 
     # -- форматирование (plain text, без Markdown) ------------------------------
 
-    def format_message(day, agg, index, portfolio, trades)
+    def format_message(day, agg, index, portfolio, balance, trades)
       lines = []
       lines << "📊 Торговый отчёт за #{day.strftime('%d.%m.%Y')}"
       lines << "Окно 24ч до #{@config.cutoff} #{@config.time_label}"
@@ -294,6 +355,7 @@ module TradingLogic
       lines << ''
       lines.concat(format_totals(agg))
       lines.concat(format_portfolio(portfolio))
+      lines.concat(format_balance(balance))
       lines << ''
       lines.concat(format_trades(trades))
       lines.join("\n")
@@ -337,6 +399,33 @@ module TradingLogic
       pct = rel ? " (#{signed_pct(rel)})" : ''
       ['', "Портфель (текущий торговый день брокера): #{abs ? "#{signed(abs)} ₽" : 'н/д'}#{pct}",
        'Включает изменение старых позиций.']
+    end
+
+    def format_balance(balance)
+      return [] unless balance[:ok]
+
+      lines = ['']
+      if balance[:free_rub]
+        blocked = balance[:blocked_rub].to_f
+        # Заблокированное показываем только когда оно есть: ежедневное «0 ₽» — шум.
+        suffix = blocked.positive? ? " (заблокировано #{fmt(blocked)} ₽)" : ''
+        lines << "💰 Свободно: #{fmt(balance[:free_rub])} ₽#{suffix}"
+      end
+      if balance[:total]
+        breakdown = portfolio_breakdown(balance)
+        total_line = "Портфель: #{fmt(balance[:total])} ₽"
+        total_line += " — #{breakdown}" unless breakdown.empty?
+        lines << total_line
+      end
+      lines.size > 1 ? lines : []
+    end
+
+    def portfolio_breakdown(balance)
+      parts = []
+      parts << "акции #{fmt(balance[:shares])}" if balance[:shares]
+      parts << "фонды #{fmt(balance[:etf])}" if balance[:etf]
+      parts << "деньги #{fmt(balance[:currencies])}" if balance[:currencies]
+      parts.join(' / ')
     end
 
     def format_trades(trades)

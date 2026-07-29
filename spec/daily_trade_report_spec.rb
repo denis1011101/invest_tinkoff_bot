@@ -35,6 +35,14 @@ RSpec.describe TradingLogic::DailyTradeReport do
   let(:instruments) { double('instruments') }
   let(:market_data) { double('market_data') }
   let(:users) { double('users') }
+  # GetPositions идёт REST-клиентом библиотеки: money/blocked отдельными списками.
+  let(:positions_payload) do
+    OpenStruct.new(
+      limitsLoadingInProgress: false,
+      money: [{ 'currency' => 'rub', 'units' => 2668, 'nano' => 510_000_000 }],
+      blocked: []
+    )
+  end
   # Отчёт за 2026-07-23, cutoff 21:00 +05:00 → окно [22.07 16:00 UTC, 23.07 16:00 UTC)
   let(:now) { Time.utc(2026, 7, 23, 16, 5) }
 
@@ -44,7 +52,12 @@ RSpec.describe TradingLogic::DailyTradeReport do
     allow(users).to receive(:accounts).and_return(OpenStruct.new(accounts: [OpenStruct.new(id: 'ACC')]))
     allow(instruments).to receive(:indicatives).and_return([OpenStruct.new(ticker: 'IMOEX', uid: 'IDX')])
     allow(instruments).to receive(:get_instrument_by).and_return(nil)
-    allow(operations).to receive(:portfolio).and_return(OpenStruct.new(daily_yield: q(-18.42), daily_yield_relative: q(-0.37)))
+    allow(operations).to receive(:portfolio).and_return(
+      OpenStruct.new(daily_yield: q(-18.42), daily_yield_relative: q(-0.37),
+                     total_amount_portfolio: q(23_751.78), total_amount_shares: q(18_617.74),
+                     total_amount_currencies: q(2676.45), total_amount_etf: q(2457.59))
+    )
+    allow(client).to receive(:positions).and_return(positions_payload)
     # индекс: предыдущее закрытие 22.07, текущее (неполное) 23.07
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: [
                                                                         candle(Time.utc(2026, 7, 22), close: 2121.76),
@@ -191,6 +204,48 @@ RSpec.describe TradingLogic::DailyTradeReport do
     report.build
     expect(captured[:from]).to eq(Time.utc(2026, 7, 22, 16, 0))
     expect(captured[:to]).to eq(Time.utc(2026, 7, 23, 16, 0))
+  end
+
+  describe 'balance block' do
+    # fmt группирует тысячи неразрывным пробелом, поэтому ожидания строим из него же.
+    let(:nbsp) { "\u00A0" }
+
+    before { allow(operations).to receive(:operations_by_cursor).and_return(page([])) }
+
+    it 'reports free rubles from GetPositions and portfolio totals' do
+      result = report.build
+      expect(result[:balance]).to include(ok: true, free_rub: 2668.51, total: 23_751.78)
+      expect(result[:text]).to include("💰 Свободно: 2#{nbsp}668.51 ₽")
+      expect(result[:text]).to include(
+        "Портфель: 23#{nbsp}751.78 ₽ — акции 18#{nbsp}617.74 / фонды 2#{nbsp}457.59 / деньги 2#{nbsp}676.45"
+      )
+    end
+
+    it 'subtracts blocked rubles and shows them only when present' do
+      positions_payload.blocked = [{ 'currency' => 'rub', 'units' => 600, 'nano' => 0 }]
+      result = report.build
+      expect(result[:balance][:free_rub]).to eq(2068.51)
+      expect(result[:text]).to include("💰 Свободно: 2#{nbsp}068.51 ₽ (заблокировано 600.00 ₽)")
+    end
+
+    it 'omits the zero-blocked suffix' do
+      expect(report.build[:text]).not_to include('заблокировано')
+    end
+
+    it 'still reports totals when GetPositions is unavailable' do
+      allow(client).to receive(:positions).and_raise(StandardError, 'boom')
+      result = report.build
+      expect(result[:balance]).not_to have_key(:free_rub)
+      expect(result[:text]).to include("Портфель: 23#{nbsp}751.78 ₽")
+      expect(result[:text]).not_to include('Свободно')
+    end
+
+    it 'omits the balance entirely for a historical report day' do
+      result = report.build('2026-07-21')
+      expect(result[:balance]).to eq({ ok: false, reason: :historical })
+      expect(result[:text]).not_to include('Свободно')
+      expect(result[:text]).not_to include('Портфель:')
+    end
   end
 end
 

@@ -7,6 +7,8 @@ require 'ostruct'
 # торговые ограничители в специях. Dotenv не перетирает уже заданные переменные,
 # поэтому заранее выключаем то, что иначе тихо блокирует покупки в тестах.
 %w[MAX_DAILY_BUY_RUB MAX_SHARES_SHARE].each { |key| ENV[key] ||= '0' }
+# То же и для правила momentum: специи описывают дефолт, а не то, что стоит в .env.
+ENV['MOMENTUM_RULE'] ||= 'strict3'
 
 # добавить lib в $LOAD_PATH, чтобы require_relative из spec не ломался
 $LOAD_PATH.unshift File.expand_path('..', __dir__) unless $LOAD_PATH.include?(File.expand_path('..', __dir__))

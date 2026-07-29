@@ -45,6 +45,9 @@ MIN_RVOL_SESSION_FRACTION = if min_rvol_session_fraction.empty?
                               min_rvol_session_fraction.to_f
                             end
 VOLUME_LOOKBACK_DAYS = (ENV['VOLUME_LOOKBACK_DAYS'] || '20').to_i
+# Активное правило momentum-входа (MOMENTUM_RULE). Резолвим один раз при старте,
+# чтобы неизвестное значение дало ровно одно предупреждение за прогон.
+MOMENTUM_RULE = TradingLogic::StrategyHelpers.momentum_rule(logger: LOGGER)
 VOLUME_COMPARE_MODE = (ENV['VOLUME_COMPARE_MODE'] || 'none').strip
 DAY = Tinkoff::Public::Invest::Api::Contract::V1::CandleInterval::CANDLE_INTERVAL_DAY
 
@@ -308,8 +311,8 @@ begin
     TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
       client, logic, account_id, state, figi_cache: figi_cache, trend: trend, logger: LOGGER
     )
-    # попытка одной покупки по сигналу "3 дневных закрытия вверх" из пересечения IMOEX∩market
-    LOGGER.info('DOWN: try momentum(3D up) BUY one per day from IMOEX∩market')
+    # попытка одной покупки по momentum-сигналу из пересечения IMOEX∩market
+    LOGGER.info("DOWN: try momentum(#{MOMENTUM_RULE}) BUY one per day from IMOEX∩market")
     bought = TradingLogic::StrategyHelpers.buy_one_momentum_from_intersection!(
       client, logic, state,
       market_cache_path: MARKET_CACHE_PATH,
@@ -330,7 +333,7 @@ begin
     )
 
   else
-    LOGGER.info('Trend: SIDE — SELL by same rules, and try momentum(3D up) BUY one per day')
+    LOGGER.info("Trend: SIDE — SELL by same rules, and try momentum(#{MOMENTUM_RULE}) BUY one per day")
     TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
       client, logic, account_id, state, figi_cache: figi_cache, trend: trend, logger: LOGGER
     )

@@ -304,18 +304,52 @@ module TradingLogic
       logger&.debug("#{ticker} closes_count=#{closes.size} completed=#{completed.size}/#{candles.size} sample_last=#{closes.last(5).inspect}")
 
       if closes.size < 4
-        logger&.debug("skip #{ticker} — not enough daily closes (need 4 for 3 consecutive increases)")
+        logger&.debug("skip #{ticker} — not enough daily closes (need 4 for a 3-change window)")
         return false
       end
 
       sequence = closes.last(4)
-      return true if sequence.each_cons(2).all? { |left, right| left < right }
-
-      logger&.debug("skip #{ticker} — not 3-day momentum (#{sequence.map { |value| value.round(2) }.inspect})")
-      false
+      verdicts = momentum_verdicts(sequence)
+      rule = momentum_rule(logger: logger)
+      # Shadow-лог: считаем ВСЕ варианты правила из тех же закрытий (ноль лишних
+      # вызовов API) и пишем одной разборной строкой. Решение принимает только
+      # активный rule; остальные копятся для сравнения на живых данных.
+      logger&.debug(
+        "momentum_shadow ticker=#{ticker} " \
+        "closes=#{sequence.map { |value| value.round(4) }.inspect} " \
+        "#{verdicts.map { |name, ok| "#{name}=#{ok ? 1 : 0}" }.join(' ')} " \
+        "active=#{rule} pass=#{verdicts.fetch(rule) ? 1 : 0}"
+      )
+      verdicts.fetch(rule)
     rescue StandardError => e
       logger&.debug("candles request failed for #{ticker}/#{figi}: #{e.class}: #{e.message}")
       false
+    end
+
+    # Четыре кандидата на правило входа по дневным закрытиям. sequence — 4 закрытия,
+    # то есть 3 изменения. strict3 — исходное поведение и дефолт: менять его вслепую
+    # нельзя, пока варианты не сравнены на истории.
+    MOMENTUM_RULES = %w[strict3 last2 two_of_three cumulative].freeze
+    DEFAULT_MOMENTUM_RULE = 'strict3'
+
+    def momentum_verdicts(sequence)
+      ups = sequence.each_cons(2).map { |left, right| left < right }
+      {
+        'strict3' => ups.all?,
+        'last2' => ups.last(2).all?,
+        'two_of_three' => ups.count(true) >= 2,
+        'cumulative' => sequence.last > sequence.first
+      }
+    end
+
+    def momentum_rule(logger: nil)
+      raw = ENV['MOMENTUM_RULE'].to_s.strip.downcase
+      return DEFAULT_MOMENTUM_RULE if raw.empty?
+      return raw if MOMENTUM_RULES.include?(raw)
+
+      logger&.warn("unknown MOMENTUM_RULE=#{raw.inspect} — falling back to #{DEFAULT_MOMENTUM_RULE} " \
+                   "(known: #{MOMENTUM_RULES.join(', ')})")
+      DEFAULT_MOMENTUM_RULE
     end
 
     def affordable_candidate?(price, lot, lots_per_order, max_lot_rub)

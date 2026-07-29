@@ -64,6 +64,17 @@ RSpec.describe TradingLogic::StrategyHelpers do
     ]
   end
 
+  # Провал на первом изменении и рост на двух последних: strict3 отклоняет,
+  # last2/two_of_three/cumulative пропускают.
+  def dip_then_rising_daily_candles
+    [
+      OpenStruct.new(close: q(10)),
+      OpenStruct.new(close: q(9)),
+      OpenStruct.new(close: q(11)),
+      OpenStruct.new(close: q(12))
+    ]
+  end
+
   def flat_daily_candles
     [
       OpenStruct.new(close: q(10)),
@@ -824,6 +835,113 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
       expect(state.fetch('pending_orders')).to eq({})
       expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d'), {})).not_to have_key('AAA')
+    end
+  end
+
+  describe 'momentum rule variants' do
+    around do |example|
+      previous = ENV.fetch('MOMENTUM_RULE', nil)
+      example.run
+    ensure
+      ENV['MOMENTUM_RULE'] = previous
+    end
+
+    it 'scores all four rules from the same four closes' do
+      expect(described_class.momentum_verdicts([10, 11, 12, 13])).to eq(
+        'strict3' => true, 'last2' => true, 'two_of_three' => true, 'cumulative' => true
+      )
+      expect(described_class.momentum_verdicts([10, 9, 11, 12])).to eq(
+        'strict3' => false, 'last2' => true, 'two_of_three' => true, 'cumulative' => true
+      )
+      expect(described_class.momentum_verdicts([10, 11, 12, 9])).to eq(
+        'strict3' => false, 'last2' => false, 'two_of_three' => true, 'cumulative' => false
+      )
+      expect(described_class.momentum_verdicts([10, 11, 9, 10])).to eq(
+        'strict3' => false, 'last2' => false, 'two_of_three' => true, 'cumulative' => false
+      )
+    end
+
+    it 'defaults to strict3 and warns once on an unknown rule' do
+      ENV.delete('MOMENTUM_RULE')
+      expect(described_class.momentum_rule).to eq('strict3')
+
+      ENV['MOMENTUM_RULE'] = 'ma5'
+      logger = double('logger')
+      expect(logger).to receive(:warn).once.with(/unknown MOMENTUM_RULE="ma5"/)
+      expect(described_class.momentum_rule(logger: logger)).to eq('strict3')
+    end
+
+    it 'keeps strict3 rejecting a candidate that only rose on the last two days' do
+      market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+      index_cache = write_cache([{ 'ticker' => 'AAA' }])
+      client, = build_buy_flow_client(market_candles: dip_then_rising_daily_candles)
+      ENV['MOMENTUM_RULE'] = 'strict3'
+
+      logic = double('logic')
+      expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+      result = described_class.buy_one_momentum_from_intersection!(
+        client, logic, described_class.default_state,
+        market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+        max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc'
+      )
+
+      expect(result).to be false
+    ensure
+      market_cache&.close!
+      index_cache&.close!
+    end
+
+    it 'lets the same candidate through when MOMENTUM_RULE=last2' do
+      market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+      index_cache = write_cache([{ 'ticker' => 'AAA' }])
+      client, = build_buy_flow_client(market_candles: dip_then_rising_daily_candles)
+      ENV['MOMENTUM_RULE'] = 'last2'
+
+      logic = double('logic')
+      allow(logic).to receive_messages(last_price_for: 100.0, dip_today?: true,
+                                       entry_stretch_metrics: {}, nearest_support: nil)
+      expect(logic).to receive(:confirm_and_place_order_with_result).once.and_return(
+        { ok: true, category: :filled, order: OpenStruct.new(order_id: 'o1') }
+      )
+
+      result = described_class.buy_one_momentum_from_intersection!(
+        client, logic, described_class.default_state,
+        market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+        max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc'
+      )
+
+      expect(result).to be true
+    ensure
+      market_cache&.close!
+      index_cache&.close!
+    end
+
+    it 'logs every rule verdict in a single parsable shadow line' do
+      market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+      index_cache = write_cache([{ 'ticker' => 'AAA' }])
+      client, = build_buy_flow_client(market_candles: dip_then_rising_daily_candles)
+      ENV['MOMENTUM_RULE'] = 'strict3'
+
+      lines = []
+      logger = double('logger')
+      allow(logger).to receive(:debug) { |message| lines << message }
+      allow(logger).to receive(:warn)
+
+      described_class.buy_one_momentum_from_intersection!(
+        client, double('logic'), described_class.default_state,
+        market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+        max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc', logger: logger
+      )
+
+      shadow = lines.find { |line| line.start_with?('momentum_shadow ') }
+      expect(shadow).to eq(
+        'momentum_shadow ticker=AAA closes=[10.0, 9.0, 11.0, 12.0] ' \
+        'strict3=0 last2=1 two_of_three=1 cumulative=1 active=strict3 pass=0'
+      )
+    ensure
+      market_cache&.close!
+      index_cache&.close!
     end
   end
 
