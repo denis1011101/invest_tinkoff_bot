@@ -64,6 +64,8 @@ UP_REQUIRE_SUPPORT = ENV.fetch('UP_REQUIRE_SUPPORT', '0').strip == '1'
 UP_ENTRY_MA_DAYS   = (ENV['UP_ENTRY_MA_DAYS'] || '5').to_i
 # Shadow-режим: считаем и логируем сделки, но не отправляем ордера.
 SHADOW_BUYS = ENV.fetch('SHADOW_BUYS', '0').strip == '1'
+SCAN_ID = TradingLogic::StrategyHelpers.new_buy_scan_id
+LOGGER.debug("scan_id=#{SCAN_ID}")
 
 logic = TradingLogic::Runner.new(
   client,
@@ -177,8 +179,21 @@ begin
     up_positions = nil
     up_positions_loaded = false
     universe.each do |it| # rubocop:disable Metrics/BlockLength
-      next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_buy', it[:ticker])
-      next if TradingLogic::StrategyHelpers.pending_order_active?(state, it[:ticker])
+      helpers = TradingLogic::StrategyHelpers
+      if helpers.acted_today?(state, 'last_buy', it[:ticker])
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'already_processed', outcome: 'rejected'
+        )
+        next
+      end
+      if helpers.pending_order_active?(state, it[:ticker])
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'pending_order', outcome: 'rejected', figi: it[:figi]
+        )
+        next
+      end
 
       cur = logic.last_price_for(it[:figi])
       intraday = begin
@@ -199,23 +214,67 @@ begin
                    "dip_threshold=#{dip_thr.inspect} gate=#{gate.inspect}")
       # При аварии портфельного API сохраняем полную диагностику сигналов, но
       # fail-closed блокируем любые действия и портфельные гейты.
-      next unless up_portfolio
-      next unless gate[:should_buy]
+      unless up_portfolio
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'portfolio_preflight', outcome: 'rejected', figi: it[:figi],
+                  reason: 'unavailable', gate: gate
+        )
+        next
+      end
+      unless gate[:should_buy]
+        failed_stage = if !gate[:dip]
+                         'dip'
+                       elsif !gate[:volume_ok]
+                         'volume'
+                       else
+                         'trend_entry'
+                       end
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: failed_stage, outcome: 'rejected', figi: it[:figi], gate: gate
+        )
+        next
+      end
 
       buy_value = (cur || it[:price]) * it[:lot] * LOTS_PER_ORDER
-      next unless TradingLogic::StrategyHelpers.position_within_limit?(
+      unless helpers.position_within_limit?(
         client, account_id, it[:figi],
         planned_buy_value: buy_value, portfolio: up_portfolio, logger: LOGGER
       )
-      next unless TradingLogic::StrategyHelpers.daily_buy_within_limit?(state, buy_value, logger: LOGGER)
-      next unless TradingLogic::StrategyHelpers.shares_share_within_limit?(
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'position_limit', outcome: 'rejected', figi: it[:figi], buy_value: buy_value
+        )
+        next
+      end
+      unless helpers.daily_buy_within_limit?(state, buy_value, logger: LOGGER)
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'daily_budget', outcome: 'rejected', figi: it[:figi], buy_value: buy_value,
+                  committed_today: helpers.daily_buy_committed_total(state)
+        )
+        next
+      end
+      unless helpers.shares_share_within_limit?(
         client, account_id,
         planned_buy_value: buy_value + run_committed, portfolio: up_portfolio, logger: LOGGER
       )
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'shares_exposure', outcome: 'rejected', figi: it[:figi], buy_value: buy_value
+        )
+        next
+      end
 
       if SHADOW_BUYS
         LOGGER.info("SHADOW BUY #{it[:ticker]} lots=#{LOTS_PER_ORDER} @#{cur || it[:price]} " \
                     "value=#{buy_value.round(2)} gate=#{gate.inspect}")
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'shadow_order', outcome: 'eligible', figi: it[:figi],
+                  price: cur || it[:price], buy_value: buy_value
+        )
         next
       end
 
@@ -225,12 +284,25 @@ begin
         )
         up_positions_loaded = true
       end
-      next unless up_positions
+      unless up_positions
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'cash_preflight', outcome: 'rejected', figi: it[:figi],
+                  reason: 'positions_unavailable'
+        )
+        next
+      end
 
-      next unless TradingLogic::StrategyHelpers.cash_sufficient_for_buy?(
+      unless helpers.cash_sufficient_for_buy?(
         client, account_id,
         planned_buy_value: buy_value + run_committed, positions: up_positions, logger: LOGGER
       )
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'cash', outcome: 'rejected', figi: it[:figi], buy_value: buy_value
+        )
+        next
+      end
 
       result = logic.confirm_and_place_order_with_result(
         account_id: account_id,
@@ -241,14 +313,22 @@ begin
         order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
       )
       result[:figi] ||= it[:figi]
-      TradingLogic::StrategyHelpers.sync_pending_order!(state, it[:ticker], result)
-      helpers = TradingLogic::StrategyHelpers
-      if helpers.buy_committed_result?(result)
-        helpers.register_daily_buy!(state, buy_value)
-        run_committed += buy_value
-      end
+      helpers.account_buy_result!(
+        state, it[:ticker], result, planned_value: buy_value, logger: LOGGER, scan_id: SCAN_ID
+      )
+      category = result[:category].to_s
+      committed = helpers.buy_committed_result?(result)
+      helpers.log_buy_funnel(
+        LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                stage: 'order', outcome: committed ? 'committed' : 'rejected',
+                reason: category.empty? ? 'unknown' : category, figi: it[:figi],
+                price: cur || it[:price], buy_value: buy_value,
+                client_order_id: helpers.pending_client_order_id(result),
+                broker_order_id: helpers.pending_broker_order_id(result)
+      )
+      run_committed += buy_value if committed
 
-      if TradingLogic::StrategyHelpers.buy_execution_result?(result)
+      if helpers.buy_execution_result?(result)
         resp = result[:response]
         LOGGER.info(
           "BUY #{it[:ticker]} lots=#{LOTS_PER_ORDER} lot_size=#{it[:lot]} " \
@@ -320,7 +400,8 @@ begin
       max_lot_rub: MAX_LOT_RUB,
       lots_per_order: LOTS_PER_ORDER,
       account_id: account_id,
-      logger: LOGGER
+      logger: LOGGER,
+      scan_id: SCAN_ID
     )
     LOGGER.info('DOWN: no momentum candidates') unless bought
 
@@ -344,7 +425,8 @@ begin
       max_lot_rub: MAX_LOT_RUB,
       lots_per_order: LOTS_PER_ORDER,
       account_id: account_id,
-      logger: LOGGER
+      logger: LOGGER,
+      scan_id: SCAN_ID
     )
     LOGGER.info('SIDE: no momentum candidates') unless bought
   end

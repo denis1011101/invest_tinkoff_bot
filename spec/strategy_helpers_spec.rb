@@ -836,6 +836,439 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(state.fetch('pending_orders')).to eq({})
       expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d'), {})).not_to have_key('AAA')
     end
+
+    it 'requests cancellation after TTL but releases the reservation only after terminal reconciliation' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+
+      active = OpenStruct.new(
+        order_id: 'broker-ttl',
+        order_request_id: 'client-ttl',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_NEW',
+        lots_requested: 2,
+        lots_executed: 0,
+        total_order_amount: q(201.2)
+      )
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(
+        OpenStruct.new(orders: [active]),
+        OpenStruct.new(orders: [])
+      )
+      allow(client).to receive(:cancel_order)
+        .with(account_id: 'acc', order_id: 'broker-ttl')
+        .and_return(OpenStruct.new(success?: true))
+      cancelled = {
+        'executionReportStatus' => 'EXECUTION_REPORT_STATUS_CANCELLED',
+        'lotsRequested' => 2,
+        'lotsExecuted' => 0,
+        'totalOrderAmount' => { 'units' => 201, 'nano' => 200_000_000 }
+      }
+      allow(client).to receive(:order_state)
+        .with(account_id: 'acc', order_id: 'broker-ttl')
+        .and_return(OpenStruct.new(success?: true, payload: cancelled))
+
+      state = described_class.default_state
+      state['pending_orders']['AAA'] = {
+        'client_order_id' => 'client-ttl',
+        'broker_order_id' => 'broker-ttl',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => (Time.now.utc - 1_200).iso8601,
+        'status' => 'sent_not_filled',
+        'planned_value' => 200.0,
+        'filled_value' => 0.0,
+        'reserved_value' => 200.0
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10)
+
+      expect(client).to have_received(:cancel_order).once
+      expect(state.fetch('pending_orders').fetch('AAA')).to have_key('cancel_requested_at')
+      expect(described_class.pending_buy_reserved_total(state)).to eq(200)
+
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10)
+
+      expect(state.fetch('pending_orders')).to eq({})
+      expect(client).to have_received(:order_state).once
+      expect(described_class.pending_buy_reserved_total(state)).to eq(0)
+      expect(described_class.daily_buy_total(state)).to eq(0)
+    end
+
+    it 'migrates an active legacy commitment from daily_buys into an order reservation' do
+      client = double('client')
+      orders = double('orders')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+
+      active = OpenStruct.new(
+        order_id: 'broker-legacy',
+        order_request_id: 'client-legacy',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_NEW',
+        lots_requested: 2,
+        lots_executed: 0,
+        initial_order_price: q(200),
+        total_order_amount: q(201.2)
+      )
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: [active]))
+
+      state = described_class.default_state
+      described_class.register_daily_buy!(state, 200)
+      state['pending_orders']['AAA'] = {
+        'client_order_id' => 'client-legacy',
+        'broker_order_id' => 'broker-legacy',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => Time.now.utc.iso8601,
+        'status' => 'sent_not_filled'
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(described_class.daily_buy_total(state)).to eq(0)
+      expect(described_class.pending_buy_reserved_total(state)).to eq(200)
+      expect(described_class.daily_buy_committed_total(state)).to eq(200)
+    end
+
+    it 'keeps the reservation when cancellation has no confirmed terminal status' do
+      client = double('client')
+      orders = double('orders')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: []))
+      still_active = OpenStruct.new(
+        execution_report_status: 'EXECUTION_REPORT_STATUS_NEW',
+        lots_requested: 1,
+        lots_executed: 0
+      )
+      allow(client).to receive(:order_state)
+        .with(account_id: 'acc', order_id: 'broker-wait')
+        .and_return(OpenStruct.new(success?: true, payload: still_active))
+
+      state = described_class.default_state
+      state['pending_orders']['AAA'] = {
+        'client_order_id' => 'client-wait',
+        'broker_order_id' => 'broker-wait',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => (Time.now.utc - 1_200).iso8601,
+        'status' => 'sent_not_filled',
+        'planned_value' => 100.0,
+        'filled_value' => 0.0,
+        'reserved_value' => 100.0,
+        'cancel_requested_at' => Time.now.utc.iso8601
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(described_class.pending_buy_reserved_total(state)).to eq(100)
+    end
+
+    # PARTIALLYFILL терминальным не является, а отсутствие в одной выдаче GetOrders
+    # не доказывает судьбу заявки — резерв держим до явного CANCELLED/REJECTED/FILL.
+    it 'keeps the reservation while a cancelled order still reports PARTIALLYFILL' do
+      client = double('client')
+      orders = double('orders')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: []))
+      partial = OpenStruct.new(
+        execution_report_status: 'EXECUTION_REPORT_STATUS_PARTIALLYFILL',
+        lots_requested: 4,
+        lots_executed: 1
+      )
+      allow(client).to receive(:order_state)
+        .with(account_id: 'acc', order_id: 'broker-partial')
+        .and_return(OpenStruct.new(success?: true, payload: partial))
+
+      state = described_class.default_state
+      state['pending_orders']['AAA'] = {
+        'client_order_id' => 'client-partial',
+        'broker_order_id' => 'broker-partial',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => (Time.now.utc - 1_200).iso8601,
+        'status' => 'partially_filled',
+        'planned_value' => 200.0,
+        'filled_value' => 0.0,
+        'reserved_value' => 200.0,
+        'cancel_requested_at' => Time.now.utc.iso8601
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      pending = state.fetch('pending_orders').fetch('AAA')
+      expect(pending.fetch('terminal_confirm_attempts')).to eq(1)
+      expect(pending.fetch('filled_value')).to eq(50)
+      expect(described_class.pending_buy_reserved_total(state)).to eq(150)
+      expect(described_class.daily_buy_total(state)).to eq(50)
+    end
+
+    it 'retries cancellation with backoff instead of firing every run' do
+      client = double('client')
+      orders = double('orders')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      active = OpenStruct.new(
+        order_id: 'broker-retry',
+        order_request_id: 'client-retry',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_NEW',
+        lots_requested: 2,
+        lots_executed: 0
+      )
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: [active]))
+      allow(client).to receive(:cancel_order)
+        .with(account_id: 'acc', order_id: 'broker-retry')
+        .and_return(OpenStruct.new(success?: true))
+
+      state = described_class.default_state
+      info = {
+        'client_order_id' => 'client-retry',
+        'broker_order_id' => 'broker-retry',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => (Time.now.utc - 1_200).iso8601,
+        'status' => 'sent_not_filled',
+        'planned_value' => 200.0,
+        'filled_value' => 0.0,
+        'reserved_value' => 200.0
+      }
+      state['pending_orders']['AAA'] = info
+
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10)
+      expect(info.fetch('cancel_attempts')).to eq(1)
+
+      # Сразу следующий прогон cron — backoff ещё не истёк.
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10)
+      expect(info.fetch('cancel_attempts')).to eq(1)
+
+      info['cancel_requested_at'] = (Time.now.utc - 600).iso8601
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10)
+      expect(info.fetch('cancel_attempts')).to eq(2)
+      expect(client).to have_received(:cancel_order).twice
+      expect(described_class.pending_buy_reserved_total(state)).to eq(200)
+    end
+
+    it 'applies backoff and the stuck threshold to unsuccessful cancel requests' do
+      previous_max_attempts = ENV.fetch('BUY_CANCEL_MAX_ATTEMPTS', nil)
+      ENV['BUY_CANCEL_MAX_ATTEMPTS'] = '2'
+
+      client = double('client')
+      orders = double('orders')
+      logger = double('logger', debug: nil, info: nil, warn: nil, error: nil)
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      active = OpenStruct.new(
+        order_id: 'broker-failing-cancel',
+        order_request_id: 'client-failing-cancel',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_NEW',
+        lots_requested: 1,
+        lots_executed: 0
+      )
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: [active]))
+      allow(client).to receive(:cancel_order)
+        .with(account_id: 'acc', order_id: 'broker-failing-cancel')
+        .and_return(OpenStruct.new(success?: false))
+
+      state = described_class.default_state
+      info = {
+        'client_order_id' => 'client-failing-cancel',
+        'broker_order_id' => 'broker-failing-cancel',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => (Time.now.utc - 1_200).iso8601,
+        'status' => 'sent_not_filled',
+        'planned_value' => 100.0,
+        'filled_value' => 0.0,
+        'reserved_value' => 100.0
+      }
+      state['pending_orders']['AAA'] = info
+
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10, logger: logger)
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10, logger: logger)
+      expect(info.fetch('cancel_attempts')).to eq(1)
+      expect(client).to have_received(:cancel_order).once
+
+      info['cancel_requested_at'] = (Time.now.utc - 600).iso8601
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10, logger: logger)
+      described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10, logger: logger)
+
+      expect(info.fetch('cancel_attempts')).to eq(2)
+      expect(client).to have_received(:cancel_order).twice
+      expect(logger).to have_received(:error).with(/BUY CANCEL STUCK AAA/).once
+      expect(described_class.pending_buy_reserved_total(state)).to eq(100)
+    ensure
+      ENV['BUY_CANCEL_MAX_ATTEMPTS'] = previous_max_attempts
+    end
+
+    it 'raises one error alert after repeated unconfirmed cancellations' do
+      client = double('client')
+      orders = double('orders')
+      logger = double('logger', debug: nil, info: nil, warn: nil, error: nil)
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: []))
+      still_active = OpenStruct.new(
+        execution_report_status: 'EXECUTION_REPORT_STATUS_NEW',
+        lots_requested: 1,
+        lots_executed: 0
+      )
+      allow(client).to receive(:order_state)
+        .with(account_id: 'acc', order_id: 'broker-stuck')
+        .and_return(OpenStruct.new(success?: true, payload: still_active))
+
+      state = described_class.default_state
+      info = {
+        'client_order_id' => 'client-stuck',
+        'broker_order_id' => 'broker-stuck',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => (Time.now.utc - 1_200).iso8601,
+        'status' => 'sent_not_filled',
+        'planned_value' => 100.0,
+        'filled_value' => 0.0,
+        'reserved_value' => 100.0,
+        'cancel_requested_at' => Time.now.utc.iso8601
+      }
+      state['pending_orders']['AAA'] = info
+
+      6.times { described_class.cleanup_pending_orders!(client, 'acc', state, logger: logger) }
+
+      expect(info.fetch('terminal_confirm_attempts')).to eq(6)
+      expect(logger).to have_received(:error).with(/BUY CANCEL STUCK AAA/).once
+      expect(described_class.pending_buy_reserved_total(state)).to eq(100)
+    end
+
+    it 'keeps the remaining reservation when a partial fill disappears from GetOrders' do
+      client = double('client')
+      orders = double('orders')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
+      partial = OpenStruct.new(
+        execution_report_status: 'EXECUTION_REPORT_STATUS_PARTIALLYFILL',
+        lots_requested: 4,
+        lots_executed: 1
+      )
+      allow(client).to receive(:order_state)
+        .with(account_id: 'acc', order_id: 'broker-partial')
+        .and_return(OpenStruct.new(success?: true, payload: partial))
+
+      state = described_class.default_state
+      described_class.register_daily_buy!(state, 50)
+      state['pending_orders']['AAA'] = {
+        'client_order_id' => 'client-partial',
+        'broker_order_id' => 'broker-partial',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => (Time.now.utc - 600).iso8601,
+        'status' => 'partially_filled',
+        'planned_value' => 200.0,
+        'filled_value' => 50.0,
+        'reserved_value' => 150.0
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(described_class.daily_buy_total(state)).to eq(50)
+      expect(described_class.pending_buy_reserved_total(state)).to eq(150)
+    end
+
+    it 'alerts once when a partial fill stays unresolved with cancellation disabled' do
+      previous_max_attempts = ENV.fetch('BUY_CANCEL_MAX_ATTEMPTS', nil)
+      ENV['BUY_CANCEL_MAX_ATTEMPTS'] = '5'
+
+      client = double('client')
+      orders = double('orders')
+      logger = double('logger', debug: nil, info: nil, warn: nil, error: nil)
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: []))
+      partial = OpenStruct.new(
+        execution_report_status: 'EXECUTION_REPORT_STATUS_PARTIALLYFILL',
+        lots_requested: 4,
+        lots_executed: 1
+      )
+      allow(client).to receive(:order_state)
+        .with(account_id: 'acc', order_id: 'broker-no-ttl')
+        .and_return(OpenStruct.new(success?: true, payload: partial))
+
+      state = described_class.default_state
+      info = {
+        'client_order_id' => 'client-no-ttl',
+        'broker_order_id' => 'broker-no-ttl',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => (Time.now.utc - 14_400).iso8601,
+        'status' => 'partially_filled',
+        'planned_value' => 200.0,
+        'filled_value' => 0.0,
+        'reserved_value' => 200.0
+      }
+      state['pending_orders']['AAA'] = info
+
+      6.times do
+        described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 0, logger: logger)
+      end
+
+      expect(state.fetch('pending_orders')).to have_key('AAA')
+      expect(info.fetch('cancel_requested_at', nil)).to be_nil
+      expect(info.fetch('terminal_confirm_attempts')).to eq(6)
+      expect(info.fetch('cancel_alerted')).to be true
+      expect(described_class.daily_buy_total(state)).to eq(50)
+      expect(described_class.pending_buy_reserved_total(state)).to eq(150)
+      expect(logger).to have_received(:error).with(/BUY PENDING STUCK AAA/).once
+      expect(logger).to have_received(:warn)
+        .with(/pending order for AAA left untouched — terminal status unknown/)
+        .at_least(:once)
+    ensure
+      ENV['BUY_CANCEL_MAX_ATTEMPTS'] = previous_max_attempts
+    end
+
+    it 'does not grow the reservation when a later active-order snapshot omits lot counters' do
+      client = double('client')
+      orders = double('orders')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      incomplete = OpenStruct.new(
+        order_id: 'broker-partial',
+        order_request_id: 'client-partial',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_PARTIALLYFILL'
+      )
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: [incomplete]))
+
+      state = described_class.default_state
+      described_class.register_daily_buy!(state, 50)
+      state['pending_orders']['AAA'] = {
+        'client_order_id' => 'client-partial',
+        'broker_order_id' => 'broker-partial',
+        'figi' => 'F_AAA',
+        'ticker' => 'AAA',
+        'ts' => Time.now.utc.iso8601,
+        'status' => 'partially_filled',
+        'planned_value' => 200.0,
+        'filled_value' => 50.0,
+        'reserved_value' => 150.0
+      }
+
+      described_class.cleanup_pending_orders!(client, 'acc', state)
+
+      pending = state.fetch('pending_orders').fetch('AAA')
+      expect(pending.fetch('filled_value')).to eq(50)
+      expect(pending.fetch('reserved_value')).to eq(150)
+      expect(pending.fetch('filled_value') + pending.fetch('reserved_value')).to eq(200)
+      expect(described_class.daily_buy_total(state)).to eq(50)
+    end
   end
 
   describe 'momentum rule variants' do
@@ -931,18 +1364,100 @@ RSpec.describe TradingLogic::StrategyHelpers do
       described_class.buy_one_momentum_from_intersection!(
         client, double('logic'), described_class.default_state,
         market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
-        max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc', logger: logger
+        max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc', logger: logger,
+        scan_id: 'scan-shadow'
       )
 
       shadow = lines.find { |line| line.start_with?('momentum_shadow ') }
       expect(shadow).to eq(
         'momentum_shadow ticker=AAA closes=[10.0, 9.0, 11.0, 12.0] ' \
-        'strict3=0 last2=1 two_of_three=1 cumulative=1 active=strict3 pass=0'
+        'strict3=0 last2=1 two_of_three=1 cumulative=1 active=strict3 pass=0 scan_id=scan-shadow'
       )
     ensure
       market_cache&.close!
       index_cache&.close!
     end
+
+    it 'logs one terminal funnel event with the same scan id when momentum rejects a ticker' do
+      market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+      index_cache = write_cache([{ 'ticker' => 'AAA' }])
+      client, = build_buy_flow_client(market_candles: dip_then_rising_daily_candles)
+      ENV['MOMENTUM_RULE'] = 'strict3'
+
+      lines = []
+      logger = double('logger')
+      allow(logger).to receive(:debug) { |message| lines << message }
+      allow(logger).to receive(:warn)
+
+      result = described_class.buy_one_momentum_from_intersection!(
+        client, double('logic'), described_class.default_state,
+        market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+        max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc', logger: logger,
+        scan_id: 'scan-funnel-reject'
+      )
+
+      funnel = lines.grep(/^buy_funnel /)
+      expect(result).to be false
+      expect(funnel.size).to eq(1)
+      expect(JSON.parse(funnel.first.delete_prefix('buy_funnel '))).to include(
+        'scan_id' => 'scan-funnel-reject',
+        'ticker' => 'AAA',
+        'path' => 'intersection',
+        'stage' => 'momentum',
+        'outcome' => 'rejected',
+        'reason' => 'active_rule_failed',
+        'active_rule' => 'strict3'
+      )
+    ensure
+      market_cache&.close!
+      index_cache&.close!
+    end
+  end
+
+  it 'logs the broker outcome as the terminal funnel event for an eligible ticker' do
+    market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+    index_cache = write_cache([{ 'ticker' => 'AAA' }])
+    client, = build_buy_flow_client(market_candles: rising_daily_candles)
+
+    logic = double('logic')
+    allow(logic).to receive_messages(last_price_for: 100.0, dip_today?: true,
+                                     entry_stretch_metrics: {}, nearest_support: nil)
+    allow(logic).to receive(:confirm_and_place_order_with_result).and_return(
+      {
+        ok: false,
+        category: :sent_not_filled,
+        response: OpenStruct.new(order_id: 'broker-1', order_request_id: 'client-1')
+      }
+    )
+
+    lines = []
+    logger = double('logger')
+    allow(logger).to receive(:debug) { |message| lines << message }
+    allow(logger).to receive(:warn)
+
+    result = described_class.buy_one_momentum_from_intersection!(
+      client, logic, described_class.default_state,
+      market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc', logger: logger,
+      scan_id: 'scan-funnel-order'
+    )
+
+    funnel = lines.grep(/^buy_funnel /)
+    expect(result).to be true
+    expect(funnel.size).to eq(1)
+    expect(JSON.parse(funnel.first.delete_prefix('buy_funnel '))).to include(
+      'scan_id' => 'scan-funnel-order',
+      'ticker' => 'AAA',
+      'path' => 'intersection',
+      'stage' => 'order',
+      'outcome' => 'committed',
+      'reason' => 'sent_not_filled',
+      'client_order_id' => 'client-1',
+      'broker_order_id' => 'broker-1'
+    )
+  ensure
+    market_cache&.close!
+    index_cache&.close!
   end
 
   it 'skips candidate when daily candles do not confirm momentum' do
@@ -1030,6 +1545,55 @@ RSpec.describe TradingLogic::StrategyHelpers do
       pending = state.fetch('pending_orders').fetch('AAA')
       expect(pending.fetch('ts')).to eq(order_time.iso8601)
       expect(state.fetch('last_buy').fetch(Time.now.utc.strftime('%Y-%m-%d')).fetch('AAA')).to be true
+    end
+
+    it 'restores today filled amount and remaining reservation without understating the budget' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      instruments = double('instruments')
+      allow(client).to receive_messages(
+        grpc_orders: orders,
+        grpc_operations: operations,
+        grpc_instruments: instruments
+      )
+
+      buy_op = OpenStruct.new(
+        type: 'OPERATION_TYPE_BUY',
+        figi: 'F_AAA',
+        date: Time.now.utc.iso8601,
+        quantity_done: 1,
+        payment: q(-50)
+      )
+      allow(operations).to receive(:operations_by_cursor)
+        .and_return(OpenStruct.new(items: [buy_op]))
+      active = OpenStruct.new(
+        direction: 'ORDER_DIRECTION_BUY',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_PARTIALLYFILL',
+        figi: 'F_AAA',
+        order_id: 'broker-restore-budget',
+        order_request_id: 'client-restore-budget',
+        order_date: Google::Protobuf::Timestamp.new(seconds: Time.now.utc.to_i),
+        lots_requested: 4,
+        lots_executed: 1,
+        initial_order_price: q(200),
+        total_order_amount: q(201.2)
+      )
+      allow(orders).to receive(:get_orders)
+        .with(account_id: 'acc')
+        .and_return(OpenStruct.new(orders: [active]))
+      allow(instruments).to receive(:get_instrument_by)
+        .with(:figi, 'F_AAA')
+        .and_return(OpenStruct.new(ticker: 'AAA'))
+
+      state = described_class.default_state
+      described_class.restore_state_from_broker_if_empty!(client, 'acc', state)
+
+      pending = state.fetch('pending_orders').fetch('AAA')
+      expect(described_class.daily_buy_total(state)).to eq(50)
+      expect(pending.fetch('filled_value')).to eq(50)
+      expect(pending.fetch('reserved_value')).to eq(150)
+      expect(described_class.daily_buy_committed_total(state)).to eq(200)
     end
   end
 
@@ -1153,13 +1717,57 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
     logic = double('logic')
     expect(logic).not_to receive(:confirm_and_place_order_with_result)
+    lines = []
+    logger = double('logger', warn: nil)
+    allow(logger).to receive(:debug) { |message| lines << message }
 
     result = described_class.buy_one_momentum_from_intersection!(
       double('client'), logic, described_class.default_state,
       market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
-      max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc'
+      max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc',
+      logger: logger, scan_id: 'scan-stale'
     )
+
+    scan_lines = lines.grep(/^buy_funnel_scan /)
+    scan_event = JSON.parse(scan_lines.fetch(0).delete_prefix('buy_funnel_scan '))
     expect(result).to be false
+    expect(scan_lines.size).to eq(1)
+    expect(scan_event).to include(
+      'scan_id' => 'scan-stale',
+      'path' => 'intersection',
+      'outcome' => 'stale_cache',
+      'max_age_hours' => 72
+    )
+  ensure
+    market_cache&.close!
+    index_cache&.close!
+  end
+
+  it 'logs a scan-level outcome when the cache intersection is empty' do
+    market_cache = write_cache([{ 'ticker' => 'AAA' }])
+    index_cache = write_cache([{ 'ticker' => 'BBB' }])
+    lines = []
+    logger = double('logger')
+    allow(logger).to receive(:debug) { |message| lines << message }
+
+    result = described_class.buy_one_momentum_from_intersection!(
+      double('client'), double('logic'), described_class.default_state,
+      market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+      max_lot_rub: 1_000.0, lots_per_order: 1, account_id: 'acc',
+      logger: logger, scan_id: 'scan-empty'
+    )
+
+    scan_lines = lines.grep(/^buy_funnel_scan /)
+    scan_event = JSON.parse(scan_lines.fetch(0).delete_prefix('buy_funnel_scan '))
+    expect(result).to be false
+    expect(scan_lines.size).to eq(1)
+    expect(scan_event).to eq(
+      'scan_id' => 'scan-empty',
+      'path' => 'intersection',
+      'outcome' => 'empty_intersection',
+      'market_tickers' => 1,
+      'index_tickers' => 1
+    )
   ensure
     market_cache&.close!
     index_cache&.close!
@@ -1464,6 +2072,108 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(described_class.buy_committed_result?({ category: 'sent_not_filled' })).to be true
       expect(described_class.buy_committed_result?({ category: 'filled' })).to be true
       expect(described_class.buy_committed_result?({ category: 'rejected' })).to be_falsey
+    end
+
+    it 'keeps filled money and an unfilled order reservation separate' do
+      state = described_class.default_state
+      # total_order_amount у брокера — итоговая стоимость ЗАЯВКИ с комиссиями,
+      # она положительна и когда не исполнено ни одного лота.
+      response = OpenStruct.new(lots_requested: 2, lots_executed: 0, total_order_amount: q(201.2))
+
+      described_class.account_buy_result!(
+        state,
+        'AAA',
+        { category: :sent_not_filled, response: response, figi: 'F_AAA' },
+        planned_value: 200
+      )
+
+      expect(described_class.daily_buy_total(state)).to eq(0)
+      expect(described_class.pending_buy_reserved_total(state)).to eq(200)
+      expect(described_class.daily_buy_committed_total(state)).to eq(200)
+      expect(described_class.daily_buy_within_limit?(state, 800, max_daily_rub: 1_000)).to be true
+      expect(described_class.daily_buy_within_limit?(state, 801, max_daily_rub: 1_000)).to be false
+    end
+
+    # Регрессия: раньше total_order_amount читался как исполненная сумма, поэтому
+    # неисполненная заявка занимала бюджет дважды — и как filled, и как reserved.
+    it 'ignores total_order_amount above planned when nothing is executed' do
+      response = OpenStruct.new(lots_requested: 2, lots_executed: 0, total_order_amount: q(250))
+
+      accounting = described_class.buy_result_accounting(
+        { category: :sent_not_filled, response: response },
+        planned_value: 200
+      )
+
+      expect(accounting[:filled_value]).to eq(0)
+      expect(accounting[:reserved_value]).to eq(200)
+      expect(accounting[:filled_value] + accounting[:reserved_value]).to eq(200)
+    end
+
+    it 'registers only the executed amount and reserves only the remainder after a partial fill' do
+      state = described_class.default_state
+      response = OpenStruct.new(lots_requested: 2, lots_executed: 1, total_order_amount: q(201.2))
+
+      described_class.account_buy_result!(
+        state,
+        'AAA',
+        { category: :partially_filled, response: response, figi: 'F_AAA' },
+        planned_value: 200
+      )
+
+      pending = state.fetch('pending_orders').fetch('AAA')
+      expect(described_class.daily_buy_total(state)).to eq(100)
+      expect(pending.fetch('filled_value')).to eq(100)
+      expect(pending.fetch('reserved_value')).to eq(100)
+      expect(described_class.daily_buy_committed_total(state)).to eq(200)
+    end
+
+    it 'reads partial-fill accounting from the REST camelCase order payload' do
+      response = {
+        'lotsRequested' => 4,
+        'lotsExecuted' => 3,
+        'totalOrderAmount' => { 'units' => 201, 'nano' => 200_000_000 }
+      }
+
+      accounting = described_class.buy_result_accounting(
+        { category: :partially_filled, response: response },
+        planned_value: 200
+      )
+
+      expect(accounting[:filled_value]).to eq(150)
+      expect(accounting[:reserved_value]).to eq(50)
+    end
+
+    # Регрессия: filled брался из total_order_amount, поэтому восстановленная из
+    # брокера живая заявка получала reserved_value = 0 и не занимала бюджет вовсе.
+    it 'reserves the unfilled remainder when restoring a live order from the broker' do
+      order = OpenStruct.new(
+        order_id: 'broker-restore',
+        order_request_id: 'client-restore',
+        figi: 'F_AAA',
+        lots_requested: 4,
+        lots_executed: 1,
+        initial_order_price: q(200),
+        total_order_amount: q(201.2)
+      )
+
+      payload = described_class.restored_pending_order_payload(order, 'AAA', 'partially_filled')
+
+      expect(payload.fetch('planned_value')).to eq(200)
+      expect(payload.fetch('filled_value')).to eq(50)
+      expect(payload.fetch('reserved_value')).to eq(150)
+    end
+
+    it 'fails closed when a legacy active pending order has no reservation metadata' do
+      state = described_class.default_state
+      state['pending_orders']['AAA'] = { 'status' => 'sent_not_filled' }
+      logger = double('logger', warn: nil)
+
+      result = described_class.daily_buy_within_limit?(
+        state, 100, max_daily_rub: 1_000, logger: logger
+      )
+
+      expect(result).to be false
+      expect(logger).to have_received(:warn).with(include('unknown reservation'))
     end
 
     it 'keeps only recent days in state' do

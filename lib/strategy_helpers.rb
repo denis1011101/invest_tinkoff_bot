@@ -1,12 +1,77 @@
 # frozen_string_literal: true
 
 require 'json'
+require 'securerandom'
 require 'time'
 require_relative 'utils'
 
 module TradingLogic
   module StrategyHelpers # rubocop:disable Metrics/ModuleLength
     module_function
+
+    BUY_FUNNEL_PREFIX = 'buy_funnel'
+    BUY_FUNNEL_SCAN_PREFIX = 'buy_funnel_scan'
+    BUY_ORDER_LIFECYCLE_PREFIX = 'buy_order_lifecycle'
+
+    # Одна терминальная запись на (scan_id, ticker) показывает, на каком гейте
+    # закончилась проверка кандидата. Для кандидатов, дошедших до брокера, stage=order
+    # содержит фактическую категорию результата. JSON после префикса позволяет
+    # считать воронку без хрупкого разбора человекочитаемых сообщений.
+    def log_buy_funnel(logger, scan_id:, ticker:, path:, stage:, outcome:, **details)
+      payload = {
+        scan_id: scan_id.to_s,
+        ticker: ticker.to_s,
+        path: path.to_s,
+        stage: stage.to_s,
+        outcome: outcome.to_s
+      }
+      details.each { |key, value| payload[key] = value unless value.nil? }
+      logger&.debug("#{BUY_FUNNEL_PREFIX} #{JSON.generate(payload)}")
+    rescue StandardError
+      # Диагностика не должна менять торговое решение, даже если formatter/logger
+      # временно недоступен или дополнительное поле нельзя сериализовать.
+      nil
+    end
+
+    def new_buy_scan_id
+      SecureRandom.uuid
+    end
+
+    # Scan-level outcomes cover early exits where there is no ticker and therefore
+    # no regular buy_funnel record to emit.
+    def log_buy_funnel_scan(logger, scan_id:, path:, outcome:, **details)
+      payload = {
+        scan_id: scan_id.to_s,
+        path: path.to_s,
+        outcome: outcome.to_s
+      }
+      details.each { |key, value| payload[key] = value unless value.nil? }
+      logger&.debug("#{BUY_FUNNEL_SCAN_PREFIX} #{JSON.generate(payload)}")
+    rescue StandardError
+      nil
+    end
+
+    def log_buy_order_lifecycle(logger, ticker:, info:, event:, **details)
+      payload = {
+        scan_id: info['scan_id'],
+        ticker: ticker.to_s,
+        event: event.to_s,
+        client_order_id: info['client_order_id'],
+        broker_order_id: info['broker_order_id']
+      }.compact
+      details.each { |key, value| payload[key] = value unless value.nil? }
+      logger&.debug("#{BUY_ORDER_LIFECYCLE_PREFIX} #{JSON.generate(payload)}")
+    rescue StandardError
+      nil
+    end
+
+    def reject_buy_funnel(logger, scan_id:, ticker:, path:, stage:, **details)
+      log_buy_funnel(
+        logger, scan_id: scan_id, ticker: ticker, path: path,
+                stage: stage, outcome: 'rejected', **details
+      )
+      nil
+    end
 
     def load_cache_normalized(path)
       return [] unless File.exist?(path)
@@ -121,19 +186,16 @@ module TradingLogic
 
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
     def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:,
-                                            max_lot_rub:, account_id:, lots_per_order: 1, logger: nil)
+                                            max_lot_rub:, account_id:, lots_per_order: 1, logger: nil,
+                                            scan_id: nil)
+      scan_id ||= new_buy_scan_id
       # Не торгуем по протухшим справочникам: устаревший состав IMOEX / рыночный кеш
       # приводит к покупкам недоступных или чужих инструментов.
       # Порог протухания должен быть заметно больше TTL обновления кеша (MarketCache
       # CACHE_TTL_HOURS=24), иначе при ежедневном refresh покупки заблокируются.
-      max_age = (ENV['INTERSECTION_CACHE_MAX_AGE_HOURS'] || '72').to_i * 3600
-      unless cache_fresh?(market_cache_path, max_age) && cache_fresh?(moex_index_cache_path, max_age)
-        logger&.warn('intersection BUY skipped — stale caches ' \
-                     "(market updated=#{cache_updated_at(market_cache_path)&.iso8601.inspect}, " \
-                     "moex updated=#{cache_updated_at(moex_index_cache_path)&.iso8601.inspect}, " \
-                     "max_age_h=#{max_age / 3600})")
-        return false
-      end
+      return false unless intersection_caches_fresh?(
+        market_cache_path, moex_index_cache_path, logger: logger, scan_id: scan_id
+      )
 
       market = load_cache_normalized(market_cache_path)
       index  = load_cache_normalized(moex_index_cache_path)
@@ -147,7 +209,13 @@ module TradingLogic
       inter = market_tickers & index_tickers
       logger&.debug("intersection candidates=#{inter.size} #{inter.sample(10).inspect}")
 
-      return false if inter.empty?
+      if inter.empty?
+        log_buy_funnel_scan(
+          logger, scan_id: scan_id, path: 'intersection', outcome: 'empty_intersection',
+                  market_tickers: market_tickers.size, index_tickers: index_tickers.size
+        )
+        return false
+      end
 
       preflight = {}
       candidates = inter.filter_map do |ticker|
@@ -157,7 +225,8 @@ module TradingLogic
           account_id: account_id,
           lots_per_order: lots_per_order,
           preflight: preflight,
-          logger: logger
+          logger: logger,
+          scan_id: scan_id
         )
       end
 
@@ -165,38 +234,105 @@ module TradingLogic
       candidates.sort_by! { |c| c[:support_distance] }
       logger&.debug("sorted candidates: #{candidates.map { |c| "#{c[:tk]}(#{c[:support_distance].round(3)})" }.inspect}")
 
-      candidates.each do |candidate|
-        return true if execute_intersection_buy_candidate!(
+      candidates.each_with_index do |candidate, index|
+        next unless execute_intersection_buy_candidate!(
           logic,
           state,
           candidate,
           account_id: account_id,
-          logger: logger
+          logger: logger,
+          scan_id: scan_id
         )
+
+        candidates.drop(index + 1).each do |skipped|
+          log_buy_funnel(
+            logger,
+            scan_id: scan_id,
+            ticker: skipped[:tk],
+            path: 'intersection',
+            stage: 'selection',
+            outcome: 'skipped',
+            reason: 'earlier_order_committed'
+          )
+        end
+        return true
       end
 
       false
     end
 
+    def intersection_caches_fresh?(market_cache_path, moex_index_cache_path, logger:, scan_id:)
+      max_age = (ENV['INTERSECTION_CACHE_MAX_AGE_HOURS'] || '72').to_i * 3600
+      market_updated_at = cache_updated_at(market_cache_path)
+      moex_updated_at = cache_updated_at(moex_index_cache_path)
+      return true if cache_fresh?(market_cache_path, max_age) && cache_fresh?(moex_index_cache_path, max_age)
+
+      logger&.warn('intersection BUY skipped — stale caches ' \
+                   "(market updated=#{market_updated_at&.iso8601.inspect}, " \
+                   "moex updated=#{moex_updated_at&.iso8601.inspect}, " \
+                   "max_age_h=#{max_age / 3600})")
+      log_buy_funnel_scan(
+        logger, scan_id: scan_id, path: 'intersection', outcome: 'stale_cache',
+                market_updated_at: market_updated_at&.iso8601,
+                moex_updated_at: moex_updated_at&.iso8601,
+                max_age_hours: max_age / 3600
+      )
+      false
+    end
+
     def build_intersection_candidate(client, logic, state, ticker, max_lot_rub:, account_id:, lots_per_order:,
-                                     preflight: {}, logger: nil)
+                                     preflight: {}, logger: nil, scan_id: nil)
+      scan_id ||= new_buy_scan_id
+      candidate = build_intersection_signal_candidate(
+        client, logic, state, ticker,
+        max_lot_rub: max_lot_rub, lots_per_order: lots_per_order, logger: logger, scan_id: scan_id
+      )
+      return nil unless candidate
+
+      apply_intersection_risk_gates(
+        client, logic, state, candidate,
+        account_id: account_id, preflight: preflight, logger: logger, scan_id: scan_id
+      )
+    end
+
+    def build_intersection_signal_candidate(client, logic, state, ticker, max_lot_rub:, lots_per_order:,
+                                            logger:, scan_id:)
       logger&.debug("processing candidate #{ticker}")
-      return nil if buy_already_processed_today?(state, ticker)
+      if buy_already_processed_today?(state, ticker)
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection', stage: 'already_processed'
+        )
+      end
 
       # Авторитетный резолв: рублёвая акция TQBR, доступная для торгов через API.
       # Не доверяем строковому совпадению тикера из кеша (защита от "T" -> AT&T).
       share = resolve_tradable_share(client, ticker, logger: logger)
-      return nil unless share
+      unless share
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection', stage: 'instrument_resolution'
+        )
+      end
 
       figi = share[:figi]
       lot  = share[:lot]
 
       if instrument_quarantined?(state, figi)
         logger&.debug("skip #{ticker} (figi=#{figi}) — quarantined after permanent broker reject")
-        return nil
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'quarantine', figi: figi
+        )
       end
 
-      return nil unless valid_momentum_candidate?(client, ticker, figi, logger: logger)
+      momentum_trace = {}
+      unless valid_momentum_candidate?(
+        client, ticker, figi, logger: logger, scan_id: scan_id, trace: momentum_trace
+      )
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'momentum', figi: figi, **momentum_trace
+        )
+      end
 
       price = logic.last_price_for(figi)
       price_per_lot = price && lot ? (price * lot) : nil
@@ -204,58 +340,98 @@ module TradingLogic
 
       unless affordable_candidate?(price, lot, lots_per_order, max_lot_rub)
         logger&.debug("skip #{ticker} — price/lot missing or too expensive")
-        return nil
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'affordability', figi: figi,
+                  price: price, lot: lot, lots_per_order: lots_per_order, max_lot_rub: max_lot_rub
+        )
       end
 
       unless logic.dip_today?(figi)
         logger&.debug("skip #{ticker} — momentum OK but no intraday dip")
-        return nil
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'dip', figi: figi, price: price
+        )
       end
       logger&.debug("#{ticker} entry_stretch=#{logic.entry_stretch_metrics(figi, price: price).inspect}")
 
       if pending_order_active?(state, ticker)
         logger&.debug("BUY skipped for #{ticker} — active pending order cooldown")
-        return nil
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'pending_order', figi: figi
+        )
       end
 
-      buy_value = price * lot * lots_per_order
+      { tk: ticker, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order }
+    end
+
+    def apply_intersection_risk_gates(client, logic, state, candidate, account_id:, preflight:, logger:, scan_id:)
+      ticker = candidate[:tk]
+      figi = candidate[:figi]
+      price = candidate[:price]
+      buy_value = candidate[:price] * candidate[:lot] * candidate[:lots_per_order]
       preflight[:portfolio] = load_portfolio_snapshot(client, account_id, logger: logger) unless preflight.key?(:portfolio)
       portfolio = preflight[:portfolio]
-      return nil unless portfolio
+      unless portfolio
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'portfolio_preflight', figi: figi, reason: 'unavailable'
+        )
+      end
 
       unless position_within_limit?(
         client, account_id, figi, planned_buy_value: buy_value, portfolio: portfolio, logger: logger
       )
         logger&.debug("BUY skipped for #{ticker} — position share limit reached")
-        return nil
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'position_limit', figi: figi, buy_value: buy_value
+        )
       end
 
       unless daily_buy_within_limit?(state, buy_value, logger: logger)
         logger&.debug("BUY skipped for #{ticker} — daily buy budget reached")
-        return nil
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'daily_budget', figi: figi, buy_value: buy_value,
+                  committed_today: daily_buy_committed_total(state)
+        )
       end
 
       preflight[:positions] = load_positions_snapshot(client, account_id, logger: logger) unless preflight.key?(:positions)
-      return nil unless preflight[:positions]
+      unless preflight[:positions]
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'cash_preflight', figi: figi, reason: 'positions_unavailable'
+        )
+      end
 
       unless cash_sufficient_for_buy?(
         client, account_id, planned_buy_value: buy_value, positions: preflight[:positions], logger: logger
       )
         logger&.debug("BUY skipped for #{ticker} — insufficient cash")
-        return nil
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'cash', figi: figi, buy_value: buy_value
+        )
       end
 
       unless shares_share_within_limit?(
         client, account_id, planned_buy_value: buy_value, portfolio: portfolio, logger: logger
       )
         logger&.debug("BUY skipped for #{ticker} — shares exposure guard")
-        return nil
+        return reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'shares_exposure', figi: figi, buy_value: buy_value
+        )
       end
 
       support_distance = support_distance_for_candidate(logic, figi, price)
       logger&.debug("#{ticker} support_distance=#{support_distance.round(4)}")
 
-      { tk: ticker, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order, support_distance: support_distance }
+      candidate.merge(support_distance: support_distance)
     end
 
     def load_portfolio_snapshot(client, account_id, logger: nil)
@@ -291,7 +467,7 @@ module TradingLogic
       false
     end
 
-    def valid_momentum_candidate?(client, ticker, figi, logger: nil)
+    def valid_momentum_candidate?(client, ticker, figi, logger: nil, scan_id: nil, trace: nil)
       response = client.grpc_market_data.candles(
         figi: figi,
         from: (Time.now.utc - (8 * 86_400)),
@@ -305,12 +481,15 @@ module TradingLogic
 
       if closes.size < 4
         logger&.debug("skip #{ticker} — not enough daily closes (need 4 for a 3-change window)")
+        trace&.merge!(reason: 'not_enough_closes', closes_count: closes.size)
         return false
       end
 
       sequence = closes.last(4)
       verdicts = momentum_verdicts(sequence)
       rule = momentum_rule(logger: logger)
+      passed = verdicts.fetch(rule)
+      trace&.merge!(reason: passed ? 'passed' : 'active_rule_failed', active_rule: rule)
       # Shadow-лог: считаем ВСЕ варианты правила из тех же закрытий (ноль лишних
       # вызовов API) и пишем одной разборной строкой. Решение принимает только
       # активный rule; остальные копятся для сравнения на живых данных.
@@ -318,11 +497,12 @@ module TradingLogic
         "momentum_shadow ticker=#{ticker} " \
         "closes=#{sequence.map { |value| value.round(4) }.inspect} " \
         "#{verdicts.map { |name, ok| "#{name}=#{ok ? 1 : 0}" }.join(' ')} " \
-        "active=#{rule} pass=#{verdicts.fetch(rule) ? 1 : 0}"
+        "active=#{rule} pass=#{passed ? 1 : 0} scan_id=#{scan_id}"
       )
-      verdicts.fetch(rule)
+      passed
     rescue StandardError => e
       logger&.debug("candles request failed for #{ticker}/#{figi}: #{e.class}: #{e.message}")
+      trace&.merge!(reason: 'candles_unavailable', error_class: e.class.to_s)
       false
     end
 
@@ -367,7 +547,8 @@ module TradingLogic
       1.0
     end
 
-    def execute_intersection_buy_candidate!(logic, state, candidate, account_id:, logger: nil)
+    def execute_intersection_buy_candidate!(logic, state, candidate, account_id:, logger: nil, scan_id: nil)
+      scan_id ||= new_buy_scan_id
       result = begin
         logic.confirm_and_place_order_with_result(
           account_id: account_id,
@@ -384,8 +565,27 @@ module TradingLogic
 
       result[:figi] ||= candidate[:figi]
 
-      sync_pending_order!(state, candidate[:tk], result)
-      return handle_successful_intersection_buy!(state, candidate, result, logger: logger) if successful_buy_result?(result)
+      buy_value = candidate[:price] * candidate[:lot] * candidate[:lots_per_order]
+      account_buy_result!(
+        state, candidate[:tk], result, planned_value: buy_value, logger: logger, scan_id: scan_id
+      )
+      category = result[:category].to_s
+      committed = successful_buy_result?(result)
+      log_buy_funnel(
+        logger,
+        scan_id: scan_id,
+        ticker: candidate[:tk],
+        path: 'intersection',
+        stage: 'order',
+        outcome: committed ? 'committed' : 'rejected',
+        reason: category.empty? ? 'unknown' : category,
+        figi: candidate[:figi],
+        price: candidate[:price],
+        buy_value: buy_value,
+        client_order_id: pending_client_order_id(result),
+        broker_order_id: pending_broker_order_id(result)
+      )
+      return handle_successful_intersection_buy!(state, candidate, result, logger: logger) if committed
 
       # Постоянный отказ (инструмент недоступен для торгов, 30079) — в карантин,
       # чтобы не долбить брокера каждую минуту одним и тем же FIGI.
@@ -407,7 +607,6 @@ module TradingLogic
       category = result[:category].to_s
       logger&.debug("BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) category=#{category} order_id=#{response&.order_id}")
       mark_action!(state, 'last_buy', candidate[:tk]) if buy_execution_result?(result)
-      register_daily_buy!(state, candidate[:price] * candidate[:lot] * candidate[:lots_per_order])
       true
     rescue StandardError
       true
@@ -677,10 +876,9 @@ module TradingLogic
     # сколько рублей в день бот вообще может потратить и какую долю счёта держать
     # в акциях (остаток — «сухой порох» под будущие просадки).
 
-    # Считаем деньги ЗАНЯТЫМИ в момент отправки ордера, а не исполнения: лимитные
-    # заявки исполняются асинхронно, и если ждать факта, за день можно наотправлять
-    # заявок далеко за бюджет. Неисполненная заявка «съест» лимит до конца дня —
-    # намеренный перекос в безопасную сторону.
+    # Исполненные суммы и открытые резервы храним раздельно, но оба компонента
+    # участвуют в preflight. Так несколько асинхронных лимиток не могут превысить
+    # дневной бюджет, а подтверждённая отмена освобождает только неисполненный остаток.
     def buy_committed_result?(result)
       successful_buy_result?(result)
     end
@@ -698,16 +896,52 @@ module TradingLogic
       state['daily_buys'][day]
     end
 
+    def unregister_daily_buy!(state, value, day: today_key)
+      ensure_state_defaults!(state)
+      state['daily_buys'][day] = [daily_buy_total(state, day: day) - value.to_f, 0.0].max
+    end
+
+    def pending_buy_reserved_total(state)
+      ensure_state_defaults!(state)
+      state['pending_orders'].sum do |_ticker, info|
+        next 0.0 unless info.is_a?(Hash)
+        next 0.0 unless %w[sent_not_filled partially_filled].include?(info['status'].to_s)
+
+        info['reserved_value'].to_f
+      end
+    end
+
+    def pending_buy_reservation_unknown?(state)
+      ensure_state_defaults!(state)
+      state['pending_orders'].any? do |_ticker, info|
+        info.is_a?(Hash) &&
+          %w[sent_not_filled partially_filled].include?(info['status'].to_s) &&
+          !info.key?('reserved_value')
+      end
+    end
+
+    def daily_buy_committed_total(state, day: today_key)
+      daily_buy_total(state, day: day) + pending_buy_reserved_total(state)
+    end
+
     def daily_buy_within_limit?(state, planned_buy_value, max_daily_rub: nil, logger: nil)
       max_daily_rub = (max_daily_rub || ENV['MAX_DAILY_BUY_RUB'] || 0).to_f
       return true unless max_daily_rub.positive?
 
-      spent = daily_buy_total(state)
+      if pending_buy_reservation_unknown?(state)
+        logger&.warn('daily buy budget blocked: active legacy pending order has unknown reservation')
+        return false
+      end
+
+      filled = daily_buy_total(state)
+      reserved = pending_buy_reserved_total(state)
+      committed = filled + reserved
       planned = planned_buy_value.to_f
-      return true if (spent + planned) <= max_daily_rub
+      return true if (committed + planned) <= max_daily_rub
 
       logger&.info(
-        "daily buy budget reached: spent=#{spent.round(2)} + planned=#{planned.round(2)} " \
+        "daily buy budget reached: filled=#{filled.round(2)} reserved=#{reserved.round(2)} " \
+        "committed=#{committed.round(2)} + planned=#{planned.round(2)} " \
         "> MAX_DAILY_BUY_RUB=#{max_daily_rub}"
       )
       false
@@ -841,11 +1075,12 @@ module TradingLogic
       true
     end
 
-    def cleanup_pending_orders!(client, account_id, state, logger: nil)
+    def cleanup_pending_orders!(client, account_id, state, logger: nil, ttl_minutes: nil)
       ensure_state_defaults!(state)
       pending = state['pending_orders']
       return if pending.empty?
 
+      ttl_minutes = (ttl_minutes.nil? ? ENV.fetch('BUY_ORDER_TTL_MIN', '0') : ttl_minutes).to_f
       active_orders = fetch_active_orders(client, account_id, logger: logger)
       unless active_orders[:ok]
         logger&.warn(
@@ -855,31 +1090,121 @@ module TradingLogic
         return
       end
 
-      to_delete = []
-      pending.each do |ticker, info|
-        migrate_pending_order_metadata!(client, ticker, info, active_orders: active_orders, logger: logger)
+      to_delete = pending.filter_map do |ticker, info|
+        ticker if cleanup_pending_order!(
+          client, account_id, state, ticker, info,
+          active_orders: active_orders, ttl_minutes: ttl_minutes, logger: logger
+        )
+      end
+      to_delete.each { |ticker| pending.delete(ticker) }
+    end
 
-        unless pending_order_ids_present?(info)
-          logger&.warn("pending order for #{ticker} has no known IDs — keeping entry for safety")
-          next
-        end
-
-        next if active_pending_order?(info, active_orders)
-
-        reconciliation = reconcile_missing_pending_order!(client, account_id, state, ticker, info, logger: logger)
-        case reconciliation
-        when :executed, :not_executed
-          logger&.debug(
-            "cleaned up pending order for #{ticker} " \
-            "(client_id=#{info['client_order_id'].inspect}, broker_id=#{info['broker_order_id'].inspect})"
-          )
-          to_delete << ticker
-        when :unknown
-          logger&.warn("pending order for #{ticker} left untouched — execution status unknown")
-        end
+    def cleanup_pending_order!(client, account_id, state, ticker, info, active_orders:, ttl_minutes:, logger:)
+      migrate_pending_order_metadata!(client, ticker, info, active_orders: active_orders, logger: logger)
+      unless pending_order_ids_present?(info)
+        logger&.warn("pending order for #{ticker} has no known IDs — keeping entry for safety")
+        return false
       end
 
-      to_delete.each { |ticker| pending.delete(ticker) }
+      active_order = find_active_pending_order(info, active_orders)
+      if active_order
+        reconcile_active_pending_accounting!(state, info, active_order, logger: logger)
+        request_stale_pending_cancel!(
+          client, account_id, ticker, info, ttl_minutes: ttl_minutes, logger: logger
+        )
+        return false
+      end
+
+      explicit_status_required = info['cancel_requested_at'] || info['status'].to_s == 'partially_filled'
+      result = if explicit_status_required
+                 reconcile_explicit_pending_state!(
+                   client, account_id, state, ticker, info,
+                   cancel_requested: !info['cancel_requested_at'].to_s.empty?,
+                   logger: logger
+                 )
+               else
+                 reconcile_missing_pending_order!(client, account_id, state, ticker, info, logger: logger)
+               end
+      return log_terminal_pending_cleanup(logger, ticker, info, result) if %i[executed not_executed].include?(result)
+
+      label = explicit_status_required ? 'terminal status' : 'execution status'
+      logger&.warn("pending order for #{ticker} left untouched — #{label} unknown")
+      false
+    end
+
+    def log_terminal_pending_cleanup(logger, ticker, info, outcome)
+      log_buy_order_lifecycle(
+        logger, ticker: ticker, info: info, event: 'terminal',
+                outcome: outcome, filled_value: info['filled_value'],
+                released_value: info['reserved_value']
+      )
+      logger&.debug(
+        "cleaned up pending order for #{ticker} " \
+        "(client_id=#{info['client_order_id'].inspect}, broker_id=#{info['broker_order_id'].inspect})"
+      )
+      true
+    end
+
+    # Освобождать резерв можно ТОЛЬКО по явному терминальному статусу: CANCELLED,
+    # REJECTED или полный FILL. Отсутствие заявки в одной выдаче GetOrders и статус
+    # PARTIALLYFILL терминальными не считаются — заявка может быть ещё жива.
+    def reconcile_explicit_pending_state!(client, account_id, state, ticker, info, cancel_requested:, logger: nil)
+      unless client.respond_to?(:order_state)
+        logger&.warn("terminal status unavailable for #{ticker}: client has no order_state")
+        return unresolved_explicit_pending_state(logger, ticker, info, cancel_requested: cancel_requested)
+      end
+
+      broker_order_id = info['broker_order_id'].to_s
+      return unresolved_explicit_pending_state(logger, ticker, info, cancel_requested: cancel_requested) if broker_order_id.empty?
+
+      response = client.order_state(account_id: account_id, order_id: broker_order_id)
+      if response.respond_to?(:success?) && !response.success?
+        logger&.warn("terminal status lookup failed for #{ticker}: broker response is unsuccessful")
+        return unresolved_explicit_pending_state(logger, ticker, info, cancel_requested: cancel_requested)
+      end
+
+      order = response.respond_to?(:payload) ? response.payload : response
+      status = order_status(order)
+      reconcile_active_pending_accounting!(state, info, order, logger: logger)
+      fully_filled = status.include?('FILL') && !status.include?('PARTIAL')
+      terminal = status.include?('CANCEL') || status.include?('REJECT') || fully_filled
+      unless terminal
+        return unresolved_explicit_pending_state(
+          logger, ticker, info, cancel_requested: cancel_requested, status: status
+        )
+      end
+
+      return :not_executed unless order_has_executed_lots?(order)
+
+      mark_action!(state, 'last_buy', ticker)
+      :executed
+    rescue StandardError => e
+      logger&.warn("terminal status lookup failed for #{ticker}: #{e.class}: #{e.message}")
+      unresolved_explicit_pending_state(logger, ticker, info, cancel_requested: cancel_requested)
+    end
+
+    def unresolved_explicit_pending_state(logger, ticker, info, cancel_requested:, status: nil)
+      attempts = increment_terminal_confirm_attempts!(info)
+      subject = cancel_requested ? 'cancel' : 'terminal status'
+      logger&.debug(
+        "#{subject} not confirmed for #{ticker} status=#{status.to_s.empty? ? 'unavailable' : status} " \
+        "attempt=#{attempts} — reservation kept"
+      )
+      alert_stuck_pending_order!(logger, ticker, info, cancel_requested: cancel_requested)
+      :unknown
+    end
+
+    # Older local state may contain cancel_confirm_attempts. Read it as an alias,
+    # then continue under the neutral name because terminal checks also happen
+    # when automatic cancellation is disabled.
+    def terminal_confirm_attempts(info)
+      [info['terminal_confirm_attempts'].to_i, info['cancel_confirm_attempts'].to_i].max
+    end
+
+    def increment_terminal_confirm_attempts!(info)
+      attempts = terminal_confirm_attempts(info) + 1
+      info['terminal_confirm_attempts'] = attempts
+      attempts
     end
 
     def fetch_active_orders(client, account_id, logger: nil)
@@ -903,6 +1228,8 @@ module TradingLogic
       broker_ids = Set.new
       client_ids = Set.new
       broker_by_client = {}
+      orders_by_broker = {}
+      orders_by_client = {}
 
       orders.each do |order|
         broker_id = order_broker_id(order)
@@ -911,13 +1238,17 @@ module TradingLogic
         broker_ids << broker_id if broker_id
         client_ids << client_id if client_id
         broker_by_client[client_id] = broker_id if client_id && broker_id
+        orders_by_broker[broker_id] = order if broker_id
+        orders_by_client[client_id] = order if client_id
       end
 
       {
         ok: true,
         broker_order_ids: broker_ids,
         client_order_ids: client_ids,
-        broker_id_by_client_id: broker_by_client
+        broker_id_by_client_id: broker_by_client,
+        orders_by_broker_id: orders_by_broker,
+        orders_by_client_id: orders_by_client
       }
     rescue StandardError => e
       logger&.warn("get_orders exception: #{e.class}: #{e.message}")
@@ -946,11 +1277,24 @@ module TradingLogic
     end
 
     def reconcile_missing_pending_order!(client, account_id, state, ticker, info, logger: nil)
-      status = pending_buy_execution_state(client, account_id, info, logger: logger)
-      return :not_executed if status == :not_executed
-      return :unknown if status == :unknown
+      legacy_accounting = !info.key?('reserved_value')
+      execution = pending_buy_execution_state(client, account_id, info, logger: logger)
+      return :not_executed if execution[:status] == :not_executed
+      return :unknown if execution[:status] == :unknown
 
-      logger&.info("pending BUY resolved with execution for #{ticker} — marking last_buy")
+      total_filled = execution[:amount]
+      total_filled = info['planned_value'].to_f unless total_filled&.positive?
+      already_registered = info['filled_value'].to_f
+      # Legacy state already included the full submitted amount in daily_buys.
+      # If the order disappeared before we could migrate it from active OrderState,
+      # keep that conservative amount and avoid registering the execution twice.
+      newly_filled = legacy_accounting ? 0.0 : [total_filled.to_f - already_registered, 0.0].max
+      register_daily_buy!(state, newly_filled, day: execution[:day]) if newly_filled.positive?
+
+      logger&.info(
+        "pending BUY resolved with execution for #{ticker} — marking last_buy " \
+        "newly_filled=#{newly_filled.round(2)} released=#{info['reserved_value'].to_f.round(2)}"
+      )
       mark_action!(state, 'last_buy', ticker)
       :executed
     rescue StandardError => e
@@ -966,18 +1310,45 @@ module TradingLogic
       figi = pending_info['figi'].to_s
       if figi.empty?
         logger&.warn('pending reconciliation skipped: FIGI is missing')
-        return :unknown
+        return { status: :unknown }
       end
 
       fetched = operations_between(client, account_id, from: from, to: to)
-      return :unknown unless fetched[:ok]
+      return { status: :unknown } unless fetched[:ok]
 
-      executed = fetched[:operations].any? do |op|
+      matching = fetched[:operations].select do |op|
         operation_buy_executed_for_figi?(op, figi)
       end
-      return :unknown if !executed && fetched[:has_next]
+      return { status: :unknown } if matching.empty? && fetched[:has_next]
+      return { status: :not_executed } if matching.empty?
 
-      executed ? :executed : :not_executed
+      amounts = matching.filter_map { |op| operation_payment_abs(op) }
+      amount = amounts.sum if amounts.any?
+      execution_time = matching.filter_map { |op| operation_time(op) }.max
+      { status: :executed, amount: amount, day: (execution_time || Time.now.utc).strftime('%Y-%m-%d') }
+    end
+
+    def operation_payment_abs(op)
+      payment = structured_value(op, :payment)
+      value = Utils.q_to_decimal(payment)
+      value&.abs
+    rescue StandardError
+      nil
+    end
+
+    def operation_time(op)
+      candidate = structured_value(op, :date, :time, :timestamp)
+      return nil unless candidate
+
+      if candidate.respond_to?(:seconds)
+        Time.at(candidate.seconds).utc
+      elsif candidate.is_a?(Time)
+        candidate.utc
+      else
+        Time.parse(candidate.to_s).utc
+      end
+    rescue StandardError
+      nil
     end
 
     def operations_between(client, account_id, from:, to:)
@@ -1083,7 +1454,85 @@ module TradingLogic
       nil
     end
 
-    def sync_pending_order!(state, ticker, result)
+    def account_buy_result!(state, ticker, result, planned_value:, day: today_key, logger: nil, scan_id: nil)
+      accounting = buy_result_accounting(result, planned_value: planned_value)
+      register_daily_buy!(state, accounting[:filled_value], day: day) if accounting[:filled_value].positive?
+      sync_pending_order!(
+        state, ticker, result, accounting: accounting, reservation_day: day, scan_id: scan_id
+      )
+      logger&.debug(
+        "BUY accounting ticker=#{ticker} filled=#{accounting[:filled_value].round(2)} " \
+        "reserved=#{accounting[:reserved_value].round(2)} planned=#{planned_value.to_f.round(2)}"
+      )
+      accounting
+    end
+
+    def buy_result_accounting(result, planned_value:)
+      planned = planned_value.to_f
+      return { filled_value: 0.0, reserved_value: 0.0, planned_value: planned } unless successful_buy_result?(result)
+
+      fully_filled = result[:category].to_s == 'filled' || result[:ok] == true
+      order_fill_split(result[:response], planned_value: planned, fully_filled: fully_filled)
+    end
+
+    # Единственный источник правды о том, какая часть заявки уже исполнена, а какая
+    # ещё держит бюджет. Считаем ТОЛЬКО по лотам: total_order_amount — это
+    # «итоговая стоимость заявки, включающая все комиссии» (orders.proto), она
+    # положительна и у неисполненного лимитника, поэтому как объём исполнения
+    # непригодна. executed_order_price тоже не годится: в PostOrderResponse это
+    # средняя цена ОДНОГО инструмента, а в OrderState — уже произведение на лоты.
+    # reserved считаем вычитанием, чтобы filled + reserved == planned по построению.
+    def order_fill_split(order, planned_value:, fully_filled: false)
+      planned = planned_value.to_f
+      return { filled_value: planned, reserved_value: 0.0, planned_value: planned } if fully_filled
+
+      requested = order_numeric_field(order, :lots_requested)
+      executed = order_numeric_field(order, :lots_executed)
+      executed = order_numeric_field(order, :executed_order_lots) if executed.nil?
+
+      unless requested&.positive? && executed && executed >= 0
+        # Старый/неполный ответ брокера: весь planned остаётся обязательством.
+        # Это менее точно, но не позволяет превысить дневной лимит.
+        return { filled_value: 0.0, reserved_value: planned, planned_value: planned }
+      end
+
+      filled = planned * ([executed, requested].min / requested)
+      { filled_value: filled, reserved_value: [planned - filled, 0.0].max, planned_value: planned }
+    rescue StandardError
+      { filled_value: 0.0, reserved_value: planned_value.to_f, planned_value: planned_value.to_f }
+    end
+
+    def order_numeric_field(order, field)
+      raw = structured_order_value(order, field)
+      return nil if raw.nil?
+
+      raw.respond_to?(:units) ? Utils.q_to_decimal(raw).to_f : raw.to_f
+    rescue StandardError
+      nil
+    end
+
+    def order_money_field(order, field)
+      raw = structured_order_value(order, field)
+      return nil if raw.nil?
+
+      value = if raw.respond_to?(:units)
+                Utils.q_to_decimal(raw)
+              elsif raw.is_a?(Hash)
+                units = structured_value(raw, :units).to_f
+                nano = structured_value(raw, :nano).to_f
+                units + (nano / 1_000_000_000.0)
+              end
+      value&.abs
+    rescue StandardError
+      nil
+    end
+
+    def structured_order_value(order, field)
+      camel = field.to_s.gsub(/_([a-z])/) { Regexp.last_match(1).upcase }
+      structured_value(order, field, camel.to_sym)
+    end
+
+    def sync_pending_order!(state, ticker, result, accounting: nil, reservation_day: today_key, scan_id: nil)
       ensure_state_defaults!(state)
       category = result[:category].to_s
       pending_status =
@@ -1102,8 +1551,14 @@ module TradingLogic
           'ticker' => ticker,
           'figi' => result[:figi],
           'ts' => submitted_at || Time.now.utc.iso8601,
-          'status' => pending_status
+          'status' => pending_status,
+          'planned_value' => accounting && accounting[:planned_value],
+          'filled_value' => accounting && accounting[:filled_value],
+          'reserved_value' => accounting && accounting[:reserved_value],
+          'reservation_day' => reservation_day,
+          'scan_id' => scan_id
         }
+        state['pending_orders'][ticker].compact!
       else
         state['pending_orders'].delete(ticker)
       end
@@ -1152,34 +1607,40 @@ module TradingLogic
         operations = resp.respond_to?(:operations) ? resp.operations : []
       end
 
-      operations.each do |op|
-        kind = operation_kind(op)
-        next unless kind
-
-        figi = op.respond_to?(:figi) ? op.figi.to_s : ''
-        next if figi.empty?
-
-        ticker = resolve_ticker_for_sell(client, figi: figi, logger: logger)
-        next unless ticker
-
-        ts = operation_ts_iso8601(op)
-        if kind == :buy
-          state['last_buy'][day] ||= {}
-          state['last_buy'][day][ticker] = true
-        elsif kind == :sell
-          state['last_sell'][ticker] = {
-            'figi' => figi,
-            'ts' => ts,
-            'reason' => 'broker_restore'
-          }
-        end
-      end
+      operations.each { |op| restore_broker_operation!(client, state, op, day: day, logger: logger) }
 
       restore_pending_buy_orders!(client, account_id, state, logger: logger)
       state
     rescue StandardError => e
       logger&.error("state restore from broker failed: #{e.class}: #{e.message}")
       state
+    end
+
+    def restore_broker_operation!(client, state, operation, day:, logger: nil)
+      kind = operation_kind(operation)
+      return unless kind
+
+      if kind == :buy
+        payment = operation_payment_abs(operation)
+        register_daily_buy!(state, payment, day: day) if payment&.positive?
+      end
+
+      figi = operation.respond_to?(:figi) ? operation.figi.to_s : ''
+      return if figi.empty?
+
+      ticker = resolve_ticker_for_sell(client, figi: figi, logger: logger)
+      return unless ticker
+
+      if kind == :buy
+        state['last_buy'][day] ||= {}
+        state['last_buy'][day][ticker] = true
+      else
+        state['last_sell'][ticker] = {
+          'figi' => figi,
+          'ts' => operation_ts_iso8601(operation),
+          'reason' => 'broker_restore'
+        }
+      end
     end
 
     def today_key
@@ -1309,12 +1770,8 @@ module TradingLogic
     end
 
     def order_status(order)
-      if order.respond_to?(:execution_report_status)
-        order.execution_report_status.to_s.upcase
-      elsif order.respond_to?(:status)
-        order.status.to_s.upcase
-      else
-        ''
+      structured_order_value(order, :execution_report_status).to_s.upcase.then do |status|
+        status.empty? ? structured_order_value(order, :status).to_s.upcase : status
       end
     end
 
@@ -1323,14 +1780,23 @@ module TradingLogic
     end
 
     def restored_pending_order_payload(order, ticker, pending_status)
-      {
+      planned = order_money_field(order, :initial_order_price)
+      # initial_order_price = запрошенные лоты × цена, поэтому это корректный planned.
+      # Долю исполнения берём тем же общим методом, что и для свежего ответа брокера.
+      split = planned && order_fill_split(order, planned_value: planned)
+      payload = {
         'client_order_id' => order_request_id(order),
         'broker_order_id' => order_broker_id(order),
         'ticker' => ticker,
         'figi' => order_figi(order),
         'ts' => order_submitted_at(order) || Time.now.utc.iso8601,
-        'status' => pending_status
+        'status' => pending_status,
+        'planned_value' => planned,
+        'filled_value' => split && split[:filled_value],
+        'reserved_value' => split && split[:reserved_value],
+        'reservation_day' => today_key
       }
+      payload.compact
     end
 
     def order_submitted_at(order)
@@ -1359,12 +1825,8 @@ module TradingLogic
     end
 
     def order_has_executed_lots?(order)
-      value =
-        if order.respond_to?(:lots_executed)
-          order.lots_executed
-        elsif order.respond_to?(:executed_order_lots)
-          order.executed_order_lots
-        end
+      value = structured_order_value(order, :lots_executed)
+      value = structured_order_value(order, :executed_order_lots) if value.nil?
       numeric =
         if value.respond_to?(:units)
           Utils.q_to_decimal(value)
@@ -1398,13 +1860,176 @@ module TradingLogic
       info['client_order_id'].to_s != '' || info['broker_order_id'].to_s != ''
     end
 
-    def active_pending_order?(info, active_orders)
+    def find_active_pending_order(info, active_orders)
       client_order_id = info['client_order_id'].to_s
       broker_order_id = info['broker_order_id'].to_s
 
-      client_match = !client_order_id.empty? && active_orders[:client_order_ids].include?(client_order_id)
-      broker_match = !broker_order_id.empty? && active_orders[:broker_order_ids].include?(broker_order_id)
-      client_match || broker_match
+      by_client = active_orders[:orders_by_client_id] || {}
+      by_broker = active_orders[:orders_by_broker_id] || {}
+      by_client[client_order_id] || by_broker[broker_order_id]
+    end
+
+    def active_pending_order?(info, active_orders)
+      !find_active_pending_order(info, active_orders).nil?
+    end
+
+    def reconcile_active_pending_accounting!(state, info, order, logger: nil)
+      migrate_legacy_pending_accounting!(state, info, order, logger: logger)
+      planned = info['planned_value'].to_f
+      return unless planned.positive?
+
+      status = pending_status_for_order(order) || info['status'].to_s
+      accounting = buy_result_accounting(
+        { category: status, response: order },
+        planned_value: planned
+      )
+      registered = info['filled_value'].to_f
+      newly_filled = [accounting[:filled_value] - registered, 0.0].max
+      register_daily_buy!(state, newly_filled) if newly_filled.positive?
+
+      effective_filled = [registered, accounting[:filled_value]].max
+      info['status'] = status
+      info['filled_value'] = effective_filled
+      # Broker snapshots may be stale or omit lot counters. Never move an already
+      # observed fill back into the reservation; preserve the split invariant.
+      info['reserved_value'] = [planned - effective_filled, 0.0].max
+      logger&.debug(
+        "pending BUY accounting ticker=#{info['ticker']} newly_filled=#{newly_filled.round(2)} " \
+        "filled=#{info['filled_value'].to_f.round(2)} reserved=#{info['reserved_value'].to_f.round(2)}"
+      )
+    end
+
+    def migrate_legacy_pending_accounting!(state, info, order, logger: nil)
+      return if info.key?('reserved_value')
+
+      planned = order_money_field(order, :initial_order_price)
+      return unless planned&.positive?
+
+      reservation_day = pending_order_ts(info)&.strftime('%Y-%m-%d') || today_key
+      unregister_daily_buy!(state, planned, day: reservation_day)
+      info['planned_value'] = planned
+      info['filled_value'] = 0.0
+      info['reserved_value'] = planned
+      info['reservation_day'] = reservation_day
+      logger&.info(
+        "migrated legacy pending BUY accounting ticker=#{info['ticker']} " \
+        "planned=#{planned.round(2)} day=#{reservation_day}"
+      )
+    end
+
+    # Отмена может не дойти до брокера или не примениться, поэтому её повторяем с
+    # экспоненциальным backoff. Резерв при этом НЕ освобождается: единственный
+    # источник правды о судьбе заявки — терминальный статус из GetOrderState.
+    def cancel_retry_due?(info, now: Time.now.utc)
+      last_attempt = begin
+        Time.parse(info['cancel_requested_at'].to_s).utc
+      rescue StandardError
+        nil
+      end
+      return true unless last_attempt
+
+      attempts = info['cancel_attempts'].to_i
+      base = (ENV['BUY_CANCEL_RETRY_MIN'] || '5').to_f
+      return false unless base.positive?
+
+      backoff = base * (2**[attempts - 1, 0].max)
+      backoff = [backoff, 60.0].min
+      (now - last_attempt) >= (backoff * 60)
+    end
+
+    def cancel_max_attempts
+      value = (ENV['BUY_CANCEL_MAX_ATTEMPTS'] || '5').to_i
+      value.positive? ? value : 5
+    end
+
+    # Один ERROR на застрявшую заявку — тем же каналом, что и BUY HALTED. Резерв
+    # продолжает держать бюджет: это состояние требует ручного разбора, а не
+    # автоматического освобождения денег.
+    def alert_stuck_pending_order!(logger, ticker, info, cancel_requested: nil)
+      return false if info['cancel_alerted']
+
+      attempts = info['cancel_attempts'].to_i
+      confirms = terminal_confirm_attempts(info)
+      return false if attempts < cancel_max_attempts && confirms < cancel_max_attempts
+
+      cancel_flow = if cancel_requested.nil?
+                      attempts.positive? || !info['cancel_requested_at'].to_s.empty?
+                    else
+                      cancel_requested
+                    end
+      event = cancel_flow ? 'cancel_stuck' : 'terminal_status_stuck'
+      alert = cancel_flow ? 'BUY CANCEL STUCK' : 'BUY PENDING STUCK'
+      info['cancel_alerted'] = true
+      log_buy_order_lifecycle(
+        logger, ticker: ticker, info: info, event: event,
+                cancel_attempts: attempts, terminal_confirm_attempts: confirms,
+                reserved_value: info['reserved_value']
+      )
+      logger&.error(
+        "#{alert} #{ticker} order_id=#{info['broker_order_id']} " \
+        "cancel_attempts=#{attempts} terminal_confirm_attempts=#{confirms} " \
+        "reserved=#{info['reserved_value'].to_f.round(2)} — reservation kept, manual check required"
+      )
+      true
+    end
+
+    def request_stale_pending_cancel!(client, account_id, ticker, info, ttl_minutes:, logger: nil)
+      return false unless ttl_minutes.positive?
+      return false unless cancel_retry_due?(info)
+
+      submitted_at = pending_order_ts(info)
+      return false unless submitted_at
+      return false if (Time.now.utc - submitted_at) < (ttl_minutes * 60)
+
+      broker_order_id = info['broker_order_id'].to_s
+      if broker_order_id.empty?
+        logger&.warn("stale pending BUY #{ticker} cannot be cancelled: broker_order_id is missing")
+        return false
+      end
+      unless client.respond_to?(:cancel_order)
+        logger&.warn("stale pending BUY #{ticker} cannot be cancelled: client has no cancel_order")
+        return false
+      end
+
+      info['cancel_requested_at'] = Time.now.utc.iso8601
+      info['cancel_attempts'] = info['cancel_attempts'].to_i + 1
+      attempt = info['cancel_attempts']
+
+      response = client.cancel_order(account_id: account_id, order_id: broker_order_id)
+      if response.respond_to?(:success?) && !response.success?
+        log_buy_order_lifecycle(
+          logger, ticker: ticker, info: info, event: 'cancel_failed',
+                  reserved_value: info['reserved_value'], ttl_minutes: ttl_minutes,
+                  attempt: attempt, reason: 'broker_response_unsuccessful'
+        )
+        logger&.warn("stale pending BUY cancel failed for #{ticker}: broker response is unsuccessful")
+        alert_stuck_pending_order!(logger, ticker, info)
+        return false
+      end
+
+      log_buy_order_lifecycle(
+        logger, ticker: ticker, info: info, event: 'cancel_requested',
+                reserved_value: info['reserved_value'], ttl_minutes: ttl_minutes,
+                attempt: attempt
+      )
+      logger&.info(
+        "stale pending BUY cancel requested for #{ticker} order_id=#{broker_order_id} " \
+        "attempt=#{attempt} " \
+        "age_min=#{((Time.now.utc - submitted_at) / 60).round(1)} ttl_min=#{ttl_minutes}"
+      )
+      alert_stuck_pending_order!(logger, ticker, info)
+      true
+    rescue StandardError => e
+      if defined?(attempt) && attempt
+        log_buy_order_lifecycle(
+          logger, ticker: ticker, info: info, event: 'cancel_failed',
+                  reserved_value: info['reserved_value'], ttl_minutes: ttl_minutes,
+                  attempt: attempt, reason: e.class.to_s
+        )
+        alert_stuck_pending_order!(logger, ticker, info)
+      end
+      logger&.warn("stale pending BUY cancel failed for #{ticker}: #{e.class}: #{e.message}")
+      false
     end
 
     def pending_broker_order_id(result)
