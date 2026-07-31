@@ -1868,8 +1868,11 @@ RSpec.describe TradingLogic::StrategyHelpers do
       client = double('client')
       ops = double('ops')
       instruments = double('instruments')
+      orders = double('orders')
       allow(client).to receive(:grpc_operations).and_return(ops)
       allow(client).to receive(:grpc_instruments).and_return(instruments)
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
       allow(ops).to receive(:portfolio).and_return(OpenStruct.new(positions: [position]))
       allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 10))
 
@@ -1877,9 +1880,9 @@ RSpec.describe TradingLogic::StrategyHelpers do
       allow(logic).to receive(:should_sell?).and_return(true)
       allow(logic).to receive(:last_price_for).with('F1').and_return(50.0)
       captured = nil
-      allow(logic).to receive(:confirm_and_place_order) do |**kw|
+      allow(logic).to receive(:confirm_and_place_order_with_result) do |**kw|
         captured = kw
-        OpenStruct.new(order_id: 'o')
+        { ok: false, category: :sent_not_filled, response: OpenStruct.new(order_id: 'o') }
       end
 
       described_class.try_sell_positions_with_logic!(
@@ -1889,6 +1892,30 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
       # 100 бумаг / лот 10 = 10 лотов, продаём 1 лот
       expect(captured[:quantity]).to eq(1)
+    end
+
+    it 'skips the signal SELL when the broker already has an active SELL for the figi' do
+      position = OpenStruct.new(figi: 'F1', instrument_type: 'SHARE', quantity: OpenStruct.new(units: 10))
+      active_sell = OpenStruct.new(
+        figi: 'F1', direction: 'ORDER_DIRECTION_SELL', order_id: 'active-sell',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_NEW'
+      )
+      client = double('client')
+      allow(client).to receive(:grpc_orders).and_return(
+        double('orders', get_orders: OpenStruct.new(orders: [active_sell]))
+      )
+      allow(client).to receive(:grpc_operations).and_return(
+        double('ops', portfolio: OpenStruct.new(positions: [position]))
+      )
+      allow(client).to receive(:grpc_instruments)
+
+      logic = double('logic')
+      expect(logic).not_to receive(:should_sell?)
+      expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+      described_class.try_sell_positions_with_logic!(
+        client, logic, 'acc', described_class.default_state, figi_cache: { 'F1' => 'AAA' }
+      )
     end
   end
 
@@ -1903,8 +1930,11 @@ RSpec.describe TradingLogic::StrategyHelpers do
       client = double('client')
       ops = double('ops')
       instruments = double('instruments')
+      orders = double('orders')
       allow(client).to receive(:grpc_operations).and_return(ops)
       allow(client).to receive(:grpc_instruments).and_return(instruments)
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
       allow(ops).to receive(:portfolio).and_return(OpenStruct.new(positions: [position]))
       allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 10, ticker: 'AAA'))
 
@@ -1912,17 +1942,19 @@ RSpec.describe TradingLogic::StrategyHelpers do
       allow(logic).to receive(:should_force_exit?).with(position, 'F1').and_return(true)
       allow(logic).to receive(:last_price_for).with('F1').and_return(150.0)
       captured = nil
-      allow(logic).to receive(:confirm_and_place_order) do |**kw|
+      allow(logic).to receive(:confirm_and_place_order_with_result) do |**kw|
         captured = kw
-        OpenStruct.new(order_id: 'force-1')
+        { ok: false, category: :sent_not_filled, response: OpenStruct.new(order_id: 'force-1') }
       end
 
+      state = described_class.default_state
       described_class.try_force_exit_positions_with_logic!(
-        client, logic, 'acc', figi_cache: { 'F1' => 'AAA' }
+        client, logic, 'acc', state: state, figi_cache: { 'F1' => 'AAA' }
       )
 
       expect(captured[:figi]).to eq('F1')
       expect(captured[:quantity]).to eq(10)
+      expect(state.fetch('last_sell').fetch('AAA').fetch('reason')).to eq('force_exit')
     end
 
     it 'skips force-exit when instrument lot size cannot be resolved' do
@@ -1935,19 +1967,67 @@ RSpec.describe TradingLogic::StrategyHelpers do
       client = double('client')
       ops = double('ops')
       instruments = double('instruments')
+      orders = double('orders')
       allow(client).to receive(:grpc_operations).and_return(ops)
       allow(client).to receive(:grpc_instruments).and_return(instruments)
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
       allow(ops).to receive(:portfolio).and_return(OpenStruct.new(positions: [position]))
       allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_raise(StandardError, 'lookup failed')
 
       logic = double('logic')
       allow(logic).to receive(:should_force_exit?).with(position, 'F1').and_return(true)
       expect(logic).not_to receive(:last_price_for)
-      expect(logic).not_to receive(:confirm_and_place_order)
+      expect(logic).not_to receive(:confirm_and_place_order_with_result)
 
       described_class.try_force_exit_positions_with_logic!(
         client, logic, 'acc', figi_cache: { 'F1' => 'AAA' }
       )
+    end
+
+    it 'does not submit a duplicate force-exit while an active SELL exists' do
+      position = OpenStruct.new(
+        figi: 'F1', instrument_type: 'SHARE', quantity: OpenStruct.new(units: 100),
+        average_position_price: q(100)
+      )
+      active_sell = OpenStruct.new(
+        figi: 'F1', direction: 'ORDER_DIRECTION_SELL', order_id: 'active-sell',
+        execution_report_status: 'EXECUTION_REPORT_STATUS_PARTIALLYFILL'
+      )
+      client = double('client')
+      allow(client).to receive(:grpc_orders).and_return(
+        double('orders', get_orders: OpenStruct.new(orders: [active_sell]))
+      )
+      allow(client).to receive(:grpc_operations).and_return(
+        double('ops', portfolio: OpenStruct.new(positions: [position]))
+      )
+      allow(client).to receive(:grpc_instruments)
+
+      logic = double('logic')
+      allow(logic).to receive(:should_force_exit?).with(position, 'F1').and_return(true)
+      expect(logic).not_to receive(:last_price_for)
+      expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+      described_class.try_force_exit_positions_with_logic!(
+        client, logic, 'acc', figi_cache: { 'F1' => 'AAA' }
+      )
+    end
+
+    it 'fails closed before reading the portfolio when active orders are unavailable' do
+      client = double('client')
+      orders = double('orders')
+      operations = double('operations')
+      allow(client).to receive(:grpc_orders).and_return(orders)
+      allow(client).to receive(:grpc_operations).and_return(operations)
+      allow(orders).to receive(:get_orders).with(account_id: 'acc').and_raise(StandardError, 'outage')
+      expect(operations).not_to receive(:portfolio)
+
+      logic = double('logic')
+      expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+      expect(
+        described_class.try_force_exit_positions_with_logic!(client, logic, 'acc')
+      ).to be false
     end
   end
 

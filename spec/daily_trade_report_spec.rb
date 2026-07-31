@@ -3,6 +3,7 @@
 require_relative 'spec_helper'
 require_relative '../lib/daily_trade_report'
 require_relative '../lib/daily_report_delivery'
+require 'securerandom'
 require 'tmpdir'
 
 # Лёгкие протобаф-подобные заглушки.
@@ -16,9 +17,24 @@ def ts(time)
   OpenStruct.new(seconds: time.to_i)
 end
 
-def op(type:, figi: 'F', name: 'N', payment: 0.0, price: 0.0, qty: 0, state: 'OPERATION_STATE_EXECUTED', at: Time.utc(2026, 7, 23, 10))
+def trade_fill(num:, at:, qty:, price:)
+  OpenStruct.new(num: num, date: ts(at), quantity: qty, price: q(price))
+end
+
+def op(type:, figi: 'F', name: 'N', payment: 0.0, price: 0.0, qty: 0,
+       state: 'OPERATION_STATE_EXECUTED', at: Time.utc(2026, 7, 23, 10), id: nil, trades: :default)
+  id ||= "op-#{SecureRandom.uuid}"
+  if trades == :default
+    trades = if %w[OPERATION_TYPE_BUY OPERATION_TYPE_SELL].include?(type) &&
+                state == 'OPERATION_STATE_EXECUTED' && qty.positive?
+               [trade_fill(num: "trade-#{id}", at: at, qty: qty, price: price)]
+             else
+               []
+             end
+  end
   OpenStruct.new(type: type, figi: figi, name: name, payment: q(payment), price: q(price),
-                 quantity_done: qty, state: state, date: ts(at))
+                 quantity_done: qty, state: state, date: ts(at), id: id,
+                 trades_info: OpenStruct.new(trades: trades))
 end
 
 def page(items, has_next: false, next_cursor: '')
@@ -71,7 +87,7 @@ RSpec.describe TradingLogic::DailyTradeReport do
 
   it 'aggregates buys and sells only from executed trades, ignoring canceled/progress' do
     allow(operations).to receive(:operations_by_cursor).and_return(page([
-                                                                          op(type: 'OPERATION_TYPE_BUY', figi: 'RUAL', payment: -227.85,
+                                                                          op(type: 'OPERATION_TYPE_BUY', figi: 'RUAL', payment: -227.9,
                                                                              price: 22.79, qty: 10),
                                                                           op(type: 'OPERATION_TYPE_SELL', figi: 'SBER', payment: 263.0, price: 263.0,
                                                                              qty: 1),
@@ -83,14 +99,17 @@ RSpec.describe TradingLogic::DailyTradeReport do
     agg = report.build[:aggregates]
     expect(agg[:buys_count]).to eq(1)
     expect(agg[:sells_count]).to eq(1)
-    expect(agg[:buy_turnover]).to eq(227.85)
+    expect(agg[:buy_turnover]).to eq(227.9)
     expect(agg[:sell_turnover]).to eq(263.0)
   end
 
   it 'follows pagination across two pages, terminating on has_next=false' do
     pages = [
-      page([op(type: 'OPERATION_TYPE_BUY', figi: 'A', payment: -10)], has_next: true, next_cursor: 'c1'),
-      page([op(type: 'OPERATION_TYPE_BUY', figi: 'B', payment: -20)], has_next: false)
+      page(
+        [op(type: 'OPERATION_TYPE_BUY', figi: 'A', payment: -10, price: 10, qty: 1)],
+        has_next: true, next_cursor: 'c1'
+      ),
+      page([op(type: 'OPERATION_TYPE_BUY', figi: 'B', payment: -20, price: 20, qty: 1)], has_next: false)
     ]
     call = 0
     allow(operations).to receive(:operations_by_cursor) { pages[call].tap { call += 1 } }
@@ -101,8 +120,14 @@ RSpec.describe TradingLogic::DailyTradeReport do
 
   it 'raises instead of silently truncating when has_next set but cursor repeats' do
     pages = [
-      page([op(type: 'OPERATION_TYPE_BUY', figi: 'A', payment: -10)], has_next: true, next_cursor: 'c1'),
-      page([op(type: 'OPERATION_TYPE_BUY', figi: 'B', payment: -20)], has_next: true, next_cursor: 'c1')
+      page(
+        [op(type: 'OPERATION_TYPE_BUY', figi: 'A', payment: -10, price: 10, qty: 1)],
+        has_next: true, next_cursor: 'c1'
+      ),
+      page(
+        [op(type: 'OPERATION_TYPE_BUY', figi: 'B', payment: -20, price: 20, qty: 1)],
+        has_next: true, next_cursor: 'c1'
+      )
     ]
     call = 0
     allow(operations).to receive(:operations_by_cursor) { pages[call].tap { call += 1 } }
@@ -116,6 +141,51 @@ RSpec.describe TradingLogic::DailyTradeReport do
                                                                           op(type: 'OPERATION_TYPE_BROKER_FEE', figi: 'A', payment: -1.39)
                                                                         ]))
     expect(report.build[:aggregates][:fees]).to eq(2.07)
+  end
+
+  it 'assigns a delayed execution by fill time even when the order timestamp precedes the report window' do
+    fill_time = Time.utc(2026, 7, 23, 10, 30)
+    delayed = op(
+      type: 'OPERATION_TYPE_BUY', figi: 'SNGSP', payment: -402.2, price: 40.22, qty: 10,
+      at: Time.utc(2026, 7, 22, 10, 0),
+      trades: [trade_fill(num: 'sngsp-fill', at: fill_time, qty: 10, price: 40.22)]
+    )
+    allow(operations).to receive(:operations_by_cursor).and_return(page([delayed]))
+
+    result = report.build
+
+    expect(result[:aggregates]).to include(buys_count: 1, buy_turnover: 402.2)
+    expect(result[:trades].first).to include(time: fill_time.iso8601, ticker: 'N', qty: 10, amount: 402.2)
+    expect(result[:text]).to include('15:30 BUY')
+  end
+
+  it 'splits partial fills at the cutoff and deduplicates by operation id plus trade number' do
+    fills = [
+      trade_fill(num: 'before', at: Time.utc(2026, 7, 22, 15, 59), qty: 2, price: 10),
+      trade_fill(num: 'inside', at: Time.utc(2026, 7, 22, 16, 1), qty: 3, price: 11),
+      trade_fill(num: 'at-end', at: Time.utc(2026, 7, 23, 16, 0), qty: 4, price: 12)
+    ]
+    partial = op(
+      id: 'shared-operation', type: 'OPERATION_TYPE_BUY', figi: 'F', payment: -101,
+      price: 11.22, qty: 9, state: 'OPERATION_STATE_PROGRESS', at: Time.utc(2026, 7, 22, 10), trades: fills
+    )
+    pages = [page([partial], has_next: true, next_cursor: 'c1'), page([partial])]
+    call = 0
+    allow(operations).to receive(:operations_by_cursor) { pages[call].tap { call += 1 } }
+
+    result = report.build
+
+    expect(result[:aggregates]).to include(buys_count: 1, buy_turnover: 33.0)
+    expect(result[:trades].map { |trade| trade[:qty] }).to eq([3])
+  end
+
+  it 'fails closed when an executed operation reports filled quantity without trades_info' do
+    malformed = op(
+      id: 'missing-fills', type: 'OPERATION_TYPE_BUY', payment: -100, price: 100, qty: 1, trades: []
+    )
+    allow(operations).to receive(:operations_by_cursor).and_return(page([malformed]))
+
+    expect { report.build }.to raise_error(described_class::BrokerError, /has no trades_info executions/)
   end
 
   it 'reports no trades cleanly' do
@@ -186,13 +256,13 @@ RSpec.describe TradingLogic::DailyTradeReport do
 
   it 'includes window bounds and structured trades in the build result' do
     allow(operations).to receive(:operations_by_cursor).and_return(page([
-                                                                          op(type: 'OPERATION_TYPE_BUY', figi: 'RUAL', payment: -227.85,
+                                                                          op(type: 'OPERATION_TYPE_BUY', figi: 'RUAL', payment: -227.9,
                                                                              price: 22.79, qty: 10, at: Time.utc(2026, 7, 23, 7, 20))
                                                                         ]))
     res = report.build
     expect(res[:window_from]).to eq('2026-07-22T16:00:00Z')
     expect(res[:window_to]).to eq('2026-07-23T16:00:00Z')
-    expect(res[:trades].first).to include(side: 'BUY', qty: 10, price: 22.79, amount: 227.85)
+    expect(res[:trades].first).to include(side: 'BUY', qty: 10, price: 22.79, amount: 227.9)
   end
 
   it 'respects the +05:00 window boundaries' do
@@ -202,7 +272,7 @@ RSpec.describe TradingLogic::DailyTradeReport do
       page([])
     end
     report.build
-    expect(captured[:from]).to eq(Time.utc(2026, 7, 22, 16, 0))
+    expect(captured[:from]).to eq(Time.utc(2026, 7, 15, 16, 0))
     expect(captured[:to]).to eq(Time.utc(2026, 7, 23, 16, 0))
   end
 

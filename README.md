@@ -231,4 +231,5 @@ REPORT_DAY=2026-07-23 FORCE_SEND=1 bundle exec ruby bin/daily_trade_report.rb
 - `DAILY_REPORT_TIME_LABEL` — label shown in the message (default `YEKT`).
 - `DAILY_REPORT_CUTOFF` — window end time in the offset (default `21:00`).
 - `DAILY_REPORT_INDEX` — index ticker for the snapshot (default `IMOEX`).
+- `DAILY_REPORT_OPERATION_LOOKBACK_DAYS` — overlap used to find orders submitted before their fills (default `7`).
 - Telegram uses `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, overridable via `DAILY_REPORT_TELEGRAM_BOT_TOKEN`/`DAILY_REPORT_TELEGRAM_CHAT_ID`.

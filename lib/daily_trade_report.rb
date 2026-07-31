@@ -6,6 +6,7 @@ require 'fileutils'
 require 'net/http'
 require 'uri'
 require_relative 'utils'
+require_relative 'trade_execution_extractor'
 # StrategyHelpers использовался и раньше (build_figi_ticker_map), но подтягивался
 # только через точку входа — при загрузке одного daily_trade_report был NameError.
 require_relative 'strategy_helpers'
@@ -17,8 +18,7 @@ module TradingLogic
   class DailyTradeReport
     class BrokerError < StandardError; end
 
-    Config = Struct.new(:offset, :time_label, :cutoff, :index, keyword_init: true)
-
+    Config = Struct.new(:offset, :time_label, :cutoff, :index, :operation_lookback_days, keyword_init: true)
     def initialize(client:, account_id: nil, now: Time.now.utc, config: self.class.config_from_env,
                    market_cache_path: nil, logger: nil)
       @client = client
@@ -35,7 +35,8 @@ module TradingLogic
         offset: env['DAILY_REPORT_UTC_OFFSET'] || '+05:00',
         time_label: env['DAILY_REPORT_TIME_LABEL'] || 'YEKT',
         cutoff: env['DAILY_REPORT_CUTOFF'] || '21:00',
-        index: env['DAILY_REPORT_INDEX'] || 'IMOEX'
+        index: env['DAILY_REPORT_INDEX'] || 'IMOEX',
+        operation_lookback_days: (env['DAILY_REPORT_OPERATION_LOOKBACK_DAYS'] || '7').to_i
       )
     end
 
@@ -58,9 +59,15 @@ module TradingLogic
     def build(report_day_str = nil)
       day = report_day(report_day_str)
       from_utc, to_utc = window_for(day)
-      operations = fetch_operations(from: from_utc, to: to_utc)
-      trades = operations.select { |op| trade?(op) }
-      fees = operations.select { |op| fee?(op) }
+      # GetOperationsByCursor filters by the order timestamp, while an execution
+      # may happen hours later. Read an overlap and assign each individual fill by
+      # trades_info.trades[].date instead of assigning the whole order by op.date.
+      lookback_days = [@config.operation_lookback_days.to_i, 0].max
+      query_from = from_utc - (lookback_days * 86_400)
+      operations = fetch_operations(from: query_from, to: to_utc)
+      extractor = TradeExecutionExtractor.new
+      trades = extractor.extract(operations, from: from_utc, to: to_utc)
+      fees = extractor.fees(operations, from: from_utc, to: to_utc)
       aggregates = aggregate(day, trades, fees)
       index = index_snapshot(day)
       # daily_yield брокер отдаёт только за текущий торговый день — для
@@ -74,6 +81,8 @@ module TradingLogic
       { day: day.iso8601, text: text, aggregates: aggregates, index: index, portfolio: portfolio,
         balance: balance, window_from: from_utc.iso8601, window_to: to_utc.iso8601,
         trades: structured_trades(trades) }
+    rescue TradeExecutionExtractor::ExtractionError => e
+      raise BrokerError, e.message
     end
 
     # Окно ещё не закрылось (текущий день до cutoff) или дата в будущем — реальную
@@ -137,18 +146,6 @@ module TradingLogic
       nc
     end
 
-    def trade?(op)
-      executed?(op) && %w[OPERATION_TYPE_BUY OPERATION_TYPE_SELL].include?(op.type.to_s)
-    end
-
-    def fee?(op)
-      executed?(op) && op.type.to_s == 'OPERATION_TYPE_BROKER_FEE'
-    end
-
-    def executed?(op)
-      op.respond_to?(:state) && op.state.to_s == 'OPERATION_STATE_EXECUTED'
-    end
-
     def buy?(op)
       op.type.to_s == 'OPERATION_TYPE_BUY'
     end
@@ -173,12 +170,14 @@ module TradingLogic
       return fees.sum { |op| payment_abs(op) } unless fees.empty?
 
       trades.sum do |op|
-        c = op.respond_to?(:commission) ? Utils.q_to_decimal(op.commission) : nil
-        c ? c.abs : 0.0
+        c = op.respond_to?(:commission) ? op.commission : nil
+        c ? c.to_f.abs : 0.0
       end
     end
 
     def payment_abs(op)
+      return op.amount.to_f.abs if op.respond_to?(:amount)
+
       (Utils.q_to_decimal(op.payment) || 0.0).abs
     end
 
@@ -189,8 +188,8 @@ module TradingLogic
           time: Utils.timestamp_to_utc(op.date)&.iso8601,
           side: buy?(op) ? 'BUY' : 'SELL',
           ticker: resolve_ticker(op),
-          qty: op.respond_to?(:quantity_done) ? op.quantity_done.to_i : 0,
-          price: Utils.q_to_decimal(op.price),
+          qty: op.quantity.to_i,
+          price: op.price,
           amount: payment_abs(op).round(2)
         }
       end
@@ -439,8 +438,8 @@ module TradingLogic
       t = Utils.timestamp_to_utc(op.date)
       hhmm = t ? (t + offset_seconds).strftime('%H:%M') : '--:--'
       side = buy?(op) ? 'BUY ' : 'SELL'
-      price = Utils.q_to_decimal(op.price)
-      qty = op.respond_to?(:quantity_done) ? op.quantity_done.to_i : 0
+      price = op.price
+      qty = op.quantity.to_i
       "#{hhmm} #{side} #{resolve_ticker(op).ljust(6)} ×#{qty} @ #{fmt(price)} = #{fmt(payment_abs(op))} ₽"
     end
 

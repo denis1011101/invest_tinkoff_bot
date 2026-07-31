@@ -618,6 +618,9 @@ module TradingLogic
     end
 
     def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side, logger: nil)
+      active_sell_figis = guarded_active_sell_figis(client, account_id, context: 'SELL', logger: logger)
+      return false unless active_sell_figis
+
       port = client.grpc_operations.portfolio(account_id: account_id)
       positions = port.positions
       positions.each do |p| # rubocop:disable Metrics/BlockLength
@@ -643,6 +646,11 @@ module TradingLogic
 
         next if acted_today?(state, 'last_sell', ticker)
 
+        if active_sell_figis.include?(figi.to_s)
+          logger&.info("SELL #{ticker} skipped — active SELL already exists for figi=#{figi}")
+          next
+        end
+
         inst = begin
           client.grpc_instruments.get_instrument_by(:figi, figi)
         rescue StandardError
@@ -659,8 +667,8 @@ module TradingLogic
         sell_qty = [1, lots_held].min
         next if sell_qty <= 0
 
-        resp = begin
-          logic.confirm_and_place_order(
+        result = begin
+          logic.confirm_and_place_order_with_result(
             account_id: account_id,
             figi: figi,
             quantity: sell_qty,
@@ -669,27 +677,44 @@ module TradingLogic
             order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
           )
         rescue StandardError
-          nil
+          { ok: false, category: :api_error, response: nil }
         end
-        if resp
+        if successful_buy_result?(result)
+          resp = result[:response]
           logger&.info("SELL #{ticker} lots=#{sell_qty} (order_id=#{resp.order_id})")
           mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'signal')
+          active_sell_figis << figi.to_s
         else
           logger&.info("SELL #{ticker} skipped / not confirmed")
         end
       end
     end
 
-    def try_force_exit_positions_with_logic!(client, logic, account_id, figi_cache: {}, logger: nil)
+    def try_force_exit_positions_with_logic!(client, logic, account_id, state: nil, figi_cache: {}, logger: nil)
+      active_sell_figis = guarded_active_sell_figis(client, account_id, context: 'FORCE SELL', logger: logger)
+      return false unless active_sell_figis
+
       port = client.grpc_operations.portfolio(account_id: account_id)
       positions = port.positions
       positions.each do |p|
-        try_force_exit_position!(client, logic, account_id, p, figi_cache: figi_cache, logger: logger)
+        try_force_exit_position!(
+          client, logic, account_id, p,
+          state: state,
+          active_sell_figis: active_sell_figis,
+          figi_cache: figi_cache,
+          logger: logger
+        )
       end
     end
 
-    def try_force_exit_position!(client, logic, account_id, position, figi_cache: {}, logger: nil)
+    def try_force_exit_position!(client, logic, account_id, position, state: nil, active_sell_figis: nil,
+                                 figi_cache: {}, logger: nil)
       figi = position.figi
+
+      if active_sell_figis.nil?
+        active_sell_figis = guarded_active_sell_figis(client, account_id, context: 'FORCE SELL', logger: logger)
+        return false unless active_sell_figis
+      end
 
       if position.respond_to?(:instrument_type)
         inst_type = position.instrument_type.to_s.upcase
@@ -701,6 +726,10 @@ module TradingLogic
       return unless logic.should_force_exit?(position, figi)
 
       ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache, logger: logger) || figi
+      if active_sell_figis.include?(figi.to_s)
+        logger&.info("FORCE SELL #{ticker} skipped — active SELL already exists for figi=#{figi}")
+        return false
+      end
 
       inst = begin
         client.grpc_instruments.get_instrument_by(:figi, figi)
@@ -721,8 +750,8 @@ module TradingLogic
       end
 
       cur_price = logic.last_price_for(figi)
-      resp = begin
-        logic.confirm_and_place_order(
+      result = begin
+        logic.confirm_and_place_order_with_result(
           account_id: account_id,
           figi: figi,
           quantity: lots,
@@ -731,14 +760,46 @@ module TradingLogic
           order_type: ::Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
         )
       rescue StandardError
-        nil
+        { ok: false, category: :api_error, response: nil }
       end
 
-      if resp
+      if successful_buy_result?(result)
+        resp = result[:response]
         logger&.info("FORCE SELL +10% #{ticker} lots=#{lots} (#{qty_units} шт) @#{cur_price} (order_id=#{resp.order_id})")
+        active_sell_figis << figi.to_s
+        mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'force_exit') if state
+        true
       else
         logger&.info("FORCE SELL #{ticker} skipped / not confirmed")
+        false
       end
+    end
+
+    # Broker-side guard shared by every SELL path. GetOrders is authoritative for
+    # active orders and survives process restarts; if it is unavailable we fail
+    # closed because another full-position SELL could otherwise be submitted.
+    def fetch_active_sell_figis(client, account_id, logger: nil)
+      snapshot = fetch_active_orders(client, account_id, logger: logger)
+      return snapshot unless snapshot[:ok]
+
+      figis = Array(snapshot[:orders]).filter_map do |order|
+        next unless order_direction(order).include?('SELL')
+
+        figi = order_figi(order)
+        figi unless figi.empty?
+      end.to_set
+      { ok: true, figis: figis }
+    end
+
+    def guarded_active_sell_figis(client, account_id, context:, logger: nil)
+      snapshot = fetch_active_sell_figis(client, account_id, logger: logger)
+      return snapshot[:figis] if snapshot[:ok]
+
+      logger&.error(
+        "#{context} HALTED: active orders unavailable " \
+        "(reason=#{snapshot[:reason].inspect}) — refusing to risk a duplicate SELL"
+      )
+      nil
     end
 
     def load_state(path)
@@ -1244,6 +1305,7 @@ module TradingLogic
 
       {
         ok: true,
+        orders: orders,
         broker_order_ids: broker_ids,
         client_order_ids: client_ids,
         broker_id_by_client_id: broker_by_client,

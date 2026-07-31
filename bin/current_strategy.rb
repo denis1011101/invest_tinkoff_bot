@@ -163,7 +163,7 @@ begin
   # Принудительная продажа всех лотов при профите >= +10% (до основной логики)
   begin
     TradingLogic::StrategyHelpers.try_force_exit_positions_with_logic!(
-      client, logic, account_id, figi_cache: figi_cache, logger: LOGGER
+      client, logic, account_id, state: state, figi_cache: figi_cache, logger: LOGGER
     )
   rescue InvestTinkoff::GRPC::Error => e
     LOGGER.error("Force exit gRPC error: #{e.class} #{e.message}")
@@ -343,51 +343,8 @@ begin
   when :down
     sell_pct = ((logic.sell_threshold_for_trend(:down) - 1) * 100).round(1)
     LOGGER.info("Trend: DOWN — SELL one lot if >= avg * +#{sell_pct}% (max once per ticker per day)")
-    port = client.grpc_operations.portfolio(account_id: account_id)
-    positions = port.positions
-
-    universe.each do |it|
-      ticker = TradingLogic::StrategyHelpers.resolve_ticker_for_sell(
-        client, figi: it[:figi], fallback_ticker: it[:ticker], figi_cache: figi_cache, logger: LOGGER
-      )
-      unless ticker
-        LOGGER.debug("SELL ticker resolution failed payload=#{it.to_json}")
-        next
-      end
-
-      next if TradingLogic::StrategyHelpers.acted_today?(state, 'last_sell', ticker)
-
-      p = positions.find { |pos| pos.figi == it[:figi] }
-      next unless p
-
-      qty_units = p.quantity.units.to_i
-      next if qty_units <= 0
-
-      sell_it = it.merge(ticker: ticker)
-      next unless logic.should_sell?(p, sell_it, trend: trend)
-
-      # Продаём один лот. quantity в ЛОТАХ; ограничиваем числом удерживаемых лотов.
-      lot_size = [it[:lot].to_i, 1].max
-      lots_held = qty_units / lot_size
-      sell_qty = [1, lots_held].min
-      next if sell_qty <= 0
-
-      resp = logic.confirm_and_place_order(
-        account_id: account_id,
-        figi: it[:figi],
-        quantity: sell_qty,
-        price: logic.last_price_for(it[:figi]),
-        direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL,
-        order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
-      )
-      if resp
-        LOGGER.info("SELL #{ticker} lots=#{sell_qty} (order_id=#{resp.order_id})")
-        TradingLogic::StrategyHelpers.mark_action!(state, 'last_sell', ticker, figi: it[:figi], reason: 'signal')
-      else
-        LOGGER.info("SELL #{ticker} skipped / not confirmed")
-      end
-    end
-    # доп. проход по позициям, чтобы учесть бумаги вне исходного TICKERS
+    # Единый проход по всем позициям, включая бумаги вне исходного TICKERS. Внутри
+    # действует broker-side guard активных SELL и fail-closed поведение GetOrders.
     TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
       client, logic, account_id, state, figi_cache: figi_cache, trend: trend, logger: LOGGER
     )
