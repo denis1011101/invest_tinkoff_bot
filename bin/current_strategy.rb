@@ -95,6 +95,7 @@ FileUtils.mkdir_p(File.dirname(STATE_PATH))
 
 MARKET_CACHE_PATH = File.expand_path('../tmp/market_instruments_cache.json', __dir__)
 MOEX_INDEX_CACHE_PATH = File.expand_path('../tmp/moex_index_cache.json', __dir__)
+TRADING_SCHEDULE_CACHE_PATH = File.expand_path('../tmp/trading_schedules_cache.json', __dir__)
 
 state = nil
 
@@ -194,6 +195,13 @@ begin
         )
         next
       end
+      if helpers.instrument_quarantined?(state, it[:figi])
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'quarantine', outcome: 'rejected', figi: it[:figi]
+        )
+        next
+      end
 
       cur = logic.last_price_for(it[:figi])
       intraday = begin
@@ -256,6 +264,15 @@ begin
         )
         next
       end
+      unless helpers.daily_buy_attempt_within_limit?(state, it[:ticker])
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'attempt_limit', outcome: 'rejected', figi: it[:figi],
+                  attempts: helpers.daily_buy_attempts(state, it[:ticker]),
+                  max_attempts: helpers.max_buy_attempts_per_ticker
+        )
+        next
+      end
       unless helpers.shares_share_within_limit?(
         client, account_id,
         planned_buy_value: buy_value + run_committed, portfolio: up_portfolio, logger: LOGGER
@@ -274,6 +291,18 @@ begin
           LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
                   stage: 'shadow_order', outcome: 'eligible', figi: it[:figi],
                   price: cur || it[:price], buy_value: buy_value
+        )
+        next
+      end
+
+      session = helpers.buy_session_status(
+        client, exchange: it[:exchange], cache_path: TRADING_SCHEDULE_CACHE_PATH, logger: LOGGER
+      )
+      unless session[:open]
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'trading_session', outcome: 'rejected', figi: it[:figi],
+                  reason: session[:reason], exchange: session[:exchange]
         )
         next
       end
@@ -304,18 +333,30 @@ begin
         next
       end
 
-      result = logic.confirm_and_place_order_with_result(
-        account_id: account_id,
-        figi: it[:figi],
-        quantity: LOTS_PER_ORDER, # в ЛОТАХ, не в штуках
-        price: cur || it[:price],
-        direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
-        order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
-      )
+      result = begin
+        logic.confirm_and_place_order_with_result(
+          account_id: account_id,
+          figi: it[:figi],
+          quantity: LOTS_PER_ORDER, # в ЛОТАХ, не в штуках
+          price: cur || it[:price],
+          direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
+          order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
+        )
+      rescue StandardError => e
+        {
+          ok: false, category: :api_error, status: 'api_error',
+          reject_reason: e.message, error_code: e.class.name
+        }
+      end
       result[:figi] ||= it[:figi]
       helpers.account_buy_result!(
         state, it[:ticker], result, planned_value: buy_value, logger: LOGGER, scan_id: SCAN_ID
       )
+      if helpers.permanent_instrument_reject?(result)
+        helpers.quarantine_instrument!(
+          state, it[:figi], reason: result[:error_code] || result[:reject_reason], logger: LOGGER
+        )
+      end
       category = result[:category].to_s
       committed = helpers.buy_committed_result?(result)
       helpers.log_buy_funnel(
@@ -358,7 +399,8 @@ begin
       lots_per_order: LOTS_PER_ORDER,
       account_id: account_id,
       logger: LOGGER,
-      scan_id: SCAN_ID
+      scan_id: SCAN_ID,
+      trading_schedule_cache_path: TRADING_SCHEDULE_CACHE_PATH
     )
     LOGGER.info('DOWN: no momentum candidates') unless bought
 
@@ -383,7 +425,8 @@ begin
       lots_per_order: LOTS_PER_ORDER,
       account_id: account_id,
       logger: LOGGER,
-      scan_id: SCAN_ID
+      scan_id: SCAN_ID,
+      trading_schedule_cache_path: TRADING_SCHEDULE_CACHE_PATH
     )
     LOGGER.info('SIDE: no momentum candidates') unless bought
   end

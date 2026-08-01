@@ -33,9 +33,36 @@ RSpec.describe TradingLogic::StrategyHelpers do
   def tradable_share(figi:, lot: 1)
     OpenStruct.new(
       figi: figi, lot: lot, uid: "uid_#{figi}", currency: 'rub', class_code: 'TQBR',
+      exchange: 'MOEX',
       buy_available_flag: true, sell_available_flag: true, api_trade_available_flag: true,
       trading_status: 'SECURITY_TRADING_STATUS_NORMAL_TRADING'
     )
+  end
+
+  def trading_schedule_response(now: Time.now.utc, is_trading_day: true, intervals: nil)
+    intervals ||= [{
+      'interval' => {
+        'startTs' => (now - 3600).iso8601,
+        'endTs' => (now + 3600).iso8601
+      }
+    }]
+    OpenStruct.new(
+      success?: true,
+      payload: {
+        'exchanges' => [{
+          'exchange' => 'MOEX',
+          'days' => [{
+            'date' => Time.utc(now.year, now.month, now.day).iso8601,
+            'isTradingDay' => is_trading_day,
+            'intervals' => intervals
+          }]
+        }]
+      }
+    )
+  end
+
+  def stub_open_trading_schedule(client)
+    allow(client).to receive(:trading_schedules).and_return(trading_schedule_response)
   end
 
   def stub_share(instruments, ticker, figi:, lot: 1)
@@ -93,6 +120,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     allow(client).to receive(:grpc_market_data).and_return(market_data)
     allow(client).to receive(:grpc_operations).and_return(operations)
     allow(client).to receive(:grpc_instruments).and_return(instruments)
+    stub_open_trading_schedule(client)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: market_candles))
     allow(operations).to receive(:portfolio).and_return(
       OpenStruct.new(total_amount_shares: q(10_000), total_amount_currencies: q(10_000), positions: [])
@@ -155,6 +183,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     instruments = double('instruments')
     allow(client).to receive(:grpc_market_data).and_return(market_data)
     allow(client).to receive(:grpc_instruments).and_return(instruments)
+    stub_open_trading_schedule(client)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
     allow(instruments).to receive(:share_by_ticker) do |ticker:, **_|
       OpenStruct.new(instrument: tradable_share(figi: "F_#{ticker}"))
@@ -218,6 +247,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     instruments = double('instruments')
     allow(client).to receive(:grpc_market_data).and_return(market_data)
     allow(client).to receive(:grpc_instruments).and_return(instruments)
+    stub_open_trading_schedule(client)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
     allow(instruments).to receive(:share_by_ticker) do |ticker:, **_|
       OpenStruct.new(instrument: tradable_share(figi: "F_#{ticker}"))
@@ -317,6 +347,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     allow(client).to receive(:grpc_market_data).and_return(market_data)
     allow(client).to receive(:grpc_instruments).and_return(instruments)
     allow(client).to receive(:grpc_operations).and_return(operations)
+    stub_open_trading_schedule(client)
     allow(market_data).to receive(:candles).and_return(OpenStruct.new(candles: rising_daily_candles))
     stub_share(instruments, 'AAA', figi: 'F_AAA')
     allow(operations).to receive(:portfolio).and_return(
@@ -870,17 +901,15 @@ RSpec.describe TradingLogic::StrategyHelpers do
         .and_return(OpenStruct.new(success?: true, payload: cancelled))
 
       state = described_class.default_state
-      state['pending_orders']['AAA'] = {
-        'client_order_id' => 'client-ttl',
-        'broker_order_id' => 'broker-ttl',
-        'figi' => 'F_AAA',
-        'ticker' => 'AAA',
-        'ts' => (Time.now.utc - 1_200).iso8601,
-        'status' => 'sent_not_filled',
-        'planned_value' => 200.0,
-        'filled_value' => 0.0,
-        'reserved_value' => 200.0
-      }
+      described_class.account_buy_result!(
+        state, 'AAA',
+        {
+          category: :sent_not_filled, response: active, figi: 'F_AAA',
+          client_order_id: 'client-ttl'
+        },
+        planned_value: 200
+      )
+      state['pending_orders']['AAA']['ts'] = (Time.now.utc - 1_200).iso8601
 
       described_class.cleanup_pending_orders!(client, 'acc', state, ttl_minutes: 10)
 
@@ -894,6 +923,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(client).to have_received(:order_state).once
       expect(described_class.pending_buy_reserved_total(state)).to eq(0)
       expect(described_class.daily_buy_total(state)).to eq(0)
+      expect(described_class.daily_buy_attempts(state, 'AAA')).to eq(1)
     end
 
     it 'migrates an active legacy commitment from daily_buys into an order reservation' do
@@ -2263,6 +2293,137 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
       expect(state['daily_buys'].size).to eq(7)
       expect(state['daily_buys']).to have_key(described_class.today_key)
+    end
+  end
+
+  describe 'daily BUY attempt limit' do
+    it 'counts api_error but not a confirmation refusal' do
+      state = described_class.default_state
+
+      described_class.account_buy_result!(
+        state, 'RUAL',
+        { category: :api_error, reject_reason: 'timeout', submission_attempts: 2 },
+        planned_value: 240
+      )
+      described_class.account_buy_result!(
+        state, 'RUAL', { category: :not_sent }, planned_value: 240
+      )
+
+      expect(described_class.daily_buy_attempts(state, 'RUAL')).to eq(2)
+      expect(described_class.daily_buy_total(state)).to eq(0)
+      expect(described_class.pending_buy_reserved_total(state)).to eq(0)
+    end
+
+    it 'allows two submissions, blocks the third, and can be disabled with zero' do
+      state = described_class.default_state
+      2.times { described_class.register_daily_buy_attempt!(state, 'TATN') }
+
+      expect(described_class.daily_buy_attempt_within_limit?(state, 'TATN', max_attempts: 2)).to be false
+      expect(described_class.daily_buy_attempt_within_limit?(state, 'TATN', max_attempts: 0)).to be true
+    end
+
+    it 'uses separate UTC-day buckets and keeps only seven recent days' do
+      state = described_class.default_state
+      (1..10).each do |day|
+        described_class.register_daily_buy_attempt!(state, 'AAA', day: "2026-07-#{day.to_s.rjust(2, '0')}")
+      end
+      described_class.register_daily_buy_attempt!(state, 'AAA')
+
+      expect(state['daily_buy_attempts'].size).to eq(7)
+      expect(described_class.daily_buy_attempts(state, 'AAA')).to eq(1)
+      next_utc_day = (Time.parse("#{described_class.today_key}T00:00:00Z") + 86_400).strftime('%Y-%m-%d')
+      expect(described_class.daily_buy_attempts(state, 'AAA', day: next_utc_day)).to eq(0)
+    end
+
+    it 'emits attempt_limit and does not submit a third intersection order' do
+      market_cache = write_cache([{ 'ticker' => 'AAA' }])
+      index_cache = write_cache([{ 'ticker' => 'AAA' }])
+      client, = build_buy_flow_client(market_candles: rising_daily_candles)
+      logic = double('logic', last_price_for: 100.0, dip_today?: true, entry_stretch_metrics: {})
+      expect(logic).not_to receive(:confirm_and_place_order_with_result)
+      state = described_class.default_state
+      2.times { described_class.register_daily_buy_attempt!(state, 'AAA') }
+      lines = []
+      logger = double('logger', warn: nil)
+      allow(logger).to receive(:debug) { |message| lines << message }
+
+      result = described_class.buy_one_momentum_from_intersection!(
+        client, logic, state,
+        market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+        max_lot_rub: 1_000, lots_per_order: 1, account_id: 'acc', logger: logger,
+        scan_id: 'attempt-limit-scan'
+      )
+
+      event = JSON.parse(lines.grep(/^buy_funnel /).last.delete_prefix('buy_funnel '))
+      expect(result).to be false
+      expect(event).to include('stage' => 'attempt_limit', 'attempts' => 2, 'max_attempts' => 2)
+    ensure
+      market_cache&.close!
+      index_cache&.close!
+    end
+  end
+
+  describe '.trading_session_open?' do
+    it 'allows BUY inside an interval and blocks it outside the interval' do
+      now = Time.utc(2026, 8, 2, 8, 0, 0)
+      client = double('client')
+      allow(client).to receive(:trading_schedules).and_return(trading_schedule_response(now: now))
+
+      expect(described_class.trading_session_open?(client, exchange: 'MOEX', now: now)).to be true
+      expect(described_class.trading_session_open?(client, exchange: 'MOEX', now: now + 7200)).to be false
+    end
+
+    it 'fails closed when TradingSchedules is unavailable' do
+      client = double('client')
+
+      expect(described_class.trading_session_open?(client, exchange: 'MOEX')).to be false
+      expect(described_class.trading_session_open?(client, exchange: '')).to be false
+    end
+
+    it 'does not submit an intersection BUY on a non-trading day' do
+      market_cache = write_cache([{ 'ticker' => 'AAA' }])
+      index_cache = write_cache([{ 'ticker' => 'AAA' }])
+      client, = build_buy_flow_client(market_candles: rising_daily_candles)
+      allow(client).to receive(:trading_schedules).and_return(
+        trading_schedule_response(is_trading_day: false)
+      )
+      logic = double('logic', last_price_for: 100.0, dip_today?: true, entry_stretch_metrics: {})
+      expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+      result = described_class.buy_one_momentum_from_intersection!(
+        client, logic, described_class.default_state,
+        market_cache_path: market_cache.path, moex_index_cache_path: index_cache.path,
+        max_lot_rub: 1_000, lots_per_order: 1, account_id: 'acc'
+      )
+
+      expect(result).to be false
+    ensure
+      market_cache&.close!
+      index_cache&.close!
+    end
+
+    it 'reuses a fresh disk cache in a new process/client' do
+      now = Time.utc(2026, 8, 2, 8, 0, 0)
+      cache = Tempfile.new(['trading-schedules', '.json'])
+      cache.close
+      first_client = double('first client')
+      allow(first_client).to receive(:trading_schedules).and_return(trading_schedule_response(now: now))
+
+      expect(
+        described_class.trading_session_open?(
+          first_client, exchange: 'MOEX', now: now, cache_path: cache.path
+        )
+      ).to be true
+
+      second_client = double('second client')
+      expect(second_client).not_to receive(:trading_schedules)
+      expect(
+        described_class.trading_session_open?(
+          second_client, exchange: 'MOEX', now: now, cache_path: cache.path
+        )
+      ).to be true
+    ensure
+      cache&.unlink
     end
   end
 

@@ -99,10 +99,15 @@ module TradingLogic
     end
 
     def figi_and_lot(ticker, class_code: 'TQBR')
-      share = StrategyHelpers.resolve_tradable_share(@client, ticker, class_code: class_code)
-      return [nil, nil] unless share
+      figi, lot, = figi_lot_and_exchange(ticker, class_code: class_code)
+      [figi, lot]
+    end
 
-      [share[:figi], share[:lot]]
+    def figi_lot_and_exchange(ticker, class_code: 'TQBR')
+      share = StrategyHelpers.resolve_tradable_share(@client, ticker, class_code: class_code)
+      return [nil, nil, nil] unless share
+
+      [share[:figi], share[:lot], share[:exchange]]
     end
 
     def last_price_for(figi)
@@ -327,7 +332,7 @@ module TradingLogic
       volume_enabled = volume_features_enabled?
 
       tickers.map do |t|
-        figi, lot = figi_and_lot(t)
+        figi, lot, exchange = figi_lot_and_exchange(t)
         next unless figi && lot
 
         # Отсев по числу акций в лоте. Ограничитель избыточен, когда задан max_lot_rub
@@ -344,6 +349,7 @@ module TradingLogic
         h = {
           ticker: t,
           figi: figi,
+          exchange: exchange,
           lot: lot.to_i,
           price: price,
           price_per_lot: price * lot.to_i
@@ -530,7 +536,7 @@ module TradingLogic
                     false
                   end
 
-      return { ok: false, category: :not_sent, status: 'not_sent', response: nil } unless confirmed
+      return not_sent_order_result unless confirmed
 
       client_order_id = SecureRandom.uuid
       submitted_at = nil
@@ -562,7 +568,8 @@ module TradingLogic
           client_order_id: client_order_id,
           submitted_at: submitted_at,
           reject_reason: reject_reason,
-          error_code: error_code
+          error_code: error_code,
+          submission_attempts: attempts
         }
       rescue StandardError => e
         technical = technical_api_error?(e)
@@ -581,12 +588,20 @@ module TradingLogic
           submitted_at: submitted_at,
           reject_reason: e.message,
           error_code: e.class.to_s,
-          technical_error: technical
+          technical_error: technical,
+          submission_attempts: attempts
         }
       end
     end
 
     private
+
+    def not_sent_order_result
+      {
+        ok: false, category: :not_sent, status: 'not_sent', response: nil,
+        submission_attempts: 0
+      }
+    end
 
     def validate_level_settings!(settings)
       assert_positive_integer!(settings[:levels_lookback_days], :levels_lookback_days)
@@ -611,6 +626,10 @@ module TradingLogic
 
     def technical_api_error?(error)
       text = "#{error.class} #{error.message}"
+      # 30079 содержит слово "unavailable", но это постоянный отказ по конкретному
+      # инструменту, а не временная недоступность сервиса. Его нельзя повторять.
+      return false if text.match?(/30079|not available for trading|instrument unavailable for trading|недоступен/i)
+
       TECHNICAL_ERROR_PATTERNS.any? { |pattern| text.match?(pattern) }
     end
 

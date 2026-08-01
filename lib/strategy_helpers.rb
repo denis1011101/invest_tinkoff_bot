@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'json'
+require 'fileutils'
 require 'securerandom'
 require 'time'
 require_relative 'utils'
@@ -187,7 +188,7 @@ module TradingLogic
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
     def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:,
                                             max_lot_rub:, account_id:, lots_per_order: 1, logger: nil,
-                                            scan_id: nil)
+                                            scan_id: nil, trading_schedule_cache_path: nil)
       scan_id ||= new_buy_scan_id
       # Не торгуем по протухшим справочникам: устаревший состав IMOEX / рыночный кеш
       # приводит к покупкам недоступных или чужих инструментов.
@@ -226,7 +227,8 @@ module TradingLogic
           lots_per_order: lots_per_order,
           preflight: preflight,
           logger: logger,
-          scan_id: scan_id
+          scan_id: scan_id,
+          trading_schedule_cache_path: trading_schedule_cache_path
         )
       end
 
@@ -281,7 +283,8 @@ module TradingLogic
     end
 
     def build_intersection_candidate(client, logic, state, ticker, max_lot_rub:, account_id:, lots_per_order:,
-                                     preflight: {}, logger: nil, scan_id: nil)
+                                     preflight: {}, logger: nil, scan_id: nil,
+                                     trading_schedule_cache_path: nil)
       scan_id ||= new_buy_scan_id
       candidate = build_intersection_signal_candidate(
         client, logic, state, ticker,
@@ -291,7 +294,8 @@ module TradingLogic
 
       apply_intersection_risk_gates(
         client, logic, state, candidate,
-        account_id: account_id, preflight: preflight, logger: logger, scan_id: scan_id
+        account_id: account_id, preflight: preflight, logger: logger, scan_id: scan_id,
+        trading_schedule_cache_path: trading_schedule_cache_path
       )
     end
 
@@ -364,14 +368,21 @@ module TradingLogic
         )
       end
 
-      { tk: ticker, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order }
+      {
+        tk: ticker, figi: figi, lot: lot, price: price, lots_per_order: lots_per_order,
+        exchange: share[:exchange]
+      }
     end
 
-    def apply_intersection_risk_gates(client, logic, state, candidate, account_id:, preflight:, logger:, scan_id:)
-      ticker = candidate[:tk]
-      figi = candidate[:figi]
-      price = candidate[:price]
+    def apply_intersection_risk_gates(client, logic, state, candidate, account_id:, preflight:, logger:, scan_id:,
+                                      trading_schedule_cache_path: nil)
+      ticker, figi, price = candidate.values_at(:tk, :figi, :price)
       buy_value = candidate[:price] * candidate[:lot] * candidate[:lots_per_order]
+      return unless intersection_submission_gates_pass?(
+        client, state, candidate, logger: logger, scan_id: scan_id,
+                                  trading_schedule_cache_path: trading_schedule_cache_path
+      )
+
       preflight[:portfolio] = load_portfolio_snapshot(client, account_id, logger: logger) unless preflight.key?(:portfolio)
       portfolio = preflight[:portfolio]
       unless portfolio
@@ -432,6 +443,33 @@ module TradingLogic
       logger&.debug("#{ticker} support_distance=#{support_distance.round(4)}")
 
       candidate.merge(support_distance: support_distance)
+    end
+
+    def intersection_submission_gates_pass?(client, state, candidate, logger:, scan_id:,
+                                            trading_schedule_cache_path: nil)
+      ticker = candidate[:tk]
+      figi = candidate[:figi]
+      unless daily_buy_attempt_within_limit?(state, ticker)
+        attempts = daily_buy_attempts(state, ticker)
+        reject_buy_funnel(
+          logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                  stage: 'attempt_limit', figi: figi, attempts: attempts,
+                  max_attempts: max_buy_attempts_per_ticker
+        )
+        return false
+      end
+
+      session = buy_session_status(
+        client, exchange: candidate[:exchange], cache_path: trading_schedule_cache_path, logger: logger
+      )
+      return true if session[:open]
+
+      reject_buy_funnel(
+        logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
+                stage: 'trading_session', figi: figi, reason: session[:reason],
+                exchange: session[:exchange]
+      )
+      false
     end
 
     def load_portfolio_snapshot(client, account_id, logger: nil)
@@ -811,7 +849,10 @@ module TradingLogic
     end
 
     def default_state
-      { 'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'quarantine' => {}, 'daily_buys' => {} }
+      {
+        'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'quarantine' => {},
+        'daily_buys' => {}, 'daily_buy_attempts' => {}
+      }
     end
 
     def ensure_state_defaults!(state)
@@ -821,6 +862,7 @@ module TradingLogic
       state['pending_orders'] ||= {}
       state['quarantine'] ||= {}
       state['daily_buys'] ||= {}
+      state['daily_buy_attempts'] ||= {}
       state
     end
 
@@ -841,6 +883,194 @@ module TradingLogic
       return false unless updated
 
       (Time.now.utc - updated.utc) <= max_age_seconds
+    end
+
+    # BUY разрешён только внутри фактического торгового интервала, который вернул
+    # TradingSchedules. Статус инструмента сам по себе не означает, что площадка
+    # сейчас открыта. Кеш нужен на диске, потому что cron каждый раз запускает новый
+    # процесс. Любая неоднозначность трактуется fail-closed.
+    def buy_session_status(client, exchange:, now: Time.now.utc, cache_path: nil, logger: nil)
+      normalized_exchange = exchange.to_s.strip.upcase
+      return { open: false, reason: 'exchange_unavailable', exchange: normalized_exchange } if normalized_exchange.empty?
+
+      day = now.utc.strftime('%Y-%m-%d')
+      schedule = cached_trading_schedule(cache_path, normalized_exchange, day, now: now)
+      schedule ||= fetch_and_cache_trading_schedule(
+        client, normalized_exchange, day, cache_path: cache_path, now: now, logger: logger
+      )
+      return { open: false, reason: 'schedule_unavailable', exchange: normalized_exchange } unless schedule
+
+      trading_day = Array(schedule['days']).find { |entry| entry['date'].to_s == day }
+      return { open: false, reason: 'day_unavailable', exchange: normalized_exchange } unless trading_day
+      return { open: false, reason: 'non_trading_day', exchange: normalized_exchange } unless trading_day['is_trading_day']
+
+      intervals = Array(trading_day['intervals'])
+      is_open = intervals.any? do |interval|
+        starts_at = parse_schedule_time(interval['start'])
+        ends_at = parse_schedule_time(interval['end'])
+        starts_at && ends_at && starts_at <= now.utc && now.utc < ends_at
+      end
+      reason = intervals.empty? ? 'intervals_unavailable' : 'session_closed'
+      { open: is_open, reason: is_open ? 'open' : reason, exchange: normalized_exchange }
+    rescue StandardError => e
+      logger&.warn("BUY session gate failed for #{normalized_exchange}: #{e.class}: #{e.message}")
+      { open: false, reason: 'schedule_error', exchange: normalized_exchange }
+    end
+
+    def trading_session_open?(client, exchange:, now: Time.now.utc, cache_path: nil, logger: nil)
+      buy_session_status(client, exchange: exchange, now: now, cache_path: cache_path, logger: logger)[:open]
+    end
+
+    def cached_trading_schedule(path, exchange, day, now: Time.now.utc)
+      return nil if path.to_s.empty? || !File.exist?(path)
+
+      cache = JSON.parse(File.read(path))
+      updated_at = Time.parse(cache['updated_at'].to_s).utc
+      ttl_seconds = (ENV['TRADING_SCHEDULE_CACHE_TTL_HOURS'] || '24').to_f * 3600
+      return nil unless ttl_seconds.positive? && (now.utc - updated_at) <= ttl_seconds
+
+      schedule = (cache['exchanges'] || {})[exchange]
+      return nil unless schedule && Array(schedule['days']).any? { |entry| entry['date'].to_s == day }
+
+      schedule
+    rescue StandardError
+      nil
+    end
+
+    def fetch_and_cache_trading_schedule(client, exchange, day, cache_path:, now:, logger: nil)
+      unless client.respond_to?(:trading_schedules)
+        logger&.warn("BUY blocked: TradingSchedules unavailable for exchange=#{exchange}")
+        return nil
+      end
+
+      day_start = Time.parse("#{day}T00:00:00Z")
+      response = client.trading_schedules(exchange: exchange, from: day_start, to: day_start + 86_400)
+      if response.respond_to?(:success?) && !response.success?
+        raise "TradingSchedules returned HTTP #{response.respond_to?(:http_code) ? response.http_code : 'error'}"
+      end
+
+      payload = response.respond_to?(:payload) ? response.payload : response
+      schedule = normalize_trading_schedule(payload, exchange)
+      raise 'TradingSchedules response has no requested exchange' unless schedule
+
+      persist_trading_schedule_cache(cache_path, exchange, schedule, now: now) unless cache_path.to_s.empty?
+      schedule
+    rescue StandardError => e
+      logger&.warn("BUY blocked: TradingSchedules failed for exchange=#{exchange}: #{e.class}: #{e.message}")
+      nil
+    end
+
+    def normalize_trading_schedule(payload, requested_exchange)
+      exchanges = schedule_field(payload, :exchanges, 'exchanges')
+      source = Array(exchanges).find do |entry|
+        schedule_field(entry, :exchange, 'exchange').to_s.upcase == requested_exchange
+      end
+      return nil unless source
+
+      days = Array(schedule_field(source, :days, 'days')).filter_map do |day|
+        normalize_trading_day(day)
+      end
+      { 'exchange' => requested_exchange, 'days' => days }
+    end
+
+    def normalize_trading_day(day)
+      date_time = parse_schedule_time(schedule_field(day, :date, 'date'))
+      return nil unless date_time
+
+      intervals = Array(schedule_field(day, :intervals, 'intervals')).filter_map do |entry|
+        interval = schedule_field(entry, :interval, 'interval') || entry
+        normalize_schedule_interval(
+          schedule_field(interval, :start_ts, 'startTs', 'start_ts'),
+          schedule_field(interval, :end_ts, 'endTs', 'end_ts')
+        )
+      end
+
+      # Старые ответы API не содержат intervals. В них основная и вечерняя сессии
+      # представлены отдельными парами времён.
+      if intervals.empty?
+        [
+          %i[start_time end_time],
+          %i[evening_start_time evening_end_time],
+          %i[premarket_start_time premarket_end_time]
+        ].each do |start_name, end_name|
+          normalized = normalize_schedule_interval(
+            schedule_field(day, start_name, camelize_lower(start_name)),
+            schedule_field(day, end_name, camelize_lower(end_name))
+          )
+          intervals << normalized if normalized
+        end
+      end
+
+      {
+        'date' => date_time.utc.strftime('%Y-%m-%d'),
+        'is_trading_day' => schedule_field(day, :is_trading_day, 'isTradingDay', 'is_trading_day') == true,
+        'intervals' => intervals
+      }
+    end
+
+    def normalize_schedule_interval(raw_start, raw_end)
+      starts_at = parse_schedule_time(raw_start)
+      ends_at = parse_schedule_time(raw_end)
+      return nil unless starts_at && ends_at && starts_at < ends_at
+
+      { 'start' => starts_at.utc.iso8601, 'end' => ends_at.utc.iso8601 }
+    end
+
+    def parse_schedule_time(value)
+      return nil if value.nil?
+      return value.to_time.utc if value.respond_to?(:to_time)
+
+      if value.is_a?(Hash) && (value.key?('seconds') || value.key?(:seconds))
+        seconds = value['seconds'] || value[:seconds]
+        nanos = value['nanos'] || value[:nanos] || 0
+        return Time.at(seconds.to_i, nanos.to_i, :nanosecond).utc
+      end
+
+      Time.parse(value.to_s).utc
+    rescue StandardError
+      nil
+    end
+
+    def schedule_field(object, *names)
+      names.each do |name|
+        if object.is_a?(Hash)
+          return object[name] if object.key?(name)
+
+          string_name = name.to_s
+          return object[string_name] if object.key?(string_name)
+
+          symbol_name = string_name.to_sym
+          return object[symbol_name] if object.key?(symbol_name)
+        elsif object.respond_to?(name)
+          return object.public_send(name)
+        end
+      end
+      nil
+    rescue StandardError
+      nil
+    end
+
+    def camelize_lower(name)
+      parts = name.to_s.split('_')
+      parts.first + parts.drop(1).map(&:capitalize).join
+    end
+
+    def persist_trading_schedule_cache(path, exchange, schedule, now: Time.now.utc)
+      cache = begin
+        File.exist?(path) ? JSON.parse(File.read(path)) : {}
+      rescue StandardError
+        {}
+      end
+      cache['updated_at'] = now.utc.iso8601
+      cache['exchanges'] ||= {}
+      cache['exchanges'][exchange] = schedule
+      FileUtils.mkdir_p(File.dirname(path))
+      temp_path = "#{path}.#{Process.pid}.tmp"
+      File.write(temp_path, JSON.pretty_generate(cache))
+      File.rename(temp_path, path)
+      schedule
+    rescue StandardError
+      nil
     end
 
     # Помещён ли инструмент в карантин (после постоянного отказа брокера вроде 30079).
@@ -905,7 +1135,8 @@ module TradingLogic
         lot: (share_attr(share, :lot) || 1).to_i,
         uid: share_attr(share, :uid),
         currency: share_attr(share, :currency).to_s.downcase,
-        class_code: share_attr(share, :class_code)
+        class_code: share_attr(share, :class_code),
+        exchange: share_attr(share, :exchange).to_s
       }
     end
 
@@ -942,6 +1173,51 @@ module TradingLogic
     # дневной бюджет, а подтверждённая отмена освобождает только неисполненный остаток.
     def buy_committed_result?(result)
       successful_buy_result?(result)
+    end
+
+    def max_buy_attempts_per_ticker
+      (ENV['MAX_BUY_ATTEMPTS_PER_TICKER'] || '2').to_i
+    end
+
+    def daily_buy_attempts(state, ticker, day: today_key)
+      ensure_state_defaults!(state)
+      day_attempts = state['daily_buy_attempts'][day]
+      return 0 unless day_attempts.is_a?(Hash)
+
+      day_attempts[ticker.to_s.upcase].to_i
+    end
+
+    def daily_buy_attempt_within_limit?(state, ticker, day: today_key, max_attempts: nil)
+      max_attempts = max_attempts.nil? ? max_buy_attempts_per_ticker : max_attempts.to_i
+      return true unless max_attempts.positive?
+
+      daily_buy_attempts(state, ticker, day: day) < max_attempts
+    end
+
+    def register_daily_buy_attempt!(state, ticker, day: today_key, count: 1)
+      ensure_state_defaults!(state)
+      state['daily_buy_attempts'][day] ||= {}
+      normalized_ticker = ticker.to_s.upcase
+      attempts = daily_buy_attempts(
+        state, normalized_ticker, day: day
+      ) + [count.to_i, 0].max
+      state['daily_buy_attempts'][day][normalized_ticker] = attempts
+      # Как и daily_buys, храним только семь последних UTC-дней.
+      state['daily_buy_attempts'] = state['daily_buy_attempts'].sort.last(7).to_h
+      attempts
+    end
+
+    # not_sent означает, что подтверждение не получено и вызова брокера не было.
+    # Все остальные исходы получены после попытки отправки, включая api_error и
+    # broker_rejected, поэтому должны расходовать лимит попыток.
+    def buy_attempt_result?(result)
+      result[:category].to_s != 'not_sent'
+    end
+
+    def buy_submission_attempt_count(result)
+      return 0 unless buy_attempt_result?(result)
+
+      [result.fetch(:submission_attempts, 1).to_i, 1].max
     end
 
     def daily_buy_total(state, day: today_key)
@@ -1517,6 +1793,12 @@ module TradingLogic
     end
 
     def account_buy_result!(state, ticker, result, planned_value:, day: today_key, logger: nil, scan_id: nil)
+      submission_attempts = buy_submission_attempt_count(result)
+      if submission_attempts.positive?
+        attempts = register_daily_buy_attempt!(
+          state, ticker, day: day, count: submission_attempts
+        )
+      end
       accounting = buy_result_accounting(result, planned_value: planned_value)
       register_daily_buy!(state, accounting[:filled_value], day: day) if accounting[:filled_value].positive?
       sync_pending_order!(
@@ -1524,7 +1806,8 @@ module TradingLogic
       )
       logger&.debug(
         "BUY accounting ticker=#{ticker} filled=#{accounting[:filled_value].round(2)} " \
-        "reserved=#{accounting[:reserved_value].round(2)} planned=#{planned_value.to_f.round(2)}"
+        "reserved=#{accounting[:reserved_value].round(2)} planned=#{planned_value.to_f.round(2)} " \
+        "attempts_today=#{attempts || daily_buy_attempts(state, ticker, day: day)}"
       )
       accounting
     end

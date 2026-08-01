@@ -31,6 +31,50 @@ RSpec.describe TradingLogic::Runner do
     expect(TradingLogic::Utils.q_to_decimal(q(123, 500_000_000))).to eq(123.5)
   end
 
+  it 'does not retry permanent 30079 as a transient unavailable error' do
+    orders = double('orders')
+    allow(client).to receive(:grpc_orders).and_return(orders)
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with('AUTO_CONFIRM').and_return('1')
+    expect(orders).to receive(:post_order).once.and_raise(
+      StandardError, '30079 instrument unavailable for trading'
+    )
+
+    result = subject.confirm_and_place_order_with_result(
+      account_id: 'acc', figi: 'F_RUAL', quantity: 1, price: 24.0,
+      direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
+      order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT,
+      retry_delay_seconds: 0
+    )
+
+    expect(result).to include(
+      category: :api_error, reject_reason: include('30079'), submission_attempts: 1
+    )
+  end
+
+  it 'reports every transient post_order retry for attempt accounting' do
+    orders = double('orders')
+    allow(client).to receive(:grpc_orders).and_return(orders)
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with('AUTO_CONFIRM').and_return('1')
+    calls = 0
+    expect(orders).to receive(:post_order).exactly(3).times do
+      calls += 1
+      raise StandardError, 'service temporarily unavailable' if calls < 3
+
+      OpenStruct.new(execution_report_status: 'EXECUTION_REPORT_STATUS_NEW')
+    end
+
+    result = subject.confirm_and_place_order_with_result(
+      account_id: 'acc', figi: 'F_SBER', quantity: 1, price: 100.0,
+      direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
+      order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT,
+      retry_delay_seconds: 0
+    )
+
+    expect(result).to include(category: :sent_not_filled, submission_attempts: 3)
+  end
+
   describe '#trend' do
     it 'returns :up for 3 consecutive rising closes' do
       closes = [q(10), q(11), q(12), q(13)].map { |x| OpenStruct.new(close: x) }
