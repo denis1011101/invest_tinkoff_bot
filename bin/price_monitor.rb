@@ -4,6 +4,7 @@
 require 'bundler/setup'
 require 'dotenv/load'
 require 'invest_tinkoff'
+require_relative '../lib/broker_tls'
 require_relative '../lib/price_monitor'
 
 token = ENV['TINKOFF_TOKEN'] || abort('Set TINKOFF_TOKEN')

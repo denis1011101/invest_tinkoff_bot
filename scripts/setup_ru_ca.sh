@@ -12,6 +12,12 @@
 # which OpenSSL (and therefore every Net::HTTP call to Telegram and MOEX ISS)
 # ignores. The extra root stays confined to the broker channel.
 #
+# gRPC is only half of the client: TradingSchedules and the rest of the REST
+# surface go through HTTParty over plain OpenSSL, which that variable does not
+# reach. Do NOT paper over it with SSL_CERT_FILE — that trusts the root
+# process-wide, exactly what the paragraph above avoids. lib/broker_tls.rb
+# attaches this same bundle to the HTTParty class of the broker client instead.
+#
 # The bundle is a copy, not a link: re-run this after `bundle update grpc`,
 # otherwise the bot keeps using the roots of the old gem version.
 #
@@ -76,3 +82,6 @@ echo
 echo "Next: set GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=$BUNDLE"
 echo "  - systemd units: /etc/invest_tinkoff_bot.env"
 echo "  - cron jobs:     inline before 'bundle exec' in each invest_tinkoff_bot line"
+echo
+echo "The REST half needs no extra variable: lib/broker_tls.rb reads the same"
+echo "path (BROKER_CA_BUNDLE overrides it). Do not set SSL_CERT_FILE."

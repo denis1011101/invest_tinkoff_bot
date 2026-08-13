@@ -4,6 +4,7 @@
 require 'bundler/setup'
 require 'dotenv/load'
 require 'invest_tinkoff'
+require_relative '../lib/broker_tls'
 
 token = ENV['TINKOFF_TOKEN'] || abort('Set TINKOFF_TOKEN')
 client = InvestTinkoff::V2::Client.new(token: token, sandbox: false)

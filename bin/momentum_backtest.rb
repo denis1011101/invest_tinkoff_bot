@@ -13,6 +13,7 @@
 require 'bundler/setup'
 require 'dotenv/load'
 require 'invest_tinkoff'
+require_relative '../lib/broker_tls'
 require 'json'
 require 'logger'
 require 'time'

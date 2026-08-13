@@ -3,6 +3,7 @@
 require 'bundler/setup'
 require 'dotenv/load'
 require 'invest_tinkoff'
+require_relative '../lib/broker_tls'
 require_relative '../lib/trading_logic'
 require 'securerandom'
 require 'time'

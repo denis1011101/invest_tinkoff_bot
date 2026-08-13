@@ -91,13 +91,30 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `lib/strategy_helpers.rb` — helpers, momentum routine, position limit check, and state helpers
 - `lib/market_cache.rb` — instruments + price caching
 - `lib/telegram_confirm.rb` — Telegram confirm/send helpers
+- `lib/broker_tls.rb` — attaches the extra broker CA bundle to the T-Invest REST client alone (see Broker TLS below)
 - `bin/current_strategy.rb` — main strategy runner
 - `bin/example.rb` — basic gRPC examples and helpers
 - `bin/sync_moex_cache` — command-line wrapper around the MOEX push sync flow
 - `systemd/` — sample systemd services, timers, and environment file templates for local/server automation
 
+## Broker TLS
+
+Since 2026-08-03 `invest-public-api.tinkoff.ru` serves a chain rooted in **Russian Trusted Root CA**, which is absent from the system trust store and from the `roots.pem` shipped in the `grpc` gem. `scripts/setup_ru_ca.sh` builds `/etc/ssl/invest_bot/roots_with_ru.pem` (upstream roots + that one root, pinned by SHA-256) and `scripts/cert_watch.sh` alerts on any change of the served chain.
+
+The extra root is never installed system-wide: a national CA in the system store would be trusted for **every** TLS peer this host talks to. It reaches exactly two places, both scoped to the broker:
+
+- **gRPC** — `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`, read by grpc-core only. OpenSSL ignores it.
+- **REST** — `lib/broker_tls.rb` sets HTTParty's `ssl_ca_file` on `InvestTinkoff::V2::Client`. The bins load it right after `invest_tinkoff`, so requiring the file is enough.
+
+Telegram, MOEX ISS and investing.com go through bare `Net::HTTP` and keep the system store. The scoping is verifiable: with the bundle applied, the broker host still fails TLS over plain `Net::HTTP`.
+
+Do **not** use `SSL_CERT_FILE` or `update-ca-certificates` for this — both widen the trust to the whole process.
+
+Without a readable bundle the REST call to `TradingSchedules` fails, and since the session gate is fail-closed, **every BUY is blocked** (this is what happened on 2026-08-04/05: 400 blocked signals, zero orders). `broker_tls` prints a warning in that case rather than raising.
+
 ## Environment variables
 - `TINKOFF_TOKEN` — required API token for Tinkoff Invest.
+- `BROKER_CA_BUNDLE` — CA bundle for the broker REST client (see Broker TLS). Falls back to `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`, so a host already configured for gRPC needs no second variable. Unset means the system store.
 - `TELEGRAM_BOT_TOKEN` — Telegram bot token for confirmations/notifications.
 - `TELEGRAM_CHAT_ID` — target Telegram chat id for confirmations.
 - `AUTO_CONFIRM` — if `1`/`true`, skips Telegram/manual confirmation and sends orders immediately.
