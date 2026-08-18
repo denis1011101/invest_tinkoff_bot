@@ -1,0 +1,12 @@
+# Каждые 10 минут: стратегия пишет лог раз в 5 минут, так что более частая проверка
+# ничего не добавит, а порог тишины (STRATEGY_HEARTBEAT_WARN_MINUTES) всё равно больше.
+[Unit]
+Description=Run Invest Tinkoff Bot strategy heartbeat watchdog every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+Unit=strategy-heartbeat.service
+
+[Install]
+WantedBy=timers.target

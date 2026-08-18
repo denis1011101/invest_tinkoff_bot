@@ -76,6 +76,9 @@ INDEX=IMOEX SHA256=<sha256> FILE=tmp/incoming/moex_index_cache.json bundle exec 
 # cache freshness watchdog with Telegram alerts/recovery
 bundle exec rake cache:health
 
+# strategy liveness watchdog with Telegram alerts/recovery
+bundle exec rake strategy:heartbeat
+
 # restore strategy state from broker (today UTC)
 bundle exec rake state:restore
 
@@ -87,6 +90,7 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `lib/moex_cache_artifact.rb` — MOEX cache artifact validation and atomic install helpers
 - `lib/moex_cache_syncer.rb` — local push-based MOEX cache sync via ssh/scp
 - `lib/cache_health_monitor.rb` — cache freshness watchdog and Telegram alert suppression/recovery state
+- `lib/strategy_heartbeat_monitor.rb` — strategy liveness watchdog: log silence, hung run detection, alert suppression/recovery state
 - `lib/trading_logic.rb` — main Runner and strategy methods (should_buy?, should_sell?, trend, etc.)
 - `lib/strategy_helpers.rb` — helpers, momentum routine, position limit check, and state helpers
 - `lib/market_cache.rb` — instruments + price caching
@@ -163,6 +167,12 @@ Without a readable bundle the REST call to `TradingSchedules` fails, and since t
 - `CACHE_WARN_AGE_HOURS` — watchdog warning threshold for cache age (default `36`).
 - `CACHE_CRITICAL_AGE_HOURS` — watchdog critical threshold for cache age (default `60`).
 - `CACHE_ALERT_REPEAT_HOURS` — minimum delay before repeating the same cache alert level (default `12`).
+- `STRATEGY_HEARTBEAT_LOG` — log file whose mtime is the strategy heartbeat (default `logs/current_strategy.log`).
+- `STRATEGY_HEARTBEAT_WARN_MINUTES` — silence threshold for a warning (default `20`; cron writes the log every 5 minutes around the clock).
+- `STRATEGY_HEARTBEAT_CRITICAL_MINUTES` — silence threshold for critical (default `60`). A missing log file is critical too, never `ok`.
+- `STRATEGY_HEARTBEAT_REPEAT_HOURS` — minimum delay before repeating the same heartbeat alert level (default `6`).
+- `STRATEGY_HUNG_RUN_MINUTES` — a strategy run alive longer than this is reported as hung, with its pid (default `15`; a healthy scan takes under a minute).
+- `INVEST_TINKOFF_GRPC_TIMEOUT` — per-RPC deadline for the broker client, in seconds (gem default `30`; `0` disables it). Without a deadline a broken channel can hang a run forever — see Strategy liveness watchdog.
 
 Note: `SCAN_MAX_LOT_RUB` and `MAX_LOT_RUB` are related but different. `SCAN_MAX_LOT_RUB` works at cache stage, `MAX_LOT_RUB` works at strategy stage. Keep `SCAN_MAX_LOT_RUB >= MAX_LOT_RUB` to avoid dropping valid candidates before strategy logic.
 
@@ -172,14 +182,24 @@ Note: `SCAN_MAX_LOT_RUB` and `MAX_LOT_RUB` are related but different. `SCAN_MAX_
 - Avoid `bundle exec rake` / `generate:all` on a server that cannot reach MOEX ISS.
 - Schedule `bundle exec rake cache:health` hourly on the server and `bundle exec rake moex_cache:sync INDEX=IMOEX` daily on the local machine, including weekends.
 
+## Strategy liveness watchdog
+The strategy runs from cron every 5 minutes under `flock -n` and writes at least a `scan_id` line on every run, around the clock. Any silence longer than a few runs is a fault, so `rake strategy:heartbeat` alerts on the mtime of `logs/current_strategy.log` and clears the alert on recovery, with the same suppression logic as `cache:health`.
+
+Why it exists: on 2026-08-18 a run hung on a broker gRPC call (an ESTABLISHED socket that would never receive an answer), held `/tmp/current_strategy.lock` for 2h45m and cron silently skipped every later run. Nothing was written to any log — no error, no line — so from the outside it looked exactly like "the bot just isn't buying anything".
+
+Two independent layers cover that failure:
+- the gem now sends every RPC with a deadline (`INVEST_TINKOFF_GRPC_TIMEOUT`, default 30s), so a dead channel raises `InvestTinkoff::GRPC::DeadlineExceeded` instead of hanging;
+- this watchdog catches the symptom — silence — whatever its cause, and additionally names the pid of a run that has been alive longer than `STRATEGY_HUNG_RUN_MINUTES`. Kill that ruby pid, not the `flock`/`bash` wrappers: the ruby process inherits the lock fd, so killing the wrappers alone leaves the lock held.
+
 ## systemd templates
 - All units read secrets from `/etc/invest_tinkoff_bot.env` (never from a file inside the repository), run with `UMask=0077`, and start ruby through `bin/systemd_exec`, which builds the RVM environment for the ruby pinned in `.ruby-version` (systemd's default `PATH` has no RVM/Bundler, and neither does non-interactive SSH).
 - Host roles and identities:
   - `cache-health.timer` + `market-cache-refresh.timer` — server; run as root from `/root/apps/invest_tinkoff_bot`, matching the existing root cron deployment (non-root migration deferred). Installed and enabled on 2026-07-23.
+  - `strategy-heartbeat.timer` — server; same root deployment, runs every 10 minutes. Watches the strategy cron loop (see Strategy liveness watchdog).
   - `moex-cache-sync.timer` — template for a local machine with systemd that can reach MOEX ISS (runs as `User=denis`). The current local machine is WSL without systemd, so the MOEX sync is run **manually** instead: `bundle exec rake moex_cache:sync INDEX=IMOEX` (MOEX_SYNC_* values live in the local `.env`); the cache-health watchdog reminds about it in Telegram when the cache ages out.
 - Services intentionally have no `[Install]` section: they are pulled in by their timers. Enable **only** the `.timer` units, never the oneshot `.service` units.
 - The sample units use `flock` to block parallel runs and `Persistent=true` on timers to catch up after missed starts.
-- The timers only manage caches; the strategy (`bin/current_strategy.rb`), wishlist scan, and price monitor stay in the server cron untouched.
+- The timers manage caches and watch the strategy loop; the jobs themselves — strategy (`bin/current_strategy.rb`), wishlist scan, price monitor — stay in the server cron untouched.
 
 Installation steps (per host):
 
@@ -197,17 +217,17 @@ mkdir -p tmp/incoming tmp/cache_backups && chmod 700 tmp tmp/incoming tmp/cache_
 
 # 3. Install the units for this host and reload systemd.
 sudo cp systemd/moex-cache-sync.{service,timer} /etc/systemd/system/                            # local machine
-sudo cp systemd/{cache-health,market-cache-refresh}.{service,timer} /etc/systemd/system/        # server
+sudo cp systemd/{cache-health,market-cache-refresh,strategy-heartbeat}.{service,timer} /etc/systemd/system/  # server
 sudo systemctl daemon-reload
 
 # 4. Enable and start ONLY the timers.
 sudo systemctl enable --now moex-cache-sync.timer                          # local machine
-sudo systemctl enable --now cache-health.timer market-cache-refresh.timer  # server
+sudo systemctl enable --now cache-health.timer market-cache-refresh.timer strategy-heartbeat.timer  # server
 
 # 5. Verify.
-systemctl list-timers --all | grep -E 'moex|cache'
-systemctl status cache-health.timer market-cache-refresh.timer
-journalctl -u cache-health.service -u market-cache-refresh.service --since today
+systemctl list-timers --all | grep -E 'moex|cache|heartbeat'
+systemctl status cache-health.timer market-cache-refresh.timer strategy-heartbeat.timer
+journalctl -u cache-health.service -u market-cache-refresh.service -u strategy-heartbeat.service --since today
 ```
 
 Before enabling `moex-cache-sync.timer` on the local machine, as user `denis` accept the server host key and confirm key-based access (`ssh -i "$MOEX_SYNC_SSH_KEY" -o BatchMode=yes "$MOEX_SYNC_USER@$MOEX_SYNC_HOST" true`), then run one manual `INDEX=IMOEX DRY_RUN=1 bundle exec rake moex_cache:sync` and only after a clean dry-run do one manual real sync. The remote install step executes `<MOEX_SYNC_REMOTE_DIR>/bin/systemd_exec` on the server, so the server checkout must be pulled to a revision that contains this wrapper first.
