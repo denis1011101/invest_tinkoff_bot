@@ -11,6 +11,7 @@ require_relative 'lib/moex_iss'
 require_relative 'lib/moex_cache_artifact'
 require_relative 'lib/moex_cache_syncer'
 require_relative 'lib/cache_health_monitor'
+require_relative 'lib/strategy_heartbeat_monitor'
 require_relative 'lib/strategy_helpers'
 require_relative 'lib/wishlist_scanner'
 require_relative 'lib/price_monitor'
@@ -181,6 +182,16 @@ namespace :cache do
       age = info[:age_hours] ? format('%.1f', info[:age_hours]) : 'n/a'
       puts "#{name}: level=#{info[:level]} age_hours=#{age} updated_at=#{info[:updated_at]&.iso8601 || 'nil'}"
     end
+  end
+end
+
+namespace :strategy do
+  desc 'Check that the strategy cron loop is still writing its log and notify Telegram on silence or a hung run'
+  task :heartbeat do
+    result = TradingLogic::StrategyHeartbeatMonitor.new.check
+    age = result[:age_minutes] ? format('%.1f', result[:age_minutes]) : 'n/a'
+    hung = result[:hung_run] ? "pid=#{result[:hung_run][:pid]} alive_min=#{format('%.1f', result[:hung_run][:minutes])}" : 'none'
+    puts "strategy: level=#{result[:level]} age_min=#{age} written_at=#{result[:written_at]&.iso8601 || 'nil'} hung_run=#{hung}"
   end
 end
 
