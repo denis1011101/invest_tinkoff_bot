@@ -1,8 +1,8 @@
 GIT
   remote: https://github.com/denis1011101/invest_tinkoff.git
-  revision: f73abd045d12a49a800de57d77b3fd0b9c058924
+  revision: a8598b56cf69757a76d86ed3b3efad59a5b37961
   specs:
-    invest_tinkoff_grpc (0.9.6.8)
+    invest_tinkoff_grpc (0.9.7.0)
       google-protobuf (~> 4.31, >= 4.31.1)
       grpc (~> 1.74, >= 1.74.1)
       httparty (~> 0.23.1)
@@ -12,7 +12,7 @@ GEM
   specs:
     ast (2.4.3)
     bigdecimal (4.1.2)
-    csv (3.3.5)
+    csv (3.3.6)
     diff-lcs (1.6.2)
     dotenv (3.1.8)
     google-protobuf (4.35.1)
