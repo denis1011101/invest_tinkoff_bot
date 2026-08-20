@@ -8,6 +8,7 @@ require_relative 'telegram_confirm'
 require_relative 'market_cache'
 require_relative 'strategy_helpers'
 require_relative 'level_analysis'
+require_relative 'position_sizing'
 require_relative 'utils'
 
 module TradingLogic
@@ -23,6 +24,9 @@ module TradingLogic
       max_lot_rub: 500.0,
       max_lot_count: nil,
       lots_per_order: 1,
+      # Нижняя граница размера заявки для фильтра универсума. nil — считаем по
+      # lots_per_order (прежнее поведение с фиксированным размером).
+      min_lots_per_order: nil,
       dip_pct: 0.01,
       min_relative_volume: nil,
       min_rvol_session_fraction: MIN_SESSION_FRACTION,
@@ -62,6 +66,7 @@ module TradingLogic
       @max_lot = settings[:max_lot_rub]
       @max_lot_count = settings[:max_lot_count]
       @lots_per_order = settings[:lots_per_order]
+      @min_lots_per_order = settings[:min_lots_per_order]
       @dip_pct = settings[:dip_pct]
       @min_relative_volume = settings[:min_relative_volume]
       @min_rvol_session_fraction = settings[:min_rvol_session_fraction].to_f
@@ -362,7 +367,10 @@ module TradingLogic
 
         # фильтр по цене лота, если нужен
         if @max_lot
-          total_price = h[:price_per_lot] * (@lots_per_order || 1)
+          # При динамическом размере заявки универсум фильтруем по МИНИМАЛЬНОМУ
+          # числу лотов: бумага, которую не взять тремя лотами, доступна одним.
+          # Итоговый размер под MAX_LOT_RUB подгоняет PositionSizing.
+          total_price = h[:price_per_lot] * (@min_lots_per_order || @lots_per_order || 1)
           h if total_price <= @max_lot
         else
           h

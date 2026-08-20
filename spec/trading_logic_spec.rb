@@ -275,6 +275,28 @@ RSpec.describe TradingLogic::Runner do
       expect(runner.build_universe).to eq([])
     end
 
+    it 'filters the universe by the minimum order size, not by the maximum one' do
+      # Динамический размер заявки: бумага, которая не влезает в MAX_LOT_RUB тремя
+      # лотами, всё ещё доступна одним — иначе универсум режется по худшему случаю.
+      runner = described_class.new(
+        client, tickers: %w[SBER], max_lot_rub: 1_000.0, lots_per_order: 3, min_lots_per_order: 1
+      )
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: tradable_share(figi: 'F1',
+                                                                                                           lot: 1)))
+      allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(600))]))
+
+      expect(runner.build_universe.map { |u| u[:ticker] }).to eq(%w[SBER])
+    end
+
+    it 'keeps filtering by lots_per_order when no minimum order size is given' do
+      runner = described_class.new(client, tickers: %w[SBER], max_lot_rub: 1_000.0, lots_per_order: 3)
+      allow(instruments).to receive(:share_by_ticker).and_return(OpenStruct.new(instrument: tradable_share(figi: 'F1',
+                                                                                                           lot: 1)))
+      allow(market_data).to receive(:last_prices).and_return(OpenStruct.new(last_prices: [OpenStruct.new(price: q(600))]))
+
+      expect(runner.build_universe).to eq([])
+    end
+
     it 'keeps instruments with lot > 1 when max_lot_count is disabled' do
       runner = described_class.new(client, tickers: %w[GAZP], max_lot_rub: 1_000.0, max_lot_count: 0)
       allow(instruments).to receive(:share_by_ticker)

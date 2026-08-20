@@ -11,6 +11,7 @@ require 'json'
 require 'fileutils'
 require 'logger'
 require_relative '../lib/strategy_helpers'
+require_relative '../lib/position_sizing'
 
 log_level_name = ENV.fetch('LOG_LEVEL', 'DEBUG').upcase
 log_level = Logger.const_defined?(log_level_name) ? Logger.const_get(log_level_name) : Logger::DEBUG
@@ -36,7 +37,12 @@ UP_UNIVERSE = UP_TICKERS.empty? ? TICKERS : UP_TICKERS
 MAX_LOT_RUB = (ENV['MAX_LOT_RUB'] || '1000.0').to_f
 # 0/пусто — ограничитель выключен (рублёвого потолка MAX_LOT_RUB достаточно).
 MAX_LOT_COUNT = (ENV['MAX_LOT_COUNT'] || '0').to_i
+# Фиксированный размер заявки. При DYNAMIC_LOTS=1 (по умолчанию) используется только
+# как запасной вариант: реальный размер считает PositionSizing по режиму рынка.
 LOTS_PER_ORDER = (ENV['LOTS_PER_ORDER'] || '2').to_i
+# Универсум фильтруем по минимальному размеру заявки: бумага, которая не влезает
+# в MAX_LOT_RUB тремя лотами, всё ещё доступна одним.
+LOTS_MIN = TradingLogic::PositionSizing.min_lots(lots_per_order: LOTS_PER_ORDER)
 DIP_PCT = (ENV['DIP_PCT'] || '0.01').to_f
 MIN_RELATIVE_VOLUME = ENV['MIN_RELATIVE_VOLUME']&.to_f
 min_rvol_session_fraction = ENV.fetch('MIN_RVOL_SESSION_FRACTION', '').strip
@@ -74,6 +80,7 @@ logic = TradingLogic::Runner.new(
   max_lot_rub: MAX_LOT_RUB,
   max_lot_count: MAX_LOT_COUNT,
   lots_per_order: LOTS_PER_ORDER,
+  min_lots_per_order: LOTS_MIN,
   dip_pct: DIP_PCT,
   min_relative_volume: MIN_RELATIVE_VOLUME,
   min_rvol_session_fraction: MIN_RVOL_SESSION_FRACTION,
@@ -127,6 +134,12 @@ begin
 
   trend = logic.trend_from_closes(index_closes)
   LOGGER.debug("trend=#{trend.inspect}")
+  # Размер заявки — функция режима рынка: чем увереннее растёт индекс, тем больше
+  # лотов, но не выше LOTS_MAX и не дороже MAX_LOT_RUB за заявку.
+  sizer = TradingLogic::PositionSizing.from_env(
+    trend: trend, index_closes: index_closes, lots_per_order: LOTS_PER_ORDER,
+    max_order_rub: MAX_LOT_RUB, logger: LOGGER
+  )
   LOGGER.warn('index closes < 4 — trend UNKNOWN; проверь резолв индекса (rake index:check)') if index_closes.size < 4
 
   # В UP торгуем по расширенному whitelist'у, в остальных трендах — по базовому
@@ -145,7 +158,7 @@ begin
                    u[:daily_turnover_rub] || 0.0
                  ))
   end
-  LOGGER.info("no buy instruments under limit: max_lot_rub=#{MAX_LOT_RUB}, lots_per_order=#{LOTS_PER_ORDER}") if universe.empty?
+  LOGGER.info("no buy instruments under limit: max_lot_rub=#{MAX_LOT_RUB}, min_lots=#{LOTS_MIN}") if universe.empty?
 
   if USE_LEVELS
     LOGGER.debug("levels (lookback=#{LEVELS_LOOKBACK_DAYS}d, proximity=#{(LEVEL_PROXIMITY_PCT * 100).round(1)}%):")
@@ -246,7 +259,73 @@ begin
         next
       end
 
-      buy_value = (cur || it[:price]) * it[:lot] * LOTS_PER_ORDER
+      price_per_lot = (cur || it[:price]) * it[:lot]
+      lots = sizer.lots_for(price_per_lot: price_per_lot)
+      unless lots.positive?
+        helpers.log_buy_funnel(
+          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                  stage: 'sizing', outcome: 'rejected', figi: it[:figi],
+                  price_per_lot: price_per_lot.round(2), max_lot_rub: MAX_LOT_RUB
+        )
+        next
+      end
+
+      # Кэш урезает размер ДО стоимостных гейтов. Иначе заявка на три лота падает
+      # на лимите позиции или дневном бюджете, хотя исполнимый по деньгам один лот
+      # в эти же лимиты помещается — то есть ужатие под кэш не срабатывало ровно
+      # там, где оно и нужно. В shadow-режиме ни денег, ни расписания нет по
+      # определению: он отвечает, какой сигнал взял бы бот, а не что исполнимо.
+      unless SHADOW_BUYS
+        session = helpers.buy_session_status(
+          client, exchange: it[:exchange], cache_path: TRADING_SCHEDULE_CACHE_PATH, logger: LOGGER
+        )
+        unless session[:open]
+          helpers.log_buy_funnel(
+            LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                    stage: 'trading_session', outcome: 'rejected', figi: it[:figi],
+                    reason: session[:reason], exchange: session[:exchange]
+          )
+          next
+        end
+
+        unless up_positions_loaded
+          up_positions = TradingLogic::StrategyHelpers.load_positions_snapshot(
+            client, account_id, logger: LOGGER
+          )
+          up_positions_loaded = true
+        end
+        unless up_positions
+          helpers.log_buy_funnel(
+            LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                    stage: 'cash_preflight', outcome: 'rejected', figi: it[:figi],
+                    reason: 'positions_unavailable'
+          )
+          next
+        end
+
+        cash_available = begin
+          helpers.available_currency_amount(up_positions, currency: 'rub') - run_committed
+        rescue StandardError => e
+          LOGGER.warn("cash sizing failed (#{e.class}: #{e.message}) — BUY blocked (fail-closed)")
+          0.0
+        end
+        sized_lots = sizer.clamp_to_cash(lots, price_per_lot: price_per_lot, cash_available: cash_available)
+        if sized_lots < lots
+          LOGGER.info("#{it[:ticker]}: size #{lots} -> #{sized_lots} lots by available cash=#{cash_available.round(2)}")
+          lots = sized_lots
+        end
+        unless lots.positive?
+          helpers.log_buy_funnel(
+            LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                    stage: 'cash', outcome: 'rejected', figi: it[:figi],
+                    reason: 'insufficient_cash', cash_available: cash_available.round(2),
+                    price_per_lot: price_per_lot.round(2)
+          )
+          next
+        end
+      end
+
+      buy_value = price_per_lot * lots
       unless helpers.position_within_limit?(
         client, account_id, it[:figi],
         planned_buy_value: buy_value, portfolio: up_portfolio, logger: LOGGER
@@ -286,39 +365,12 @@ begin
       end
 
       if SHADOW_BUYS
-        LOGGER.info("SHADOW BUY #{it[:ticker]} lots=#{LOTS_PER_ORDER} @#{cur || it[:price]} " \
+        LOGGER.info("SHADOW BUY #{it[:ticker]} lots=#{lots} @#{cur || it[:price]} " \
                     "value=#{buy_value.round(2)} gate=#{gate.inspect}")
         helpers.log_buy_funnel(
           LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
                   stage: 'shadow_order', outcome: 'eligible', figi: it[:figi],
-                  price: cur || it[:price], buy_value: buy_value
-        )
-        next
-      end
-
-      session = helpers.buy_session_status(
-        client, exchange: it[:exchange], cache_path: TRADING_SCHEDULE_CACHE_PATH, logger: LOGGER
-      )
-      unless session[:open]
-        helpers.log_buy_funnel(
-          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
-                  stage: 'trading_session', outcome: 'rejected', figi: it[:figi],
-                  reason: session[:reason], exchange: session[:exchange]
-        )
-        next
-      end
-
-      unless up_positions_loaded
-        up_positions = TradingLogic::StrategyHelpers.load_positions_snapshot(
-          client, account_id, logger: LOGGER
-        )
-        up_positions_loaded = true
-      end
-      unless up_positions
-        helpers.log_buy_funnel(
-          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
-                  stage: 'cash_preflight', outcome: 'rejected', figi: it[:figi],
-                  reason: 'positions_unavailable'
+                  price: cur || it[:price], lots: lots, buy_value: buy_value
         )
         next
       end
@@ -338,7 +390,7 @@ begin
         logic.confirm_and_place_order_with_result(
           account_id: account_id,
           figi: it[:figi],
-          quantity: LOTS_PER_ORDER, # в ЛОТАХ, не в штуках
+          quantity: lots, # в ЛОТАХ, не в штуках
           price: cur || it[:price],
           direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_BUY,
           order_type: Tinkoff::Public::Invest::Api::Contract::V1::OrderType::ORDER_TYPE_LIMIT
@@ -364,7 +416,7 @@ begin
         LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
                 stage: 'order', outcome: committed ? 'committed' : 'rejected',
                 reason: category.empty? ? 'unknown' : category, figi: it[:figi],
-                price: cur || it[:price], buy_value: buy_value,
+                price: cur || it[:price], lots: lots, buy_value: buy_value,
                 client_order_id: helpers.pending_client_order_id(result),
                 broker_order_id: helpers.pending_broker_order_id(result)
       )
@@ -373,7 +425,7 @@ begin
       if helpers.buy_execution_result?(result)
         resp = result[:response]
         LOGGER.info(
-          "BUY #{it[:ticker]} lots=#{LOTS_PER_ORDER} lot_size=#{it[:lot]} " \
+          "BUY #{it[:ticker]} lots=#{lots} lot_size=#{it[:lot]} " \
           "@#{it[:price]} category=#{result[:category]} (order_id=#{resp&.order_id})"
         )
         TradingLogic::StrategyHelpers.mark_action!(state, 'last_buy', it[:ticker])
@@ -397,7 +449,7 @@ begin
       market_cache_path: MARKET_CACHE_PATH,
       moex_index_cache_path: MOEX_INDEX_CACHE_PATH,
       max_lot_rub: MAX_LOT_RUB,
-      lots_per_order: LOTS_PER_ORDER,
+      sizer: sizer,
       account_id: account_id,
       logger: LOGGER,
       scan_id: SCAN_ID,
@@ -423,7 +475,7 @@ begin
       market_cache_path: MARKET_CACHE_PATH,
       moex_index_cache_path: MOEX_INDEX_CACHE_PATH,
       max_lot_rub: MAX_LOT_RUB,
-      lots_per_order: LOTS_PER_ORDER,
+      sizer: sizer,
       account_id: account_id,
       logger: LOGGER,
       scan_id: SCAN_ID,
