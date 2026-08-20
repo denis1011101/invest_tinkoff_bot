@@ -109,7 +109,7 @@ module TradingLogic
     end
 
     def from_env(trend:, index_closes: [], lots_per_order: 1, max_order_rub: nil, env: ENV, logger: nil)
-      return fixed(lots_per_order, max_order_rub: max_order_rub, trend: trend) unless dynamic_enabled?(env: env)
+      return fixed(lots_per_order, max_order_rub: max_order_rub, trend: trend, env: env) unless dynamic_enabled?(env: env)
 
       min_lots = env_int(env, 'LOTS_MIN', DEFAULTS[:min_lots])
       max_lots = env_int(env, 'LOTS_MAX', DEFAULTS[:max_lots])
@@ -142,11 +142,15 @@ module TradingLogic
       [env_int(env, 'LOTS_MIN', DEFAULTS[:min_lots]), 1].max
     end
 
-    def fixed(lots_per_order, max_order_rub: nil, trend: nil)
+    # Подушку читаем из env и здесь: в фиксированном режиме clamp_to_cash обязан
+    # совпадать с авторитетным cash-preflight, иначе BUY_CASH_BUFFER_RATE=0 и ровно
+    # достаточный остаток дадут отказ там, где прежнее поведение разрешало заявку.
+    def fixed(lots_per_order, max_order_rub: nil, trend: nil, env: ENV)
       lots = [lots_per_order.to_i, 0].max
       Sizer.new(
         trend: trend, base_lots: lots, min_lots: [lots, 1].max, max_lots: [lots, 1].max,
-        max_order_rub: max_order_rub, dynamic: false
+        max_order_rub: max_order_rub, dynamic: false,
+        cash_buffer_rate: env_float(env, 'BUY_CASH_BUFFER_RATE', DEFAULTS[:cash_buffer_rate])
       )
     end
 
@@ -165,12 +169,16 @@ module TradingLogic
 
     # Рост индекса за окно закрытий: last/first - 1. nil, если данных не хватает —
     # тогда UP берёт средний размер, а не максимальный.
+    #
+    # Окно нужно целиком: на коротком хвосте Array#last молча вернёт историю
+    # покороче, и рост за три дня будет засчитан как рост за пять — то есть
+    # максимальный размер заявки по неполной выборке.
     def index_growth(closes, lookback: DEFAULTS[:index_lookback])
       lookback = lookback.to_i
       return nil unless lookback.positive?
 
       values = Array(closes).compact.map(&:to_f).select(&:positive?)
-      return nil if values.size < 2
+      return nil if values.size < lookback + 1
 
       window = values.last(lookback + 1)
       (window.last / window.first) - 1.0

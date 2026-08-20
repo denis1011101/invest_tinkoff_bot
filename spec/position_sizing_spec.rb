@@ -29,6 +29,14 @@ RSpec.describe TradingLogic::PositionSizing do
       expect(sizer(trend: :up, index_closes: [100.0]).lots_for(price_per_lot: 500.0)).to eq(2)
     end
 
+    it 'does not call growth strong when the lookback window is incomplete' do
+      # Четыре закрытия при окне в пять: рост за три дня не должен читаться как
+      # рост за пять и открывать максимальный размер.
+      short = sizer(trend: :up, index_closes: [100.0, 101.0, 102.0, 103.0])
+
+      expect(short.lots_for(price_per_lot: 500.0)).to eq(2)
+    end
+
     it 'takes the minimum size in SIDE and DOWN regardless of growth' do
       expect(sizer(trend: :side, index_closes: closes(0.05)).lots_for(price_per_lot: 500.0)).to eq(1)
       expect(sizer(trend: :down, index_closes: closes(0.05)).lots_for(price_per_lot: 500.0)).to eq(1)
@@ -55,6 +63,17 @@ RSpec.describe TradingLogic::PositionSizing do
 
       expect(fixed.lots_for(price_per_lot: 500.0)).to eq(2)
       expect(fixed.explain[:mode]).to eq('fixed')
+    end
+
+    it 'keeps the configured cash buffer in fixed mode' do
+      # BUY_CASH_BUFFER_RATE=0 и ровно достаточный остаток: фиксированный режим
+      # обязан совпадать с cash-preflight, а не резать заявку своей подушкой.
+      fixed = described_class.from_env(
+        trend: :up, index_closes: closes(0.05), lots_per_order: 2, max_order_rub: 10_000.0,
+        env: { 'DYNAMIC_LOTS' => '0', 'BUY_CASH_BUFFER_RATE' => '0' }
+      )
+
+      expect(fixed.clamp_to_cash(2, price_per_lot: 500.0, cash_available: 1_000.0)).to eq(2)
     end
   end
 
@@ -113,9 +132,11 @@ RSpec.describe TradingLogic::PositionSizing do
       expect(described_class.index_growth([100.0, 101.0, 102.0, 103.0], lookback: 2)).to be_within(1e-9).of((103.0 / 101.0) - 1)
     end
 
-    it 'is nil without enough closes' do
+    it 'is nil without the full lookback window' do
       expect(described_class.index_growth([100.0], lookback: 5)).to be_nil
       expect(described_class.index_growth([], lookback: 5)).to be_nil
+      expect(described_class.index_growth([100.0, 101.0, 102.0, 103.0, 104.0], lookback: 5)).to be_nil
+      expect(described_class.index_growth(([100.0] * 5) + [110.0], lookback: 5)).to be_within(1e-9).of(0.1)
     end
   end
 end

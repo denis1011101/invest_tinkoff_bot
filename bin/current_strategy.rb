@@ -269,6 +269,62 @@ begin
         )
         next
       end
+
+      # Кэш урезает размер ДО стоимостных гейтов. Иначе заявка на три лота падает
+      # на лимите позиции или дневном бюджете, хотя исполнимый по деньгам один лот
+      # в эти же лимиты помещается — то есть ужатие под кэш не срабатывало ровно
+      # там, где оно и нужно. В shadow-режиме ни денег, ни расписания нет по
+      # определению: он отвечает, какой сигнал взял бы бот, а не что исполнимо.
+      unless SHADOW_BUYS
+        session = helpers.buy_session_status(
+          client, exchange: it[:exchange], cache_path: TRADING_SCHEDULE_CACHE_PATH, logger: LOGGER
+        )
+        unless session[:open]
+          helpers.log_buy_funnel(
+            LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                    stage: 'trading_session', outcome: 'rejected', figi: it[:figi],
+                    reason: session[:reason], exchange: session[:exchange]
+          )
+          next
+        end
+
+        unless up_positions_loaded
+          up_positions = TradingLogic::StrategyHelpers.load_positions_snapshot(
+            client, account_id, logger: LOGGER
+          )
+          up_positions_loaded = true
+        end
+        unless up_positions
+          helpers.log_buy_funnel(
+            LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                    stage: 'cash_preflight', outcome: 'rejected', figi: it[:figi],
+                    reason: 'positions_unavailable'
+          )
+          next
+        end
+
+        cash_available = begin
+          helpers.available_currency_amount(up_positions, currency: 'rub') - run_committed
+        rescue StandardError => e
+          LOGGER.warn("cash sizing failed (#{e.class}: #{e.message}) — BUY blocked (fail-closed)")
+          0.0
+        end
+        sized_lots = sizer.clamp_to_cash(lots, price_per_lot: price_per_lot, cash_available: cash_available)
+        if sized_lots < lots
+          LOGGER.info("#{it[:ticker]}: size #{lots} -> #{sized_lots} lots by available cash=#{cash_available.round(2)}")
+          lots = sized_lots
+        end
+        unless lots.positive?
+          helpers.log_buy_funnel(
+            LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
+                    stage: 'cash', outcome: 'rejected', figi: it[:figi],
+                    reason: 'insufficient_cash', cash_available: cash_available.round(2),
+                    price_per_lot: price_per_lot.round(2)
+          )
+          next
+        end
+      end
+
       buy_value = price_per_lot * lots
       unless helpers.position_within_limit?(
         client, account_id, it[:figi],
@@ -315,58 +371,6 @@ begin
           LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
                   stage: 'shadow_order', outcome: 'eligible', figi: it[:figi],
                   price: cur || it[:price], lots: lots, buy_value: buy_value
-        )
-        next
-      end
-
-      session = helpers.buy_session_status(
-        client, exchange: it[:exchange], cache_path: TRADING_SCHEDULE_CACHE_PATH, logger: LOGGER
-      )
-      unless session[:open]
-        helpers.log_buy_funnel(
-          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
-                  stage: 'trading_session', outcome: 'rejected', figi: it[:figi],
-                  reason: session[:reason], exchange: session[:exchange]
-        )
-        next
-      end
-
-      unless up_positions_loaded
-        up_positions = TradingLogic::StrategyHelpers.load_positions_snapshot(
-          client, account_id, logger: LOGGER
-        )
-        up_positions_loaded = true
-      end
-      unless up_positions
-        helpers.log_buy_funnel(
-          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
-                  stage: 'cash_preflight', outcome: 'rejected', figi: it[:figi],
-                  reason: 'positions_unavailable'
-        )
-        next
-      end
-
-      # Денег может не хватить на выбранный размер — вместо отказа ужимаем заявку.
-      # Все денежные гейты выше монотонны по сумме, поэтому уменьшённая заявка
-      # проходит там же, где прошла большая.
-      cash_available = begin
-        helpers.available_currency_amount(up_positions, currency: 'rub') - run_committed
-      rescue StandardError => e
-        LOGGER.warn("cash sizing failed (#{e.class}: #{e.message}) — BUY blocked (fail-closed)")
-        0.0
-      end
-      sized_lots = sizer.clamp_to_cash(lots, price_per_lot: price_per_lot, cash_available: cash_available)
-      if sized_lots < lots
-        LOGGER.info("#{it[:ticker]}: size #{lots} -> #{sized_lots} lots by available cash=#{cash_available.round(2)}")
-        lots = sized_lots
-        buy_value = price_per_lot * lots
-      end
-      unless lots.positive?
-        helpers.log_buy_funnel(
-          LOGGER, scan_id: SCAN_ID, ticker: it[:ticker], path: 'up',
-                  stage: 'cash', outcome: 'rejected', figi: it[:figi],
-                  reason: 'insufficient_cash', cash_available: cash_available.round(2),
-                  price_per_lot: price_per_lot.round(2)
         )
         next
       end
