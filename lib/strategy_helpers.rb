@@ -5,6 +5,7 @@ require 'fileutils'
 require 'securerandom'
 require 'time'
 require_relative 'utils'
+require_relative 'position_sizing'
 
 module TradingLogic
   module StrategyHelpers # rubocop:disable Metrics/ModuleLength
@@ -186,10 +187,13 @@ module TradingLogic
     end
 
     # Возвращает true если купили одну бумагу из пересечения по правилу 3d momentum
+    # sizer: — объект PositionSizing::Sizer, считающий число лотов по режиму рынка
+    # и цене лота конкретной бумаги. Без него размер фиксирован (lots_per_order).
     def buy_one_momentum_from_intersection!(client, logic, state, market_cache_path:, moex_index_cache_path:,
-                                            max_lot_rub:, account_id:, lots_per_order: 1, logger: nil,
+                                            max_lot_rub:, account_id:, lots_per_order: 1, sizer: nil, logger: nil,
                                             scan_id: nil, trading_schedule_cache_path: nil)
       scan_id ||= new_buy_scan_id
+      sizer ||= PositionSizing.fixed(lots_per_order, max_order_rub: max_lot_rub)
       # Не торгуем по протухшим справочникам: устаревший состав IMOEX / рыночный кеш
       # приводит к покупкам недоступных или чужих инструментов.
       # Порог протухания должен быть заметно больше TTL обновления кеша (MarketCache
@@ -224,7 +228,7 @@ module TradingLogic
           client, logic, state, ticker,
           max_lot_rub: max_lot_rub,
           account_id: account_id,
-          lots_per_order: lots_per_order,
+          sizer: sizer,
           preflight: preflight,
           logger: logger,
           scan_id: scan_id,
@@ -282,13 +286,13 @@ module TradingLogic
       false
     end
 
-    def build_intersection_candidate(client, logic, state, ticker, max_lot_rub:, account_id:, lots_per_order:,
+    def build_intersection_candidate(client, logic, state, ticker, max_lot_rub:, account_id:, sizer:,
                                      preflight: {}, logger: nil, scan_id: nil,
                                      trading_schedule_cache_path: nil)
       scan_id ||= new_buy_scan_id
       candidate = build_intersection_signal_candidate(
         client, logic, state, ticker,
-        max_lot_rub: max_lot_rub, lots_per_order: lots_per_order, logger: logger, scan_id: scan_id
+        max_lot_rub: max_lot_rub, sizer: sizer, logger: logger, scan_id: scan_id
       )
       return nil unless candidate
 
@@ -299,7 +303,7 @@ module TradingLogic
       )
     end
 
-    def build_intersection_signal_candidate(client, logic, state, ticker, max_lot_rub:, lots_per_order:,
+    def build_intersection_signal_candidate(client, logic, state, ticker, max_lot_rub:, sizer:,
                                             logger:, scan_id:)
       logger&.debug("processing candidate #{ticker}")
       if buy_already_processed_today?(state, ticker)
@@ -339,10 +343,9 @@ module TradingLogic
       end
 
       price = logic.last_price_for(figi)
-      price_per_lot = price && lot ? (price * lot) : nil
-      logger&.debug("#{ticker} figi=#{figi} lot=#{lot.inspect} price=#{price.inspect} price_per_lot=#{price_per_lot.inspect}")
-
-      unless affordable_candidate?(price, lot, lots_per_order, max_lot_rub)
+      lots_per_order = candidate_lots(sizer, price, lot, max_lot_rub)
+      logger&.debug("#{ticker} figi=#{figi} lot=#{lot.inspect} price=#{price.inspect} lots=#{lots_per_order}")
+      unless lots_per_order.positive?
         logger&.debug("skip #{ticker} — price/lot missing or too expensive")
         return reject_buy_funnel(
           logger, scan_id: scan_id, ticker: ticker, path: 'intersection',
@@ -570,6 +573,19 @@ module TradingLogic
       DEFAULT_MOMENTUM_RULE
     end
 
+    # Число лотов для кандидата с учётом режима рынка и рублёвого потолка заявки.
+    # Считается до денежных гейтов: они проверяют ровно ту сумму, которая уйдёт
+    # брокеру. 0 означает, что бумага не проходит даже минимальным размером.
+    def candidate_lots(sizer, price, lot, max_lot_rub)
+      price_per_lot = price && lot ? (price * lot) : nil
+      return 0 unless price_per_lot
+
+      lots = sizer.lots_for(price_per_lot: price_per_lot)
+      return 0 unless lots.positive? && affordable_candidate?(price, lot, lots, max_lot_rub)
+
+      lots
+    end
+
     def affordable_candidate?(price, lot, lots_per_order, max_lot_rub)
       return false unless price && lot
 
@@ -619,6 +635,7 @@ module TradingLogic
         reason: category.empty? ? 'unknown' : category,
         figi: candidate[:figi],
         price: candidate[:price],
+        lots: candidate[:lots_per_order],
         buy_value: buy_value,
         client_order_id: pending_client_order_id(result),
         broker_order_id: pending_broker_order_id(result)
@@ -643,7 +660,8 @@ module TradingLogic
     def handle_successful_intersection_buy!(state, candidate, result, logger: nil)
       response = result[:response]
       category = result[:category].to_s
-      logger&.debug("BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) category=#{category} order_id=#{response&.order_id}")
+      logger&.debug("BUY accepted for #{candidate[:tk]} (figi=#{candidate[:figi]}) lots=#{candidate[:lots_per_order]} " \
+                    "category=#{category} order_id=#{response&.order_id}")
       mark_action!(state, 'last_buy', candidate[:tk]) if buy_execution_result?(result)
       true
     rescue StandardError

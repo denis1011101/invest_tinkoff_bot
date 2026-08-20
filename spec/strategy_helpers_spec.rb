@@ -2541,4 +2541,77 @@ RSpec.describe TradingLogic::StrategyHelpers do
       ).to be false
     end
   end
+
+  describe 'dynamic order size in the intersection path' do
+    def run_intersection_buy(sizer:, logic:)
+      market_cache = write_cache([{ 'ticker' => 'AAA', 'figi' => 'F_AAA', 'lot' => 1 }])
+      index_cache = write_cache([{ 'ticker' => 'AAA' }])
+      client, = build_buy_flow_client(market_candles: rising_daily_candles)
+      state = described_class.default_state
+
+      result = described_class.buy_one_momentum_from_intersection!(
+        client, logic, state,
+        market_cache_path: market_cache.path,
+        moex_index_cache_path: index_cache.path,
+        max_lot_rub: 1_000.0,
+        sizer: sizer,
+        account_id: 'acc'
+      )
+      [result, state]
+    ensure
+      market_cache&.close!
+      index_cache&.close!
+    end
+
+    def buying_logic
+      logic = double('logic')
+      allow(logic).to receive(:last_price_for).and_return(100.0)
+      allow(logic).to receive(:dip_today?).and_return(true)
+      logic
+    end
+
+    it 'sends the number of lots the sizer picked for the market regime' do
+      logic = buying_logic
+      expect(logic).to receive(:confirm_and_place_order_with_result)
+        .with(hash_including(quantity: 3)).once
+        .and_return({ ok: true, category: :filled, response: OpenStruct.new(order_id: 'order-1') })
+
+      sizer = TradingLogic::PositionSizing.from_env(
+        trend: :up, index_closes: [100.0, 100.0, 100.0, 100.0, 100.0, 105.0],
+        max_order_rub: 1_000.0, env: {}
+      )
+      result, state = run_intersection_buy(sizer: sizer, logic: logic)
+
+      expect(result).to be true
+      # Дневной бюджет должен учитывать фактический размер: 3 лота по 100.
+      expect(described_class.daily_buy_total(state)).to be_within(0.01).of(300.0)
+    end
+
+    it 'cuts the size down to the rouble ceiling of a single order' do
+      logic = buying_logic
+      expect(logic).to receive(:confirm_and_place_order_with_result)
+        .with(hash_including(quantity: 2)).once
+        .and_return({ ok: true, category: :filled, response: OpenStruct.new(order_id: 'order-1') })
+
+      sizer = TradingLogic::PositionSizing.from_env(
+        trend: :up, index_closes: [100.0, 100.0, 100.0, 100.0, 100.0, 105.0],
+        max_order_rub: 250.0, env: {}
+      )
+      result, = run_intersection_buy(sizer: sizer, logic: logic)
+
+      expect(result).to be true
+    end
+
+    it 'skips an instrument that does not fit even with a single lot' do
+      logic = buying_logic
+      expect(logic).not_to receive(:confirm_and_place_order_with_result)
+
+      sizer = TradingLogic::PositionSizing.from_env(
+        trend: :side, index_closes: [100.0, 101.0], max_order_rub: 50.0, env: {}
+      )
+      result, = run_intersection_buy(sizer: sizer, logic: logic)
+
+      expect(result).to be false
+    end
+  end
 end
