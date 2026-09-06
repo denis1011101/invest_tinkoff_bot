@@ -115,7 +115,13 @@ Telegram, MOEX ISS and investing.com go through bare `Net::HTTP` and keep the sy
 
 Do **not** use `SSL_CERT_FILE` or `update-ca-certificates` for this — both widen the trust to the whole process.
 
-Without a readable bundle the REST call to `TradingSchedules` fails, and since the session gate is fail-closed, **every BUY is blocked** (this is what happened on 2026-08-04/05: 400 blocked signals, zero orders). `broker_tls` prints a warning in that case rather than raising.
+BUY and SELL (including the +10% full-position exit) use the same `TradingSchedules` data and disk cache.
+
+- Confirmed `session_closed` or `non_trading_day` skips SELL without marking a sale and logs at DEBUG.
+- Unknown session status allows SELL to proceed through the remaining order checks and logs a WARN. This includes missing exchange data and unavailable schedules.
+- Both SELL paths require a resolved instrument and a positive lot size. `instrument_unresolved` or `invalid_lot` skips the sale with a WARN; no fallback lot is assumed.
+
+Without a readable bundle the REST call to `TradingSchedules` fails. The BUY session gate is fail-closed, so **BUY is blocked**; a schedule failure alone does not block SELL (on 2026-08-04/05 this affected BUY: 400 blocked signals, zero orders). `broker_tls` prints a warning in that case rather than raising.
 
 ## Environment variables
 - `TINKOFF_TOKEN` — required API token for Tinkoff Invest.
@@ -243,6 +249,7 @@ Before enabling `moex-cache-sync.timer` on the local machine, as user `denis` ac
 A once-a-day plain-text Telegram report of **actually executed** trades, independent of the trading strategy. Files: [`bin/daily_trade_report.rb`](bin/daily_trade_report.rb), [`lib/daily_trade_report.rb`](lib/daily_trade_report.rb), [`lib/daily_report_delivery.rb`](lib/daily_report_delivery.rb).
 
 - **Source of trades** — only `GetOperationsByCursor` (full pagination; it raises rather than silently truncating if the broker reports `has_next` without a usable cursor). Trades are never derived from strategy logs or `tmp/strategy_state.json`.
+- **SELL diagnostics** — scans `logs/current_strategy.log` and retained numbered rotations (`.1`, `.1.gz`, `.2.gz`, etc.) line by line for the same report window. Shows the number of `proceeding with unknown session` warnings (ordinary SELL and force-exit combined), plus `instrument_unresolved` and `invalid_lot` skips, counted separately by reason and FIGI. These are warning counts, not executed orders. Rotations with filesystem mtime strictly before the window start are skipped without opening or decompressing them. An unreadable/missing current log or an unreadable/corrupt rotation that may overlap the window is shown as unavailable. Deleted rotations cannot be recovered. The `strategy_log` counters are also saved in the JSONL archive.
 - **Window** — a rolling 24h ending at the cutoff (default `21:00` `+05:00` = 21:00 YEKT), so trades in the evening session are never dropped; they roll into the next day's report.
 - **Index** — IMOEX change vs the previous close, using the current (possibly still-forming) daily candle as the current value. For a *live* run this is the value near the cutoff. A historical `REPORT_DAY` re-run shows the finalized daily close, not the original cutoff snapshot. The **sent Telegram message is the source of truth** for the cutoff snapshot; the machine archive is a best-effort copy and may be absent if archiving failed after a successful send.
 - **Portfolio** — whole-portfolio `daily_yield` for the broker's *current* trading day, explicitly labeled and including old positions. Omitted for a historical `REPORT_DAY` (the broker only exposes today's yield). Note the message mixes three periods on purpose: trades (rolling 24h), index (vs previous close), portfolio (current trading day).

@@ -195,6 +195,29 @@ RSpec.describe TradingLogic::DailyTradeReport do
     expect(result[:text]).to include('Сделок сегодня не было.')
   end
 
+  it 'includes SELL diagnostics for the report window without treating warnings as executed trades' do
+    allow(operations).to receive(:operations_by_cursor).and_return(page([]))
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, 'current_strategy.log')
+      message = 'WARN: FORCE SELL AFLT proceeding with unknown session — trading_session reason=schedule_unavailable exchange=MOEX'
+      File.write(path, "2026-07-22T16:00:00Z #{message}\n2026-07-23T16:00:00Z #{message}\n")
+      result = described_class.new(client: client, now: now, strategy_log_path: path).build
+      expect(result[:strategy_log]).to include(ok: true, unknown_session_count: 1)
+      expect(result[:text]).to include('Предупреждения SELL о неизвестной сессии за 24ч: 1.')
+      expect(result[:aggregates]).to include(buys_count: 0, sells_count: 0)
+      expect(result[:trades]).to be_empty
+    end
+  end
+
+  it 'still builds a trade report when the strategy log is missing' do
+    allow(operations).to receive(:operations_by_cursor).and_return(page([]))
+    Dir.mktmpdir do |dir|
+      result = described_class.new(client: client, now: now, strategy_log_path: File.join(dir, 'missing.log')).build
+      expect(result[:text]).to include('Сделок сегодня не было.', 'Диагностика SELL за 24ч: н/д')
+      expect(result[:strategy_log]).to eq(ok: false, reason: :log_unavailable)
+    end
+  end
+
   it 'uses the incomplete current candle as value and previous as baseline (up)' do
     allow(operations).to receive(:operations_by_cursor).and_return(page([]))
     idx = report.build[:index]
@@ -340,6 +363,8 @@ RSpec.describe TradingLogic::DailyReportDelivery do
       aggregates: { buys_count: 1, sells_count: 0, buy_turnover: 10.0, sell_turnover: 0.0, fees: 0.1, realized: 0.0 },
       index: { ok: true, current: 2134.28, delta_points: 12.52, delta_percent: 0.59 },
       portfolio: { ok: false },
+      strategy_log: { ok: true, unknown_session_count: 47, instrument_unresolved: { 'BBG008F2T3T2' => 2 },
+                      invalid_lot: { 'BBG008F2T3T2' => 1 } },
       trades: [{ time: '2026-07-23T07:20:00Z', side: 'BUY', ticker: 'RUAL', qty: 10, price: 22.79, amount: 227.85 }] }
   end
 
@@ -371,6 +396,10 @@ RSpec.describe TradingLogic::DailyReportDelivery do
       expect(txt).to include('hello')
       expect(row['buys']).to eq(1)
       expect(row['window_from']).to eq('2026-07-22T16:00:00Z')
+      expect(row['strategy_log']).to eq(
+        'ok' => true, 'unknown_session_count' => 47,
+        'instrument_unresolved' => { 'BBG008F2T3T2' => 2 }, 'invalid_lot' => { 'BBG008F2T3T2' => 1 }
+      )
       expect(row['trades'].first).to include('ticker' => 'RUAL', 'side' => 'BUY', 'qty' => 10)
     end
   end

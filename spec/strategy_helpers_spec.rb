@@ -1896,6 +1896,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
     it 'sells ONE lot (quantity in lots), not the raw share count, for a multi-lot position' do
       position = OpenStruct.new(figi: 'F1', instrument_type: 'SHARE', quantity: OpenStruct.new(units: 100))
       client = double('client')
+      stub_open_trading_schedule(client)
       ops = double('ops')
       instruments = double('instruments')
       orders = double('orders')
@@ -1904,7 +1905,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
       allow(client).to receive(:grpc_orders).and_return(orders)
       allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
       allow(ops).to receive(:portfolio).and_return(OpenStruct.new(positions: [position]))
-      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 10))
+      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 10, exchange: 'MOEX'))
 
       logic = double('logic')
       allow(logic).to receive(:should_sell?).and_return(true)
@@ -1931,6 +1932,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
         execution_report_status: 'EXECUTION_REPORT_STATUS_NEW'
       )
       client = double('client')
+      stub_open_trading_schedule(client)
       allow(client).to receive(:grpc_orders).and_return(
         double('orders', get_orders: OpenStruct.new(orders: [active_sell]))
       )
@@ -1958,6 +1960,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
         average_position_price: q(100)
       )
       client = double('client')
+      stub_open_trading_schedule(client)
       ops = double('ops')
       instruments = double('instruments')
       orders = double('orders')
@@ -1966,7 +1969,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
       allow(client).to receive(:grpc_orders).and_return(orders)
       allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: []))
       allow(ops).to receive(:portfolio).and_return(OpenStruct.new(positions: [position]))
-      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 10, ticker: 'AAA'))
+      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 10, ticker: 'AAA', exchange: 'MOEX'))
 
       logic = double('logic')
       allow(logic).to receive(:should_force_exit?).with(position, 'F1').and_return(true)
@@ -1995,6 +1998,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
         average_position_price: q(100)
       )
       client = double('client')
+      stub_open_trading_schedule(client)
       ops = double('ops')
       instruments = double('instruments')
       orders = double('orders')
@@ -2025,6 +2029,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
         execution_report_status: 'EXECUTION_REPORT_STATUS_PARTIALLYFILL'
       )
       client = double('client')
+      stub_open_trading_schedule(client)
       allow(client).to receive(:grpc_orders).and_return(
         double('orders', get_orders: OpenStruct.new(orders: [active_sell]))
       )
@@ -2045,6 +2050,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
     it 'fails closed before reading the portfolio when active orders are unavailable' do
       client = double('client')
+      stub_open_trading_schedule(client)
       orders = double('orders')
       operations = double('operations')
       allow(client).to receive(:grpc_orders).and_return(orders)
@@ -2058,6 +2064,163 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(
         described_class.try_force_exit_positions_with_logic!(client, logic, 'acc')
       ).to be false
+    end
+  end
+
+  describe 'SELL trading session gate' do
+    let(:now) { Time.utc(2026, 9, 4, 3, 45) }
+    let(:opens_at) { now + 300 }
+    let(:closes_at) { now + 3600 }
+    let(:state) { described_class.default_state }
+    let(:instrument) { OpenStruct.new(lot: 10, exchange: 'MOEX') }
+    let(:position) { OpenStruct.new(figi: 'F1', instrument_type: 'SHARE', quantity: q(100)) }
+    let(:client) { double('client') }
+    let(:logic) { double('logic', should_sell?: true, should_force_exit?: true, last_price_for: 50.0) }
+    let(:logger) { double('logger', debug: nil, info: nil, warn: nil) }
+    let(:schedule) do
+      trading_schedule_response(now: now, intervals: [{
+                                  'interval' => { 'startTs' => opens_at.iso8601, 'endTs' => closes_at.iso8601 }
+                                }])
+    end
+
+    before do
+      allow(Time).to receive(:now).and_return(now)
+      allow(client).to receive(:grpc_operations).and_return(
+        double('operations', portfolio: OpenStruct.new(positions: [position]))
+      )
+      allow(client).to receive(:grpc_orders).and_return(double('orders', get_orders: OpenStruct.new(orders: [])))
+      allow(client).to receive(:grpc_instruments).and_return(double('instruments', get_instrument_by: instrument))
+      allow(client).to receive(:trading_schedules).and_return(schedule)
+    end
+
+    def attempt_sell(cache_path: nil)
+      options = { figi_cache: { 'F1' => 'AAA' }, logger: logger, trading_schedule_cache_path: cache_path }
+      if sell_path == :signal
+        described_class.try_sell_positions_with_logic!(client, logic, 'acc', state, **options)
+      else
+        described_class.try_force_exit_positions_with_logic!(client, logic, 'acc', state: state, **options)
+      end
+    end
+
+    def expect_sell_submission
+      expected_lots = sell_path == :signal ? 1 : 10
+      expect(logic).to receive(:confirm_and_place_order_with_result).with(
+        hash_including(quantity: expected_lots, direction: Tinkoff::Public::Invest::Api::Contract::V1::OrderDirection::ORDER_DIRECTION_SELL)
+      ).and_return(ok: true, category: :filled, response: OpenStruct.new(order_id: 'sell-order'))
+    end
+
+    %i[signal force_exit].each do |path|
+      context "with #{path} sales" do
+        let(:sell_path) { path }
+
+        it 'skips before opening without requesting confirmation or consuming the daily sale' do
+          expect(logic).not_to receive(:confirm_and_place_order_with_result)
+          expect(logic).not_to receive(:last_price_for)
+          expect(logger).to receive(:debug).with(/trading_session reason=session_closed exchange=MOEX/)
+          attempt_sell
+          expect(state).to eq(described_class.default_state)
+        end
+
+        it 'skips exactly at the end of a trading interval' do
+          allow(Time).to receive(:now).and_return(closes_at)
+          expect(logic).not_to receive(:confirm_and_place_order_with_result)
+          attempt_sell
+          expect(state).to eq(described_class.default_state)
+        end
+
+        it 'skips non-trading days' do
+          allow(client).to receive(:trading_schedules).and_return(trading_schedule_response(now: now, is_trading_day: false))
+          expect(logic).not_to receive(:confirm_and_place_order_with_result)
+          expect(logger).to receive(:debug).with(/reason=non_trading_day/)
+          attempt_sell
+          expect(state).to eq(described_class.default_state)
+        end
+
+        it 'warns and submits when the schedule request fails' do
+          allow(client).to receive(:trading_schedules).and_raise(StandardError, 'unavailable')
+          expect(logger).to receive(:warn).with(/proceeding with unknown session.*reason=schedule_unavailable/)
+          expect_sell_submission
+          attempt_sell
+          expect(state.fetch('last_sell').fetch('AAA').fetch('reason')).to eq(sell_path.to_s)
+        end
+
+        it 'warns and submits when the instrument exchange is unknown' do
+          instrument.exchange = ''
+          expect(client).not_to receive(:trading_schedules)
+          expect(logger).to receive(:warn).with(/proceeding with unknown session.*reason=exchange_unavailable/)
+          expect_sell_submission
+          attempt_sell
+        end
+
+        it 'warns and submits when the schedule has no current day' do
+          schedule.payload.fetch('exchanges').first['days'] = []
+          expect(logger).to receive(:warn).with(/proceeding with unknown session.*reason=day_unavailable/)
+          expect_sell_submission
+          attempt_sell
+        end
+
+        it 'warns and submits when the trading day has no intervals' do
+          schedule.payload.fetch('exchanges').first.fetch('days').first['intervals'] = []
+          expect(logger).to receive(:warn).with(/proceeding with unknown session.*reason=intervals_unavailable/)
+          expect_sell_submission
+          attempt_sell
+        end
+
+        it 'warns and submits when session status encounters an unexpected error' do
+          allow(described_class).to receive(:cached_trading_schedule).and_raise(StandardError, 'unexpected')
+          expect(logger).to receive(:warn).with(/proceeding with unknown session.*reason=schedule_error/)
+          expect_sell_submission
+          attempt_sell
+        end
+
+        it 'skips with instrument_unresolved when the instrument lookup fails' do
+          allow(client.grpc_instruments).to receive(:get_instrument_by).and_raise(StandardError, 'lookup failed')
+          expect(client).not_to receive(:trading_schedules)
+          expect(logic).not_to receive(:confirm_and_place_order_with_result)
+          expect(logger).to receive(:warn).with(/skipped.*reason=instrument_unresolved figi=F1/)
+          attempt_sell
+          expect(state).to eq(described_class.default_state)
+        end
+
+        it 'skips with instrument_unresolved when the instrument lookup returns nil' do
+          allow(client.grpc_instruments).to receive(:get_instrument_by).and_return(nil)
+          expect(client).not_to receive(:trading_schedules)
+          expect(logic).not_to receive(:confirm_and_place_order_with_result)
+          expect(logger).to receive(:warn).with(/skipped.*reason=instrument_unresolved figi=F1/)
+          attempt_sell
+          expect(state).to eq(described_class.default_state)
+        end
+
+        [nil, 0, -1].each do |invalid_lot|
+          it "skips with invalid_lot for lot=#{invalid_lot.inspect}" do
+            instrument.lot = invalid_lot
+            expect(client).not_to receive(:trading_schedules)
+            expect(logic).not_to receive(:confirm_and_place_order_with_result)
+            expect(logger).to receive(:warn).with(/skipped.*reason=invalid_lot figi=F1/)
+            attempt_sell
+            expect(state).to eq(described_class.default_state)
+          end
+        end
+
+        it 'submits at opening using the broker exchange name and the shared disk schedule' do
+          instrument.exchange = 'moex_mrng_evng_e_wknd_dlr'
+          exchange_key = instrument.exchange.upcase
+          schedule.payload.fetch('exchanges').first['exchange'] = instrument.exchange
+          cache = Tempfile.new(['sell-trading-schedules', '.json'])
+          expect(client).to receive(:trading_schedules).with(hash_including(exchange: exchange_key)).once.and_return(schedule)
+          expect(logger).to receive(:debug).with(/reason=session_closed exchange=#{exchange_key}/)
+          attempt_sell(cache_path: cache.path)
+          expect(state).to eq(described_class.default_state)
+          expect(JSON.parse(File.read(cache.path)).fetch('exchanges')).to have_key(exchange_key)
+
+          allow(Time).to receive(:now).and_return(opens_at)
+          expect_sell_submission
+          attempt_sell(cache_path: cache.path)
+          expect(state.fetch('last_sell').fetch('AAA').fetch('reason')).to eq(sell_path.to_s)
+        ensure
+          cache&.close!
+        end
+      end
     end
   end
 

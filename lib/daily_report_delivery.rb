@@ -110,7 +110,7 @@ module TradingLogic
         fees: agg[:fees], realized: agg[:realized],
         index: idx[:ok] ? { value: idx[:current], delta_points: idx[:delta_points], delta_percent: idx[:delta_percent] } : nil,
         portfolio: result[:portfolio][:ok] ? result[:portfolio].except(:ok) : nil,
-        trades: result[:trades]
+        trades: result[:trades], strategy_log: result[:strategy_log]
       )
     end
 

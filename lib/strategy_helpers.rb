@@ -673,7 +673,8 @@ module TradingLogic
       result[:ok] == true || %w[filled partially_filled].include?(category)
     end
 
-    def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side, logger: nil)
+    def try_sell_positions_with_logic!(client, logic, account_id, state, figi_cache: {}, trend: :side, logger: nil,
+                                       trading_schedule_cache_path: nil)
       active_sell_figis = guarded_active_sell_figis(client, account_id, context: 'SELL', logger: logger)
       return false unless active_sell_figis
 
@@ -713,8 +714,9 @@ module TradingLogic
           nil
         end
 
-        lot = inst&.lot.to_i
-        lot = 1 if lot <= 0
+        lot = sell_instrument_lot(inst, ticker: ticker, figi: figi, logger: logger)
+        next unless lot
+
         it = { figi: figi, ticker: ticker, lot: lot }
         next unless logic.should_sell?(p, it, trend: trend)
 
@@ -722,6 +724,7 @@ module TradingLogic
         lots_held = qty_units / lot
         sell_qty = [1, lots_held].min
         next if sell_qty <= 0
+        next unless sell_session_open?(client, inst, ticker: ticker, logger: logger, cache_path: trading_schedule_cache_path)
 
         result = begin
           logic.confirm_and_place_order_with_result(
@@ -746,7 +749,8 @@ module TradingLogic
       end
     end
 
-    def try_force_exit_positions_with_logic!(client, logic, account_id, state: nil, figi_cache: {}, logger: nil)
+    def try_force_exit_positions_with_logic!(client, logic, account_id, state: nil, figi_cache: {}, logger: nil,
+                                             trading_schedule_cache_path: nil)
       active_sell_figis = guarded_active_sell_figis(client, account_id, context: 'FORCE SELL', logger: logger)
       return false unless active_sell_figis
 
@@ -758,13 +762,14 @@ module TradingLogic
           state: state,
           active_sell_figis: active_sell_figis,
           figi_cache: figi_cache,
-          logger: logger
+          logger: logger,
+          trading_schedule_cache_path: trading_schedule_cache_path
         )
       end
     end
 
     def try_force_exit_position!(client, logic, account_id, position, state: nil, active_sell_figis: nil,
-                                 figi_cache: {}, logger: nil)
+                                 figi_cache: {}, logger: nil, trading_schedule_cache_path: nil)
       figi = position.figi
 
       if active_sell_figis.nil?
@@ -793,17 +798,18 @@ module TradingLogic
         nil
       end
 
-      lot = inst&.lot.to_i
-      if lot <= 0
-        logger&.warn("FORCE SELL #{ticker} skipped — unable to resolve positive lot size for figi=#{figi}")
-        return
-      end
+      lot = sell_instrument_lot(inst, ticker: ticker, figi: figi, context: 'FORCE SELL', logger: logger)
+      return unless lot
 
       lots = qty_units / lot
       if lots <= 0
         logger&.info("FORCE SELL #{ticker} skipped — holding #{qty_units} < lot=#{lot}")
         return
       end
+
+      return false unless sell_session_open?(
+        client, inst, ticker: ticker, context: 'FORCE SELL', logger: logger, cache_path: trading_schedule_cache_path
+      )
 
       cur_price = logic.last_price_for(figi)
       result = begin
@@ -829,6 +835,32 @@ module TradingLogic
         logger&.info("FORCE SELL #{ticker} skipped / not confirmed")
         false
       end
+    end
+
+    def sell_instrument_lot(instrument, ticker:, figi:, context: 'SELL', logger: nil)
+      lot = instrument.lot.to_i if instrument.respond_to?(:lot)
+      return lot if lot&.positive?
+
+      reason = instrument.nil? ? 'instrument_unresolved' : 'invalid_lot'
+      logger&.warn("#{context} #{ticker} skipped — reason=#{reason} figi=#{figi} lot=#{lot.inspect}")
+      nil
+    end
+
+    # Only a confirmed closure blocks SELL; schedule outages must not prevent exits.
+    # Instrument resolution and lot validation are separate prerequisites in both SELL paths.
+    def sell_session_open?(client, instrument, ticker:, context: 'SELL', logger: nil, cache_path: nil)
+      exchange = instrument.exchange if instrument.respond_to?(:exchange)
+      session = trading_session_status(client, exchange: exchange, cache_path: cache_path, logger: logger)
+      return true if session[:open]
+
+      details = "trading_session reason=#{session[:reason]} exchange=#{session[:exchange]}"
+      if %w[session_closed non_trading_day].include?(session[:reason])
+        logger&.debug("#{context} #{ticker} skipped — #{details}")
+        return false
+      end
+
+      logger&.warn("#{context} #{ticker} proceeding with unknown session — #{details}")
+      true
     end
 
     # Broker-side guard shared by every SELL path. GetOrders is authoritative for
@@ -903,11 +935,15 @@ module TradingLogic
       (Time.now.utc - updated.utc) <= max_age_seconds
     end
 
-    # BUY разрешён только внутри фактического торгового интервала, который вернул
-    # TradingSchedules. Статус инструмента сам по себе не означает, что площадка
-    # сейчас открыта. Кеш нужен на диске, потому что cron каждый раз запускает новый
-    # процесс. Любая неоднозначность трактуется fail-closed.
+    # TradingSchedules определяет фактические торговые интервалы: статус инструмента
+    # сам по себе не означает, что площадка сейчас открыта. Кеш нужен на диске,
+    # потому что cron каждый раз запускает новый процесс. Неопределённость блокирует
+    # BUY; SELL блокируется только при подтверждённом закрытии сессии.
     def buy_session_status(client, exchange:, now: Time.now.utc, cache_path: nil, logger: nil)
+      trading_session_status(client, exchange: exchange, now: now, cache_path: cache_path, logger: logger)
+    end
+
+    def trading_session_status(client, exchange:, now: Time.now.utc, cache_path: nil, logger: nil)
       normalized_exchange = exchange.to_s.strip.upcase
       return { open: false, reason: 'exchange_unavailable', exchange: normalized_exchange } if normalized_exchange.empty?
 
@@ -931,12 +967,12 @@ module TradingLogic
       reason = intervals.empty? ? 'intervals_unavailable' : 'session_closed'
       { open: is_open, reason: is_open ? 'open' : reason, exchange: normalized_exchange }
     rescue StandardError => e
-      logger&.warn("BUY session gate failed for #{normalized_exchange}: #{e.class}: #{e.message}")
+      logger&.warn("Trading session gate failed for #{normalized_exchange}: #{e.class}: #{e.message}")
       { open: false, reason: 'schedule_error', exchange: normalized_exchange }
     end
 
     def trading_session_open?(client, exchange:, now: Time.now.utc, cache_path: nil, logger: nil)
-      buy_session_status(client, exchange: exchange, now: now, cache_path: cache_path, logger: logger)[:open]
+      trading_session_status(client, exchange: exchange, now: now, cache_path: cache_path, logger: logger)[:open]
     end
 
     def cached_trading_schedule(path, exchange, day, now: Time.now.utc)
@@ -957,7 +993,7 @@ module TradingLogic
 
     def fetch_and_cache_trading_schedule(client, exchange, day, cache_path:, now:, logger: nil)
       unless client.respond_to?(:trading_schedules)
-        logger&.warn("BUY blocked: TradingSchedules unavailable for exchange=#{exchange}")
+        logger&.warn("TradingSchedules unavailable for exchange=#{exchange}")
         return nil
       end
 
@@ -974,7 +1010,7 @@ module TradingLogic
       persist_trading_schedule_cache(cache_path, exchange, schedule, now: now) unless cache_path.to_s.empty?
       schedule
     rescue StandardError => e
-      logger&.warn("BUY blocked: TradingSchedules failed for exchange=#{exchange}: #{e.class}: #{e.message}")
+      logger&.warn("TradingSchedules failed for exchange=#{exchange}: #{e.class}: #{e.message}")
       nil
     end
 

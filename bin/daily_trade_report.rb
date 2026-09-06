@@ -52,7 +52,8 @@ delivery = TradingLogic::DailyReportDelivery.new(state_path: STATE_PATH, archive
 
 client = build_client
 report = TradingLogic::DailyTradeReport.new(
-  client: client, market_cache_path: MARKET_CACHE_PATH, logger: LOGGER
+  client: client, market_cache_path: MARKET_CACHE_PATH, logger: LOGGER,
+  strategy_log_path: File.join(ROOT, 'logs', 'current_strategy.log')
 )
 
 unless dry_run || (bot && chat && !bot.to_s.empty? && !chat.to_s.empty?)
