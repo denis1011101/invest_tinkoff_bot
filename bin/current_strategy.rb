@@ -11,6 +11,7 @@ require 'json'
 require 'fileutils'
 require 'logger'
 require_relative '../lib/strategy_helpers'
+require_relative '../lib/strategy_log_formatter'
 require_relative '../lib/position_sizing'
 
 log_level_name = ENV.fetch('LOG_LEVEL', 'DEBUG').upcase
@@ -18,9 +19,7 @@ log_level = Logger.const_defined?(log_level_name) ? Logger.const_get(log_level_n
 
 LOGGER = Logger.new($stdout)
 LOGGER.level = log_level
-LOGGER.formatter = proc do |severity, datetime, _progname, message|
-  "#{datetime.utc.iso8601} #{severity}: #{message}\n"
-end
+LOGGER.formatter = TradingLogic::StrategyLogFormatter.new
 
 token = ENV['TINKOFF_TOKEN'] || abort('Set TINKOFF_TOKEN')
 client = InvestTinkoff::V2::Client.new(token: token, sandbox: false)
@@ -178,7 +177,9 @@ begin
   # Принудительная продажа всех лотов при профите >= +10% (до основной логики)
   begin
     TradingLogic::StrategyHelpers.try_force_exit_positions_with_logic!(
-      client, logic, account_id, state: state, figi_cache: figi_cache, logger: LOGGER
+      client, logic, account_id,
+      state: state, figi_cache: figi_cache, logger: LOGGER,
+      trading_schedule_cache_path: TRADING_SCHEDULE_CACHE_PATH
     )
   rescue InvestTinkoff::GRPC::Error => e
     LOGGER.error("Force exit gRPC error: #{e.class} #{e.message}")
@@ -440,7 +441,9 @@ begin
     # Единый проход по всем позициям, включая бумаги вне исходного TICKERS. Внутри
     # действует broker-side guard активных SELL и fail-closed поведение GetOrders.
     TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
-      client, logic, account_id, state, figi_cache: figi_cache, trend: trend, logger: LOGGER
+      client, logic, account_id, state,
+      figi_cache: figi_cache, trend: trend, logger: LOGGER,
+      trading_schedule_cache_path: TRADING_SCHEDULE_CACHE_PATH
     )
     # попытка одной покупки по momentum-сигналу из пересечения IMOEX∩market
     LOGGER.info("DOWN: try momentum(#{MOMENTUM_RULE}) BUY one per day from IMOEX∩market")
@@ -462,13 +465,17 @@ begin
     # защитные продажи (в т.ч. force-exit выше) оставляем.
     LOGGER.warn('Trend: UNKNOWN (нет данных по индексу) — только защитные продажи, без новых покупок')
     TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
-      client, logic, account_id, state, figi_cache: figi_cache, trend: :side, logger: LOGGER
+      client, logic, account_id, state,
+      figi_cache: figi_cache, trend: :side, logger: LOGGER,
+      trading_schedule_cache_path: TRADING_SCHEDULE_CACHE_PATH
     )
 
   else
     LOGGER.info("Trend: SIDE — SELL by same rules, and try momentum(#{MOMENTUM_RULE}) BUY one per day")
     TradingLogic::StrategyHelpers.try_sell_positions_with_logic!(
-      client, logic, account_id, state, figi_cache: figi_cache, trend: trend, logger: LOGGER
+      client, logic, account_id, state,
+      figi_cache: figi_cache, trend: trend, logger: LOGGER,
+      trading_schedule_cache_path: TRADING_SCHEDULE_CACHE_PATH
     )
     bought = TradingLogic::StrategyHelpers.buy_one_momentum_from_intersection!(
       client, logic, state,

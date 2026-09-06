@@ -7,6 +7,7 @@ require 'net/http'
 require 'uri'
 require_relative 'utils'
 require_relative 'trade_execution_extractor'
+require_relative 'strategy_log_summary'
 # StrategyHelpers использовался и раньше (build_figi_ticker_map), но подтягивался
 # только через точку входа — при загрузке одного daily_trade_report был NameError.
 require_relative 'strategy_helpers'
@@ -20,7 +21,7 @@ module TradingLogic
 
     Config = Struct.new(:offset, :time_label, :cutoff, :index, :operation_lookback_days, keyword_init: true)
     def initialize(client:, account_id: nil, now: Time.now.utc, config: self.class.config_from_env,
-                   market_cache_path: nil, logger: nil)
+                   market_cache_path: nil, strategy_log_path: nil, logger: nil)
       @client = client
       @account_id = account_id
       @now = now.utc
@@ -28,6 +29,7 @@ module TradingLogic
       @figi_ticker = market_cache_path ? StrategyHelpers.build_figi_ticker_map(market_cache_path) : {}
       @ticker_cache = {}
       @logger = logger
+      @strategy_log = StrategyLogSummary.new(path: strategy_log_path, logger: logger) if strategy_log_path
     end
 
     def self.config_from_env(env = ENV)
@@ -77,10 +79,11 @@ module TradingLogic
       current = day == report_day(nil)
       portfolio = current ? portfolio_snapshot : { ok: false, reason: :historical }
       balance = current ? balance_snapshot : { ok: false, reason: :historical }
-      text = format_message(day, aggregates, index, portfolio, balance, trades)
+      strategy_log = @strategy_log&.build(from: from_utc, to: to_utc)
+      text = ([format_message(day, aggregates, index, portfolio, balance, trades)] + StrategyLogSummary.format(strategy_log)).join("\n")
       { day: day.iso8601, text: text, aggregates: aggregates, index: index, portfolio: portfolio,
         balance: balance, window_from: from_utc.iso8601, window_to: to_utc.iso8601,
-        trades: structured_trades(trades) }
+        trades: structured_trades(trades), strategy_log: strategy_log }
     rescue TradeExecutionExtractor::ExtractionError => e
       raise BrokerError, e.message
     end
