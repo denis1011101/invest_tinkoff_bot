@@ -16,6 +16,14 @@ RSpec.describe TradingLogic::StrategyHelpers do
   end
   let(:state) { described_class.default_state }
 
+  def with_env(vars)
+    saved = vars.keys.to_h { |key| [key, ENV.fetch(key, nil)] }
+    vars.each { |key, value| ENV[key] = value }
+    yield
+  ensure
+    saved.each { |key, value| ENV[key] = value }
+  end
+
   def log_lines(pattern)
     log.string.lines.grep(pattern)
   end
@@ -40,11 +48,14 @@ RSpec.describe TradingLogic::StrategyHelpers do
   end
 
   # GetOrders отдаёт active_orders; order_states — ответы GetOrderState по order_id
-  # (значение-исключение имитирует сбой API).
-  def broker(active_orders: [], order_states: {})
+  # (значение-исключение имитирует сбой API); operations — операции для даты исполнения.
+  def broker(active_orders: [], order_states: {}, operations: [])
     client = double('client')
     orders = double('orders')
     allow(client).to receive(:grpc_orders).and_return(orders)
+    allow(client).to receive(:grpc_operations).and_return(
+      double('ops', operations_by_cursor: OpenStruct.new(items: operations, has_next: false))
+    )
     allow(orders).to receive(:get_orders).with(account_id: 'acc').and_return(OpenStruct.new(orders: active_orders))
     allow(client).to receive(:order_state) do |account_id:, order_id:|
       expect(account_id).to eq('acc')
@@ -209,7 +220,7 @@ RSpec.describe TradingLogic::StrategyHelpers do
         expect(log_lines(/WARN: SELL reconciliation skipped/).size).to eq(1)
       end
 
-      it 'raises one ERROR after BUY_CANCEL_MAX_ATTEMPTS unconfirmed lookups, not one per run' do
+      it 'raises one ERROR after SELL_TERMINAL_MAX_ATTEMPTS unconfirmed lookups, not one per run' do
         place_sell
         client = broker(order_states: { 'sell-1' => StandardError.new('boom') })
 
@@ -219,6 +230,15 @@ RSpec.describe TradingLogic::StrategyHelpers do
         expect(log_lines(/ERROR:/).size).to eq(1)
         expect(state['pending_sells']).to have_key('sell-1')
       end
+    end
+
+    it 'honours SELL_TERMINAL_MAX_ATTEMPTS for the stuck alert' do
+      place_sell
+      client = broker(order_states: { 'sell-1' => StandardError.new('boom') })
+
+      with_env('SELL_TERMINAL_MAX_ATTEMPTS' => '2') { 2.times { reconcile(client) } }
+
+      expect(log_lines(/ERROR: SELL PENDING STUCK AAA order_id=sell-1 terminal_confirm_attempts=2/).size).to eq(1)
     end
 
     it 'leaves last_sell alone when it already belongs to a newer order' do
@@ -265,6 +285,133 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
       reconcile(broker(order_states: { 'orphan' => order_state('CANCELLED', requested: 2) }))
       expect(state['last_sell']).not_to have_key('AAA')
+    end
+  end
+
+  describe 'two orders on one instrument' do
+    it 'does not resurrect an already cancelled order when the newer one is cancelled too' do
+      place_sell(order_id: 'old')
+      place_sell(order_id: 'new')
+
+      reconcile(broker(order_states: { 'old' => order_state('CANCELLED'), 'new' => order_state('CANCELLED') }))
+
+      expect(state['pending_sells']).to be_empty
+      expect(state['last_sell']).not_to have_key('AAA')
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(0)
+    end
+
+    it 'ends with no sale whichever of the two cancellations is seen first' do
+      place_sell(order_id: 'old')
+      place_sell(order_id: 'new')
+
+      reconcile(broker(active_orders: [active_sell(order_id: 'old')], order_states: { 'new' => order_state('CANCELLED') }))
+      expect(state['last_sell']['AAA']['order_id']).to eq('old')
+
+      reconcile(broker(order_states: { 'old' => order_state('CANCELLED') }))
+      expect(state['last_sell']).not_to have_key('AAA')
+    end
+
+    it 'falls back to the executed older order, with its outcome, when the newer one is cancelled' do
+      place_sell(order_id: 'old', lots: 2)
+      place_sell(order_id: 'new')
+
+      reconcile(broker(active_orders: [active_sell(order_id: 'new')],
+                       order_states: { 'old' => order_state('FILL', requested: 2, executed: 2) }))
+      reconcile(broker(order_states: { 'new' => order_state('CANCELLED') }))
+
+      expect(state['last_sell']['AAA']).to include('order_id' => 'old', 'lots_executed' => 2)
+      expect(state['last_sell']['AAA']).to have_key('executed_at')
+    end
+  end
+
+  describe 'blocking a new SELL while an earlier outcome is unknown' do
+    def blocked_run(force:)
+      position = OpenStruct.new(figi: 'F1', instrument_type: 'SHARE', quantity: OpenStruct.new(units: 3))
+      client = broker(order_states: { 'sell-1' => order_state('NEW') })
+      instruments = double('instruments')
+      allow(client).to receive_messages(grpc_operations: double('ops', portfolio: OpenStruct.new(positions: [position])),
+                                        grpc_instruments: instruments)
+      allow(instruments).to receive(:get_instrument_by).with(:figi, 'F1').and_return(OpenStruct.new(lot: 1))
+      allow(described_class).to receive(:sell_session_open?).and_return(true)
+      logic = double('logic', should_force_exit?: true, should_sell?: true, last_price_for: 700.0)
+      allow(logic).to receive(:confirm_and_place_order_with_result)
+
+      reconcile(client)
+      expect(state['pending_sells']).to have_key('sell-1')
+      if force
+        described_class.try_force_exit_positions_with_logic!(client, logic, 'acc', state: state,
+                                                                                   figi_cache: { 'F1' => 'AAA' }, logger: logger)
+      else
+        described_class.try_sell_positions_with_logic!(client, logic, 'acc', state, figi_cache: { 'F1' => 'AAA' },
+                                                                                    logger: logger)
+      end
+      expect(logic).not_to have_received(:confirm_and_place_order_with_result)
+    end
+
+    it 'blocks force exit, which never looks at last_sell' do
+      place_sell
+
+      blocked_run(force: true)
+    end
+
+    it 'blocks the signal SELL on the next day as well' do
+      current = Time.now.utc
+      allow(Time).to receive(:now).and_return(current - 86_400)
+      place_sell
+      allow(Time).to receive(:now).and_return(current)
+
+      blocked_run(force: false)
+    end
+  end
+
+  describe 'execution day' do
+    let(:today) { Time.now.utc }
+    let(:yesterday) { today - 86_400 }
+
+    def place_yesterday
+      allow(Time).to receive(:now).and_return(yesterday)
+      place_sell
+      allow(Time).to receive(:now).and_return(today)
+    end
+
+    def filled_with_stage(time)
+      state = order_state('FILL')
+      state.payload['stages'] = [{ 'executionTime' => time.iso8601 }]
+      state
+    end
+
+    it 'counts a previous-day order filled today as a sale today' do
+      place_yesterday
+
+      reconcile(broker(order_states: { 'sell-1' => order_state('FILL') }), now: today)
+
+      expect(described_class.acted_today?(state, 'last_sell', 'AAA')).to be true
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+      expect(state['last_sell']['AAA']).to include('executed_at_source' => 'observed')
+    end
+
+    it 'takes the execution time from the order trades when the broker reports them' do
+      place_yesterday
+
+      reconcile(broker(order_states: { 'sell-1' => filled_with_stage(yesterday + 60) }), now: today)
+
+      expect(state['last_sell']['AAA']).to include('executed_at' => (yesterday + 60).utc.iso8601,
+                                                   'executed_at_source' => 'order_stages')
+      expect(described_class.acted_today?(state, 'last_sell', 'AAA')).to be false
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(0)
+    end
+
+    it 'falls back to the SELL operation time for the instrument' do
+      place_yesterday
+      operations = [
+        OpenStruct.new(type: 'OPERATION_TYPE_SELL', figi: 'OTHER', quantity_done: 1, date: (today - 30).iso8601),
+        OpenStruct.new(type: 'OPERATION_TYPE_SELL', figi: 'F1', quantity_done: 1, date: (today - 600).iso8601)
+      ]
+
+      reconcile(broker(order_states: { 'sell-1' => order_state('FILL') }, operations: operations), now: today)
+
+      expect(state['last_sell']['AAA']).to include('executed_at' => (today - 600).utc.iso8601,
+                                                   'executed_at_source' => 'operations')
     end
   end
 

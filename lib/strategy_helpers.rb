@@ -702,7 +702,8 @@ module TradingLogic
           next
         end
 
-        next if acted_today?(state, 'last_sell', ticker)
+        next if acted_today?(state, 'last_sell', ticker) ||
+                unresolved_sell_blocks?(state, figi, ticker: ticker, context: 'SELL', logger: logger)
 
         if active_sell_figis.include?(figi.to_s)
           logger&.info("SELL #{ticker} skipped — active SELL already exists for figi=#{figi}")
@@ -742,8 +743,7 @@ module TradingLogic
         if successful_buy_result?(result)
           resp = result[:response]
           logger&.info("SELL #{ticker} lots=#{sell_qty} (order_id=#{resp.order_id})")
-          register_sell_order!(state, ticker, figi: figi, result: result, lots: sell_qty, reason: 'signal',
-                                              logger: logger)
+          register_sell_order!(state, ticker, figi: figi, result: result, lots: sell_qty, reason: 'signal', logger: logger)
           active_sell_figis << figi.to_s
         else
           logger&.info("SELL #{ticker} skipped / not confirmed")
@@ -789,6 +789,8 @@ module TradingLogic
       return unless logic.should_force_exit?(position, figi)
 
       ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache, logger: logger) || figi
+      return false if state && unresolved_sell_blocks?(state, figi, ticker: ticker, context: 'FORCE SELL', logger: logger)
+
       if active_sell_figis.include?(figi.to_s)
         logger&.info("FORCE SELL #{ticker} skipped — active SELL already exists for figi=#{figi}")
         return false
@@ -2057,7 +2059,7 @@ module TradingLogic
       if action.to_s == 'last_sell'
         sell = state[action] || {}
         entry = sell[ticker]
-        return true if entry.is_a?(Hash) && entry['ts'].to_s.start_with?(day)
+        return true if entry.is_a?(Hash) && [entry['ts'], entry['executed_at']].any? { |t| t.to_s.start_with?(day) }
 
         # backward compatibility with legacy format { day => { ticker => true } }
         return (sell[day] || {})[ticker] == true
@@ -2093,7 +2095,7 @@ module TradingLogic
 
       unfilled = unfilled_pending_sell_order_ids(state)
       sell.values.count do |v|
-        v.is_a?(Hash) && v['ts'].to_s.start_with?(day) && !unfilled.include?(v['order_id'])
+        v.is_a?(Hash) && (v['executed_at'] || v['ts']).to_s.start_with?(day) && !unfilled.include?(v['order_id'])
       end
     end
 
@@ -2168,6 +2170,21 @@ module TradingLogic
       (ENV['SELL_PENDING_ALERT_MIN'] || '60').to_f
     end
 
+    # Пока исход прежней SELL по бумаге не подтверждён, новую не ставим ни сигналом,
+    # ни force exit, и дата тут ни при чём. Пропажа заявки из GetOrders не доказывает,
+    # что она уже не исполнится: ответы API бывают противоречивы. Из зависшего
+    # состояния выводит только ручной разбор по SELL PENDING STUCK.
+    def unresolved_sell_blocks?(state, figi, ticker:, context:, logger: nil)
+      pending = (state['pending_sells'] || {}).values.find { |info| info['figi'].to_s == figi.to_s }
+      return false unless pending
+
+      logger&.debug(
+        "#{context} #{ticker} skipped — earlier SELL order_id=#{pending['broker_order_id']} " \
+        "status=#{pending['status']} outcome not confirmed"
+      )
+      true
+    end
+
     # last_sell ставится в момент размещения SELL: он же не даёт продать бумагу
     # второй раз за день. Но размещение ещё не продажа — лимитник по последней цене
     # может провисеть всю сессию и сгореть (CNRU, 15.09.2026). Поэтому заявка, не
@@ -2183,7 +2200,7 @@ module TradingLogic
       entry['lots_requested'] = lots
 
       if result[:ok] == true || result[:category].to_s == 'filled'
-        entry['lots_executed'] = lots
+        entry.merge!('lots_executed' => lots, 'executed_at' => entry['ts'], 'executed_at_source' => 'order_response')
         return nil
       end
 
@@ -2229,7 +2246,7 @@ module TradingLogic
         if active
           track_active_sell!(state, info, active, logger: logger, now: now)
         else
-          resolve_missing_sell!(client, account_id, state, key, info, logger: logger)
+          resolve_missing_sell!(client, account_id, state, key, info, logger: logger, now: now)
         end
       end
       true
@@ -2288,7 +2305,11 @@ module TradingLogic
       info['lots_executed'] = [info['lots_executed'].to_i, executed].max if executed
       info['status'] = pending_status_for_order(order) || info['status']
       entry = owned_last_sell_entry(state, info)
-      entry['lots_executed'] = info['lots_executed'] if entry
+      if entry
+        entry['lots_executed'] = info['lots_executed']
+        executed_at = order_stage_execution_time(order)
+        entry.merge!('executed_at' => executed_at.iso8601, 'executed_at_source' => 'order_stages') if executed_at
+      end
       alert_long_pending_sell!(logger, info, now: now)
     end
 
@@ -2310,7 +2331,7 @@ module TradingLogic
       true
     end
 
-    def resolve_missing_sell!(client, account_id, state, key, info, logger: nil)
+    def resolve_missing_sell!(client, account_id, state, key, info, logger: nil, now: Time.now.utc)
       order = fetch_sell_order_state(client, account_id, info, logger: logger)
       return unresolved_pending_sell!(logger, info) unless order
 
@@ -2326,8 +2347,53 @@ module TradingLogic
       return unresolved_pending_sell!(logger, info, status: status) unless outcome
 
       executed = requested if outcome == :executed
-      finalize_pending_sell!(state, key, info, outcome: outcome, status: status,
+      executed_at = (sell_executed_at(client, account_id, info, order, now: now) unless outcome == :cancelled)
+      finalize_pending_sell!(state, key, info, outcome: outcome, status: status, executed_at: executed_at,
                                                lots_executed: executed, lots_requested: requested, logger: logger)
+    end
+
+    # День продажи — день исполнения, а не размещения: вчерашняя заявка, исполненная
+    # сегодня, — сегодняшняя продажа. Время берём у брокера: сделки заявки
+    # (OrderState.stages), затем SELL-операции по FIGI с момента размещения. Если
+    # брокер времени не дал, остаётся момент, когда он подтвердил исполнение:
+    # продажа случилась не позже, и source=observed это честно помечает.
+    def sell_executed_at(client, account_id, info, order, now: Time.now.utc)
+      from_stages = order_stage_execution_time(order)
+      return { time: from_stages, source: 'order_stages' } if from_stages
+
+      from_operations = sell_operation_time(client, account_id, info, now: now)
+      return { time: from_operations, source: 'operations' } if from_operations
+
+      { time: now, source: 'observed' }
+    end
+
+    def order_stage_execution_time(order)
+      stages = structured_order_value(order, :stages)
+      return nil unless stages.respond_to?(:to_a)
+
+      stages.to_a.filter_map do |stage|
+        raw = structured_value(stage, :execution_time, :executionTime)
+        time = raw && parse_time_candidate(raw)
+        time if time&.to_i&.positive?
+      end.max
+    rescue StandardError
+      nil
+    end
+
+    def sell_operation_time(client, account_id, info, now: Time.now.utc)
+      figi = info['figi'].to_s
+      return nil if figi.empty?
+
+      from = (pending_order_ts(info) || (now - (2 * 24 * 3600))) - (ENV['PENDING_RECONCILE_OVERLAP_SECONDS'] || '120').to_i
+      fetched = operations_between(client, account_id, from: from, to: now)
+      return nil unless fetched[:ok]
+
+      fetched[:operations].filter_map do |op|
+        next unless operation_kind(op) == :sell && op.respond_to?(:figi) && op.figi.to_s == figi
+        next unless operation_has_execution?(op)
+
+        operation_time(op)
+      end.max
     end
 
     def fetch_sell_order_state(client, account_id, info, logger: nil)
@@ -2351,7 +2417,7 @@ module TradingLogic
         "SELL terminal status not confirmed for #{info['ticker']} order_id=#{info['broker_order_id']} " \
         "status=#{status.to_s.empty? ? 'unavailable' : status} attempt=#{attempts} — last_sell kept"
       )
-      return :unknown if info['stuck_alerted'] || attempts < cancel_max_attempts
+      return :unknown if info['stuck_alerted'] || attempts < sell_terminal_max_attempts
 
       info['stuck_alerted'] = true
       logger&.error(
@@ -2361,34 +2427,68 @@ module TradingLogic
       :unknown
     end
 
-    def finalize_pending_sell!(state, key, info, outcome:, status:, lots_executed:, lots_requested:, logger: nil)
+    def sell_terminal_max_attempts
+      value = (ENV['SELL_TERMINAL_MAX_ATTEMPTS'] || '5').to_i
+      value.positive? ? value : 5
+    end
+
+    def finalize_pending_sell!(state, key, info, outcome:, status:, lots_executed:, lots_requested:,
+                               executed_at: nil, logger: nil)
       ticker = info['ticker']
       state['pending_sells'].delete(key)
       entry = owned_last_sell_entry(state, info)
       tail = "order_id=#{info['broker_order_id']} status=#{status} reason=#{info['reason']}"
-      case outcome
-      when :cancelled
+      if outcome == :cancelled
         restore_previous_last_sell!(state, info) if entry
+        relink_previous_last_sell!(state, info) { info['previous_last_sell'] }
         logger&.warn(
           "SELL CANCELLED #{ticker} #{tail} lots_executed=0/#{lots_requested} — nothing sold, " \
           'last_sell cleared, signal will be re-evaluated'
         )
-      when :partially_executed
-        remaining = [lots_requested - lots_executed, 0].max
-        entry&.merge!('lots_requested' => lots_requested, 'lots_executed' => lots_executed, 'lots_remaining' => remaining)
-        logger&.warn(
-          "SELL PARTIAL #{ticker} #{tail} lots_executed=#{lots_executed}/#{lots_requested} " \
-          "remaining=#{remaining} — sale recorded, remainder stays in the position"
-        )
       else
-        entry&.merge!('lots_requested' => lots_requested, 'lots_executed' => lots_executed)
-        logger&.info("SELL executed #{ticker} #{tail} lots=#{lots_executed}")
+        remaining = [lots_requested - lots_executed, 0].max
+        result = { 'lots_requested' => lots_requested, 'lots_executed' => lots_executed }
+        result['lots_remaining'] = remaining if outcome == :partially_executed
+        result.merge!('executed_at' => executed_at[:time].iso8601, 'executed_at_source' => executed_at[:source]) if executed_at
+        entry&.merge!(result)
+        relink_previous_last_sell!(state, info) { |previous| previous.merge(result) }
+        if outcome == :partially_executed
+          logger&.warn(
+            "SELL PARTIAL #{ticker} #{tail} lots_executed=#{lots_executed}/#{lots_requested} " \
+            "remaining=#{remaining} executed_at=#{result['executed_at']} — sale recorded, remainder stays in the position"
+          )
+        else
+          logger&.info("SELL executed #{ticker} #{tail} lots=#{lots_executed} executed_at=#{result['executed_at']}")
+        end
       end
       log_sell_order_lifecycle(
         logger, key: key, info: info, event: 'terminal', outcome: outcome, status: status,
-                lots_executed: lots_executed, lots_requested: lots_requested
+                lots_executed: lots_executed, lots_requested: lots_requested,
+                executed_at: executed_at && executed_at[:time].iso8601, executed_at_source: executed_at&.dig(:source)
       )
       outcome
+    end
+
+    # Другие pending-заявки по бумаге хранят снимок last_sell на момент своего
+    # размещения, и там может лежать только что финализированная заявка. Снимок
+    # обязан отражать её исход: отменённая вырезается из цепочки (на её место
+    # встаёт её собственный previous), исполненная получает итоговые лоты и дату.
+    # Иначе отмена второй заявки вернула бы в last_sell уже отменённую первую.
+    def relink_previous_last_sell!(state, info)
+      order_id = info['broker_order_id']
+      return unless order_id
+
+      state['pending_sells'].each_value do |other|
+        previous = other['previous_last_sell']
+        next unless previous.is_a?(Hash) && previous['order_id'] == order_id
+
+        replacement = yield(previous)
+        if replacement.is_a?(Hash)
+          other['previous_last_sell'] = replacement
+        else
+          other.delete('previous_last_sell')
+        end
+      end
     end
 
     # last_sell может уже принадлежать другой, более поздней заявке — её не трогаем.
