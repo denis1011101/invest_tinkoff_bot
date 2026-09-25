@@ -2244,12 +2244,12 @@ module TradingLogic
         return false
       end
 
-      adopt_untracked_sell_orders!(client, account_id, state, snapshot, figi_cache: figi_cache, logger: logger, now: now)
+      adopt_untracked_sell_orders!(client, state, snapshot, figi_cache: figi_cache, logger: logger, now: now)
       # Снимок: финализация удаляет записи прямо во время обхода.
       state['pending_sells'].to_a.each do |key, info|
         active = find_active_pending_order(info, snapshot)
         if active
-          track_active_sell!(client, account_id, state, info, active, logger: logger, now: now)
+          track_active_sell!(state, info, active, logger: logger, now: now)
         else
           resolve_missing_sell!(client, account_id, state, key, info, logger: logger, now: now)
         end
@@ -2260,8 +2260,7 @@ module TradingLogic
     # Активная SELL у брокера, о которой state не знает: state потерян, процесс
     # упал между заявкой и save_state, или заявку выставили руками. Берём её на
     # учёт, чтобы отмена или частичное исполнение не прошли незамеченными.
-    def adopt_untracked_sell_orders!(client, account_id, state, snapshot, figi_cache: {}, logger: nil,
-                                     now: Time.now.utc)
+    def adopt_untracked_sell_orders!(client, state, snapshot, figi_cache: {}, logger: nil, now: Time.now.utc)
       tracked = state['pending_sells'].values.flat_map { |i| [i['broker_order_id'], i['client_order_id']] }.compact.to_set
       Array(snapshot[:orders]).each do |order|
         next unless order_direction(order).include?('SELL')
@@ -2276,11 +2275,11 @@ module TradingLogic
         ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache, logger: logger)
         next unless ticker
 
-        adopt_sell_order!(client, account_id, state, ticker, figi, order, logger: logger, now: now)
+        adopt_sell_order!(state, ticker, figi, order, logger: logger, now: now)
       end
     end
 
-    def adopt_sell_order!(client, account_id, state, ticker, figi, order, logger: nil, now: Time.now.utc)
+    def adopt_sell_order!(state, ticker, figi, order, logger: nil, now: Time.now.utc)
       broker_order_id = order_broker_id(order)
       submitted_at = order_submitted_at(order) || Time.now.utc.iso8601
       previous = state['last_sell'][ticker]
@@ -2300,15 +2299,15 @@ module TradingLogic
         'lots_executed' => 0,
         'previous_last_sell' => previous
       }.compact
-      observe_sell_execution!(client, account_id, info, order, lots_executed: executed, now: now)
+      observe_sell_execution!(info, order, lots_executed: executed, now: now)
       sync_last_sell_execution!(state['last_sell'][ticker], info)
       state['pending_sells'][broker_order_id] = info
       logger&.info("SELL order adopted from broker #{ticker} order_id=#{broker_order_id} lots=#{executed}/#{requested}")
       log_sell_order_lifecycle(logger, key: broker_order_id, info: info, event: 'adopted')
     end
 
-    def track_active_sell!(client, account_id, state, info, order, logger: nil, now: Time.now.utc)
-      observe_sell_execution!(client, account_id, info, order, lots_executed: order_lots_executed(order), now: now)
+    def track_active_sell!(state, info, order, logger: nil, now: Time.now.utc)
+      observe_sell_execution!(info, order, lots_executed: order_lots_executed(order), now: now)
       info['status'] = pending_status_for_order(order) || info['status']
       sync_last_sell_execution!(owned_last_sell_entry(state, info), info)
       alert_long_pending_sell!(logger, info, now: now)
@@ -2354,18 +2353,20 @@ module TradingLogic
       return unresolved_pending_sell!(logger, info, status: status) unless outcome
 
       executed = requested if outcome == :executed
-      observe_sell_execution!(client, account_id, info, order, lots_executed: executed, now: now) if executed.positive?
+      observe_sell_execution!(info, order, lots_executed: executed, now: now) if executed.positive?
       finalize_pending_sell!(state, key, info, outcome: outcome, status: status,
                                                lots_executed: executed, lots_requested: requested, logger: logger)
     end
 
     # День продажи — день исполнения, а не размещения: вчерашняя заявка, исполненная
-    # сегодня, — сегодняшняя продажа. Точное время — сделки самой заявки
-    # (OrderState.stages). Без них время трогаем только когда прибавились лоты:
-    # единственная SELL-операция по FIGI после размещения, иначе момент, когда
-    # исполнение увидели (source=observed — продажа была не позже). Если лотов не
-    # прибавилось, уже известное время остаётся: отмена остатка его не сдвигает.
-    def observe_sell_execution!(client, account_id, info, order, lots_executed:, now: Time.now.utc)
+    # сегодня, — сегодняшняя продажа. Точное время — только сделки самой заявки
+    # (OrderState.stages). Без них время трогаем лишь когда прибавились лоты, и
+    # ставим момент, когда прирост увидели (source=observed: исполнение было не
+    # позже). Операции брокера для этого не годятся: в них нет order_id, а FIGI,
+    # окно и единственность не отличают вчерашний лот этой же заявки от сегодняшнего.
+    # Если лотов не прибавилось, известное время остаётся: отмена остатка его не
+    # сдвигает.
+    def observe_sell_execution!(info, order, lots_executed:, now: Time.now.utc)
       seen = info['lots_executed'].to_i
       info['lots_executed'] = [seen, lots_executed.to_i].max
       return if info['lots_executed'].zero?
@@ -2375,8 +2376,7 @@ module TradingLogic
         if from_stages
           [from_stages, 'order_stages']
         elsif info['lots_executed'] > seen || info['executed_at'].to_s.empty?
-          from_operations = sell_operation_time(client, account_id, info, now: now)
-          from_operations ? [from_operations, 'operations'] : [now, 'observed']
+          [now, 'observed']
         end
       info.merge!('executed_at' => time.utc.iso8601, 'executed_at_source' => source) if time
     end
@@ -2392,27 +2392,6 @@ module TradingLogic
       end.max
     rescue StandardError
       nil
-    end
-
-    # Операции не несут order_id, поэтому к заявке их привязывают только окно
-    # [размещение, сейчас] и FIGI. Операцию берём, лишь если она там одна: две
-    # продажи (например, ручная рядом) — неоднозначность, и тогда честнее observed.
-    def sell_operation_time(client, account_id, info, now: Time.now.utc)
-      figi = info['figi'].to_s
-      submitted_at = pending_order_ts(info)
-      return nil if figi.empty? || submitted_at.nil?
-
-      fetched = operations_between(client, account_id, from: submitted_at, to: now)
-      return nil unless fetched[:ok] && !fetched[:has_next]
-
-      times = fetched[:operations].filter_map do |op|
-        next unless operation_kind(op) == :sell && op.respond_to?(:figi) && op.figi.to_s == figi
-        next unless operation_has_execution?(op)
-
-        time = operation_time(op)
-        time if time && time >= submitted_at && time <= now
-      end
-      times.first if times.size == 1
     end
 
     def fetch_sell_order_state(client, account_id, info, logger: nil)

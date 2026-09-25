@@ -432,54 +432,44 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(state['pending_sells']['sell-1']).to include('executed_at_source' => 'order_response')
       expect(state['last_sell']['AAA']).to include('executed_at_source' => 'order_response')
     end
-
-    it 'falls back to the SELL operation time for the instrument' do
-      place_yesterday
-      operations = [
-        OpenStruct.new(type: 'OPERATION_TYPE_SELL', figi: 'OTHER', quantity_done: 1, date: (today - 30).iso8601),
-        OpenStruct.new(type: 'OPERATION_TYPE_SELL', figi: 'F1', quantity_done: 1, date: (today - 600).iso8601)
-      ]
-
-      reconcile(broker(order_states: { 'sell-1' => order_state('FILL') }, operations: operations), now: today)
-
-      expect(state['last_sell']['AAA']).to include('executed_at' => (today - 600).utc.iso8601,
-                                                   'executed_at_source' => 'operations')
-    end
   end
 
-  describe 'binding an operation to the order' do
-    let(:submitted) { Time.utc(2026, 9, 26, 0, 0, 30) }
-    let(:observed) { Time.utc(2026, 9, 26, 0, 5) }
-
-    def sell_op(time, figi: 'F1')
-      OpenStruct.new(type: 'OPERATION_TYPE_SELL', figi: figi, quantity_done: 1, date: time.iso8601)
+  describe 'broker operations are not evidence of a fill time' do
+    let(:submitted) { Time.utc(2026, 9, 25, 10) }
+    let(:first_fill) { submitted + 60 }
+    let(:next_day) { Time.utc(2026, 9, 26, 10) }
+    let(:old_operation) do
+      OpenStruct.new(type: 'OPERATION_TYPE_SELL', figi: 'F1', quantity_done: 1, date: first_fill.iso8601)
     end
 
-    def fill_with(operations)
+    def partial(executed)
+      active_sell(order_id: 'sell-1', requested: 3, executed: executed, status: 'PARTIALLYFILL')
+    end
+
+    it 'dates lots filled today as observed today even when only yesterday\'s operation is visible' do
+      allow(Time).to receive(:now).and_return(submitted)
+      place_sell(lots: 3)
+      reconcile(broker(active_orders: [partial(1)], operations: [old_operation]), now: first_fill)
+      expect(state['pending_sells']['sell-1']['executed_at']).to eq(first_fill.iso8601)
+
+      allow(Time).to receive(:now).and_return(next_day)
+      reconcile(broker(active_orders: [partial(2)], operations: [old_operation]), now: next_day)
+
+      expect(state['pending_sells']['sell-1']).to include(
+        'lots_executed' => 2, 'executed_at' => next_day.iso8601, 'executed_at_source' => 'observed'
+      )
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+    end
+
+    it 'never queries operations to date a fill' do
       allow(Time).to receive(:now).and_return(submitted)
       place_sell
-      allow(Time).to receive(:now).and_return(observed)
-      reconcile(broker(order_states: { 'sell-1' => order_state('FILL') }, operations: operations), now: observed)
-      state['last_sell']['AAA']
-    end
+      client = broker(order_states: { 'sell-1' => order_state('FILL') }, operations: [old_operation])
 
-    it 'ignores a sale of the same instrument executed before the order was submitted' do
-      entry = fill_with([sell_op(Time.utc(2026, 9, 25, 23, 59, 30))])
+      reconcile(client, now: next_day)
 
-      expect(entry).to include('executed_at' => observed.iso8601, 'executed_at_source' => 'observed')
-      expect(described_class.state_last_sell_count_for_day(state, day: '2026-09-25')).to eq(0)
-    end
-
-    it 'uses the only matching operation after submission' do
-      entry = fill_with([sell_op(submitted + 60)])
-
-      expect(entry).to include('executed_at' => (submitted + 60).iso8601, 'executed_at_source' => 'operations')
-    end
-
-    it 'falls back to observed when two sales of the instrument could be this order' do
-      entry = fill_with([sell_op(submitted + 60), sell_op(submitted + 120)])
-
-      expect(entry).to include('executed_at' => observed.iso8601, 'executed_at_source' => 'observed')
+      expect(client).not_to have_received(:grpc_operations)
+      expect(state['last_sell']['AAA']).to include('executed_at' => next_day.iso8601, 'executed_at_source' => 'observed')
     end
   end
 
