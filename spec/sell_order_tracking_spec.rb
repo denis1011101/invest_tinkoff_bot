@@ -504,6 +504,51 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
     end
 
+    context 'with a sale known only from last_sell' do
+      let(:legacy) { { 'figi' => 'F1', 'ts' => Time.now.utc.iso8601, 'reason' => 'broker_restore' } }
+
+      before { state['last_sell']['AAA'] = legacy.dup }
+
+      it 'moves it to the ledger before a tracked sale of the same ticker overwrites it' do
+        expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+
+        place_sell(order_id: 'new-force', category: :filled, reason: 'force_exit')
+
+        expect(described_class.state_last_sell_count_for_day(state)).to eq(2)
+        expect(state['sell_orders'].keys).to contain_exactly("last_sell:AAA:#{legacy['ts']}", 'new-force')
+      end
+
+      it 'does not count it twice when a cancellation brings it back into last_sell' do
+        place_sell(order_id: 'new')
+        reconcile(broker(order_states: { 'new' => order_state('CANCELLED') }))
+
+        expect(state['last_sell']['AAA']).to include('ts' => legacy['ts'], 'ledger_key' => "last_sell:AAA:#{legacy['ts']}")
+        expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+
+        place_sell(order_id: 'again', category: :filled)
+        expect(state['sell_orders'].size).to eq(2)
+        expect(described_class.state_last_sell_count_for_day(state)).to eq(2)
+      end
+    end
+
+    it 'restores every sale of a ticker from broker operations, not just the last one' do
+      client = double('client')
+      allow(client).to receive(:grpc_instruments).and_return(
+        double('instruments', get_instrument_by: OpenStruct.new(ticker: 'AAA'))
+      )
+      day = Time.now.utc.strftime('%Y-%m-%d')
+      %w[op-1 op-2].each_with_index do |id, i|
+        operation = OpenStruct.new(id: id, type: 'OPERATION_TYPE_SELL', figi: 'F1', date: "#{day}T0#{i + 7}:00:00Z")
+        described_class.restore_broker_operation!(client, state, operation, day: day)
+      end
+
+      expect(state['sell_orders'].keys).to contain_exactly('operation:op-1', 'operation:op-2')
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(2)
+
+      place_sell(order_id: 'next', category: :filled)
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(3)
+    end
+
     it 'drops ledger entries older than the retention window' do
       now = Time.now.utc
       state['sell_orders']['old'] = { 'ticker' => 'AAA', 'lots_executed' => 1, 'executed_at' => (now - (8 * 86_400)).iso8601 }

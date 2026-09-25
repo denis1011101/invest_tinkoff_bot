@@ -79,7 +79,7 @@ module TradingLogic
 
       working = deep_copy(original)
       orders = selected(working, order_id).map do |key, info|
-        { key: key, ticker: info['ticker'], outcome: resolve_one(working, original, key, info, snapshot) }
+        { key: key, ticker: info['ticker'], outcome: resolve_one(working, key, info, snapshot) }
       end
       changes = diff(original, working)
       helpers.save_state(@state_path, working) if apply && !changes.empty?
@@ -92,13 +92,17 @@ module TradingLogic
       end
     end
 
-    def resolve_one(working, original, key, info, snapshot)
+    def resolve_one(working, key, info, snapshot)
       return :active if helpers.find_active_pending_order(info, snapshot)
 
+      # Снимок берём прямо перед обработкой, а не из исходного state: финализация
+      # предыдущих заявок этого же прохода могла уже поправить previous_last_sell
+      # (вырезать отменённую), и откат к исходнику вернул бы её в историю.
+      before = deep_copy(info)
       outcome = helpers.resolve_missing_sell!(@client, @account_id, working, key, info, now: @now.call)
       # Неподтверждённый исход ничего не меняет, даже счётчик попыток: ручная
       # проверка не должна приближать или откладывать алерт SELL PENDING STUCK.
-      working['pending_sells'][key] = deep_copy(original['pending_sells'][key]) if outcome == :unknown
+      working['pending_sells'][key] = before if outcome == :unknown
       outcome
     end
 

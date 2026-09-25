@@ -2043,12 +2043,24 @@ module TradingLogic
         state['last_buy'][day] ||= {}
         state['last_buy'][day][ticker] = true
       else
-        state['last_sell'][ticker] = {
-          'figi' => figi,
-          'ts' => operation_ts_iso8601(operation),
-          'reason' => 'broker_restore'
-        }
+        restore_broker_sell!(state, ticker, figi, operation)
       end
+    end
+
+    # Несколько продаж одной бумаги за день перезаписывают друг друга в last_sell,
+    # поэтому каждая восстановленная продажа сразу попадает в журнал под ключом
+    # операции; ledger_key в last_sell не даёт посчитать её второй раз.
+    def restore_broker_sell!(state, ticker, figi, operation)
+      ensure_state_defaults!(state)
+      ts = operation_ts_iso8601(operation)
+      operation_id = structured_value(operation, :id).to_s
+      key = "operation:#{operation_id.empty? ? "#{figi}:#{ts}" : operation_id}"
+      state['sell_orders'][key] = {
+        'ticker' => ticker, 'figi' => figi, 'reason' => 'broker_restore', 'ts' => ts,
+        'lots_executed' => 1, 'executed_at' => ts, 'executed_at_source' => 'operations'
+      }
+      ledger_untracked_last_sell!(state, ticker)
+      state['last_sell'][ticker] = { 'figi' => figi, 'ts' => ts, 'reason' => 'broker_restore', 'ledger_key' => key }
     end
 
     def today_key
@@ -2101,8 +2113,28 @@ module TradingLogic
       tracked = (state['sell_orders'] || {}).values.count do |order|
         order['lots_executed'].to_i.positive? && order['executed_at'].to_s.start_with?(day)
       end
-      untracked = sell.values.count { |v| v.is_a?(Hash) && !v.key?('order_id') && v['ts'].to_s.start_with?(day) }
+      untracked = sell.values.count do |v|
+        v.is_a?(Hash) && !v.key?('order_id') && !v.key?('ledger_key') && v['ts'].to_s.start_with?(day)
+      end
       tracked + untracked
+    end
+
+    # last_sell без order_id — продажа, известная только по этой записи
+    # (поставлена кодом до журнала заявок). Перед перезаписью переносим её в
+    # sell_orders. Ключ детерминирован, а ledger_key на самой записи защищает от
+    # повторного переноса и от двойного счёта, если запись вернётся в last_sell
+    # из previous_last_sell при отмене более новой заявки.
+    def ledger_untracked_last_sell!(state, ticker)
+      entry = state['last_sell'][ticker]
+      return unless entry.is_a?(Hash) && !entry.key?('order_id') && !entry.key?('ledger_key')
+
+      key = "last_sell:#{ticker}:#{entry['ts']}"
+      entry['ledger_key'] = key
+      state['sell_orders'][key] ||= {
+        'ticker' => ticker, 'figi' => entry['figi'], 'reason' => entry['reason'], 'ts' => entry['ts'],
+        'lots_executed' => [entry['lots_executed'].to_i, 1].max,
+        'executed_at' => entry['executed_at'] || entry['ts'], 'executed_at_source' => 'last_sell'
+      }.compact
     end
 
     def broker_sell_orders_count_for_day(client, account_id, day: today_key, logger: nil)
@@ -2193,6 +2225,7 @@ module TradingLogic
     # force exit) не должны затирать друг друга.
     def register_sell_order!(state, ticker, figi:, result:, lots:, reason:, logger: nil)
       ensure_state_defaults!(state)
+      ledger_untracked_last_sell!(state, ticker)
       previous = state['last_sell'][ticker]
       broker_order_id = pending_broker_order_id(result)
       mark_action!(state, 'last_sell', ticker, figi: figi, reason: reason, order_id: broker_order_id)
@@ -2286,6 +2319,7 @@ module TradingLogic
     def adopt_sell_order!(state, ticker, figi, order, logger: nil, now: Time.now.utc)
       broker_order_id = order_broker_id(order)
       submitted_at = order_submitted_at(order) || Time.now.utc.iso8601
+      ledger_untracked_last_sell!(state, ticker)
       previous = state['last_sell'][ticker]
       mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'broker_restore', ts: submitted_at,
                                                order_id: broker_order_id)

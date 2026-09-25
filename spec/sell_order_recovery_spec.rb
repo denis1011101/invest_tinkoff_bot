@@ -82,6 +82,28 @@ RSpec.describe TradingLogic::SellOrderRecovery do
     expect(saved['last_sell']['AAA']['order_id']).to eq('new')
   end
 
+  it 'keeps history relinked earlier in the same pass when a later order stays unknown' do
+    write_state do |state|
+      place(state, 'old')
+      place(state, 'new')
+    end
+
+    first = recovery(client(order_states: { 'old' => order_state('CANCELLED'),
+                                            'new' => StandardError.new('unavailable') })).run(apply: true)
+
+    expect(first[:orders].map { |o| o[:outcome] }).to eq(%i[cancelled unknown])
+    saved = helpers.load_state(state_path)
+    expect(saved['pending_sells']['new']).not_to have_key('previous_last_sell')
+    expect(saved['pending_sells']['new']).not_to have_key('terminal_confirm_attempts')
+
+    recovery(client(order_states: { 'new' => order_state('CANCELLED') })).run(apply: true)
+
+    saved = helpers.load_state(state_path)
+    expect(saved['pending_sells']).to be_empty
+    expect(saved['last_sell']).not_to have_key('AAA')
+    expect(helpers.state_last_sell_count_for_day(saved)).to eq(0)
+  end
+
   it 'records a confirmed fill in last_sell and the sale ledger' do
     write_state { |state| place(state, 'sell-1') }
 
