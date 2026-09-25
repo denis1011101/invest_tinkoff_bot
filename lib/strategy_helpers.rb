@@ -2055,10 +2055,12 @@ module TradingLogic
       ts = operation_ts_iso8601(operation)
       operation_id = structured_value(operation, :id).to_s
       key = "operation:#{operation_id.empty? ? "#{figi}:#{ts}" : operation_id}"
+      trade_ids = operation_trade_ids(operation)
       state['sell_orders'][key] = {
         'ticker' => ticker, 'figi' => figi, 'reason' => 'broker_restore', 'ts' => ts,
-        'lots_executed' => 1, 'executed_at' => ts, 'executed_at_source' => 'operations'
-      }
+        'lots_executed' => 1, 'executed_at' => ts, 'executed_at_source' => 'operations',
+        'trade_ids' => (trade_ids unless trade_ids.empty?)
+      }.compact
       ledger_untracked_last_sell!(state, ticker)
       state['last_sell'][ticker] = { 'figi' => figi, 'ts' => ts, 'reason' => 'broker_restore', 'ledger_key' => key }
     end
@@ -2355,6 +2357,7 @@ module TradingLogic
 
     SELL_ORDER_FIELDS = %w[
       ticker figi reason broker_order_id ts lots_requested lots_executed lots_remaining executed_at executed_at_source
+      trade_ids
     ].freeze
     SELL_ORDERS_RETENTION_DAYS = 7
 
@@ -2363,6 +2366,31 @@ module TradingLogic
       return unless info['lots_executed'].to_i.positive?
 
       state['sell_orders'][key] = info.slice(*SELL_ORDER_FIELDS)
+      absorb_restored_operations!(state, info)
+    end
+
+    # При потерянном state одна и та же продажа приходит дважды: из операций
+    # (restore, ключ operation:*) и из подхваченной активной заявки (ключ order_id).
+    # В операциях нет order_id, поэтому связь — номера сделок: OperationItemTrade.num
+    # против OrderStage.trade_id. Совпали — операция и есть исполнение этой заявки,
+    # её запись уходит. Если номеров сделок у одной из сторон нет, сливаем только
+    # единственную восстановленную операцию по FIGI после размещения заявки; две и
+    # больше — неоднозначность, и лучше ложная тревога сверки, чем скрытая продажа.
+    def absorb_restored_operations!(state, info)
+      submitted_at = pending_order_ts(info)
+      candidates = state['sell_orders'].select do |key, order|
+        next false unless key.start_with?('operation:') && order['figi'] == info['figi']
+
+        executed_at = pending_order_ts({ 'ts' => order['executed_at'] })
+        submitted_at && executed_at && executed_at >= submitted_at
+      end
+      order_trades = Array(info['trade_ids'])
+      matched = candidates.select { |_key, op| Array(op['trade_ids']).intersect?(order_trades) }
+      if matched.empty? && candidates.size == 1
+        op = candidates.values.first
+        matched = candidates if order_trades.empty? || Array(op['trade_ids']).empty?
+      end
+      matched.each_key { |key| state['sell_orders'].delete(key) }
     end
 
     def prune_sell_orders!(state, now: Time.now.utc)
@@ -2431,6 +2459,8 @@ module TradingLogic
       info['lots_executed'] = [seen, lots_executed.to_i].max
       return if info['lots_executed'].zero?
 
+      trade_ids = order_stage_trade_ids(order)
+      info['trade_ids'] = (Array(info['trade_ids']) | trade_ids).sort unless trade_ids.empty?
       from_stages = order_stage_execution_time(order)
       time, source =
         if from_stages
@@ -2439,6 +2469,23 @@ module TradingLogic
           [now, 'observed']
         end
       info.merge!('executed_at' => time.utc.iso8601, 'executed_at_source' => source) if time
+    end
+
+    def order_stage_trade_ids(order)
+      stages = structured_order_value(order, :stages)
+      return [] unless stages.respond_to?(:to_a)
+
+      stages.to_a.filter_map { |stage| structured_value(stage, :trade_id, :tradeId).to_s.then { |id| id unless id.empty? } }
+    rescue StandardError
+      []
+    end
+
+    def operation_trade_ids(operation)
+      Array(operation_trades(operation)).filter_map do |trade|
+        structured_value(trade, :num, :trade_id).to_s.then { |id| id unless id.empty? }
+      end.sort
+    rescue StandardError
+      []
     end
 
     def order_stage_execution_time(order)

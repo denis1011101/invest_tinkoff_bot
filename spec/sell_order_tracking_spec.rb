@@ -549,6 +549,63 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(described_class.state_last_sell_count_for_day(state)).to eq(3)
     end
 
+    context 'when a lost state is restored from operations and the active order is adopted' do
+      let(:now) { Time.now.utc }
+      let(:submitted) { now - 600 }
+
+      def sell_operation(id, at:, trades: nil)
+        OpenStruct.new(id: id, type: 'OPERATION_TYPE_SELL', figi: 'F1', quantity_done: 1, date: at.iso8601,
+                       trades_info: trades && OpenStruct.new(trades: trades.map { |num| OpenStruct.new(num: num) }))
+      end
+
+      def restore_then_adopt(operations, stages: nil)
+        active = active_sell(order_id: 'sell-1', requested: 3, executed: 1, status: 'PARTIALLYFILL',
+                             submitted_at: submitted)
+        active.stages = stages.map { |id| { 'tradeId' => id, 'executionTime' => (submitted + 60).iso8601 } } if stages
+        client = broker(active_orders: [active], operations: operations)
+        allow(client).to receive(:grpc_instruments).and_return(
+          double('instruments', get_instrument_by: OpenStruct.new(ticker: 'AAA'))
+        )
+        described_class.restore_state_from_broker_if_empty!(client, 'acc', state, logger: logger)
+        reconcile(client, now: now)
+      end
+
+      it 'counts the partially filled order once' do
+        restore_then_adopt([sell_operation('op-1', at: submitted + 60)])
+
+        expect(state['sell_orders'].keys).to eq(['sell-1'])
+        expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+      end
+
+      it 'matches by trade number and keeps another sale of the same instrument' do
+        restore_then_adopt([sell_operation('op-1', at: submitted + 60, trades: ['T1']),
+                            sell_operation('op-2', at: submitted + 120, trades: ['T9'])], stages: ['T1'])
+
+        expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:op-2')
+        expect(state['sell_orders']['sell-1']['trade_ids']).to eq(['T1'])
+        expect(described_class.state_last_sell_count_for_day(state)).to eq(2)
+      end
+
+      it 'does not merge when trade numbers on both sides disagree' do
+        restore_then_adopt([sell_operation('op-1', at: submitted + 60, trades: ['T9'])], stages: ['T1'])
+
+        expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:op-1')
+      end
+
+      it 'keeps both sales when two operations without trade numbers could be this order' do
+        restore_then_adopt([sell_operation('op-1', at: submitted + 60), sell_operation('op-2', at: submitted + 120)])
+
+        expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:op-1', 'operation:op-2')
+      end
+
+      it 'never merges a sale executed before the order was submitted' do
+        restore_then_adopt([sell_operation('op-1', at: submitted - 60)])
+
+        expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:op-1')
+        expect(described_class.state_last_sell_count_for_day(state)).to eq(2)
+      end
+    end
+
     it 'drops ledger entries older than the retention window' do
       now = Time.now.utc
       state['sell_orders']['old'] = { 'ticker' => 'AAA', 'lots_executed' => 1, 'executed_at' => (now - (8 * 86_400)).iso8601 }
