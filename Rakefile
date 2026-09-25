@@ -13,6 +13,7 @@ require_relative 'lib/moex_cache_syncer'
 require_relative 'lib/cache_health_monitor'
 require_relative 'lib/strategy_heartbeat_monitor'
 require_relative 'lib/strategy_helpers'
+require_relative 'lib/sell_order_recovery'
 require_relative 'lib/wishlist_scanner'
 require_relative 'lib/price_monitor'
 
@@ -207,5 +208,19 @@ namespace :state do
     TradingLogic::StrategyHelpers.restore_state_from_broker_if_empty!(client, account_id, state, day: day)
     TradingLogic::StrategyHelpers.save_state(path, state)
     puts "strategy state restored -> #{path}"
+  end
+
+  desc 'Resolve pending SELL orders against the broker (dry run unless APPLY=1). ' \
+       'Usage: rake state:resolve_sell [ORDER_ID=...] [APPLY=1]'
+  task :resolve_sell do
+    client = tinkoff_client
+    recovery = TradingLogic::SellOrderRecovery.new(
+      client: client, account_id: first_account_id(client),
+      state_path: File.expand_path('tmp/strategy_state.json', __dir__),
+      lock_path: ENV.fetch('STRATEGY_LOCK_PATH', TradingLogic::SellOrderRecovery::DEFAULT_LOCK_PATH)
+    )
+    report = recovery.run(order_id: ENV.fetch('ORDER_ID', nil), apply: truthy_env?('APPLY'))
+    puts TradingLogic::SellOrderRecovery.format(report)
+    exit 1 unless report[:ok]
   end
 end
