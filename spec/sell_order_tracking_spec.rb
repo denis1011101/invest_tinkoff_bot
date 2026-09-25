@@ -473,6 +473,65 @@ RSpec.describe TradingLogic::StrategyHelpers do
     end
   end
 
+  describe 'per-order sale ledger' do
+    it 'counts a signal sale and a force exit of the same instrument on one day as two sales' do
+      place_sell(order_id: 'signal', category: :filled)
+      place_sell(order_id: 'force', lots: 2, reason: 'force_exit')
+      reconcile(broker(order_states: { 'force' => order_state('FILL', requested: 2, executed: 2) }))
+
+      expect(state['sell_orders'].keys).to contain_exactly('signal', 'force')
+      expect(state['last_sell']['AAA']['order_id']).to eq('force')
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(2)
+    end
+
+    it 'records only orders with executed lots' do
+      place_sell(order_id: 'cancelled')
+      place_sell(order_id: 'partial', lots: 3)
+      reconcile(broker(order_states: {
+                         'cancelled' => order_state('CANCELLED'),
+                         'partial' => order_state('CANCELLED', requested: 3, executed: 1)
+                       }))
+
+      expect(state['sell_orders'].keys).to eq(['partial'])
+      expect(state['sell_orders']['partial']).to include('lots_executed' => 1, 'lots_remaining' => 2)
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+    end
+
+    it 'still counts last_sell entries that predate order tracking or come from broker restore' do
+      state['last_sell']['OLD'] = { 'figi' => 'F9', 'ts' => Time.now.utc.iso8601, 'reason' => 'broker_restore' }
+      place_sell(order_id: 'unfilled')
+
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+    end
+
+    it 'drops ledger entries older than the retention window' do
+      now = Time.now.utc
+      state['sell_orders']['old'] = { 'ticker' => 'AAA', 'lots_executed' => 1, 'executed_at' => (now - (8 * 86_400)).iso8601 }
+      state['sell_orders']['recent'] = { 'ticker' => 'AAA', 'lots_executed' => 1, 'executed_at' => (now - 86_400).iso8601 }
+
+      reconcile(broker, now: now)
+
+      expect(state['sell_orders'].keys).to eq(['recent'])
+    end
+
+    it 'keeps the consistency check quiet when the broker also shows two sales' do
+      place_sell(order_id: 'signal', category: :filled)
+      place_sell(order_id: 'force', category: :filled, reason: 'force_exit')
+      ops = double('ops')
+      allow(ops).to receive(:operations_by_cursor).and_return(
+        OpenStruct.new(items: Array.new(2) { OpenStruct.new(type: 'OPERATION_TYPE_SELL') })
+      )
+      start = Time.now.utc
+
+      [0, 31, 60].each do |minutes|
+        described_class.check_sell_consistency!(double('client', grpc_operations: ops), 'acc', state,
+                                                logger: logger, now: start + (minutes * 60))
+      end
+
+      expect(log_lines(/mismatch/)).to be_empty
+    end
+  end
+
   describe '.check_sell_consistency!' do
     def broker_with_sells(count)
       ops = double('ops')

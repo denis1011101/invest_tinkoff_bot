@@ -907,8 +907,8 @@ module TradingLogic
 
     def default_state
       {
-        'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'pending_sells' => {}, 'quarantine' => {},
-        'daily_buys' => {}, 'daily_buy_attempts' => {}
+        'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'pending_sells' => {}, 'sell_orders' => {},
+        'quarantine' => {}, 'daily_buys' => {}, 'daily_buy_attempts' => {}
       }
     end
 
@@ -918,6 +918,7 @@ module TradingLogic
       state['last_sell'] ||= {}
       state['pending_orders'] ||= {}
       state['pending_sells'] ||= {}
+      state['sell_orders'] ||= {}
       state['quarantine'] ||= {}
       state['daily_buys'] ||= {}
       state['daily_buy_attempts'] ||= {}
@@ -2086,23 +2087,22 @@ module TradingLogic
       state[action][day][ticker] = true
     end
 
-    # Продажи дня по версии state. Заявка, которая ещё не исполнила ни одного лота,
-    # в брокерских операциях не видна — её не считаем, иначе висящий лимитник
-    # выглядит как расхождение (122 ERROR за 15.09.2026 по одной заявке CNRU).
+    # Продажи дня по версии state — по заявкам, а не по бумагам: last_sell держит
+    # одну запись на тикер, и сигнальная продажа плюс force exit остатка в тот же
+    # день выглядели бы как одна. Считаем заявки из sell_orders, исполненные в этот
+    # день; неисполненная заявка туда не попадает, иначе висящий лимитник выглядит
+    # как расхождение (122 ERROR за 15.09.2026 по одной заявке CNRU). Записи
+    # last_sell без order_id — восстановленные из операций брокера или поставленные
+    # кодом до учёта заявок — считаем по старому, по времени записи.
     def state_last_sell_count_for_day(state, day: today_key)
       sell = state['last_sell'] || {}
       return (sell[day] || {}).keys.size if sell[day].is_a?(Hash) && sell.values.none? { |v| v.is_a?(Hash) && v['ts'] }
 
-      unfilled = unfilled_pending_sell_order_ids(state)
-      sell.values.count do |v|
-        v.is_a?(Hash) && (v['executed_at'] || v['ts']).to_s.start_with?(day) && !unfilled.include?(v['order_id'])
+      tracked = (state['sell_orders'] || {}).values.count do |order|
+        order['lots_executed'].to_i.positive? && order['executed_at'].to_s.start_with?(day)
       end
-    end
-
-    def unfilled_pending_sell_order_ids(state)
-      (state['pending_sells'] || {}).values.filter_map do |info|
-        info['broker_order_id'] if info['lots_executed'].to_i.zero?
-      end.to_set
+      untracked = sell.values.count { |v| v.is_a?(Hash) && !v.key?('order_id') && v['ts'].to_s.start_with?(day) }
+      tracked + untracked
     end
 
     def broker_sell_orders_count_for_day(client, account_id, day: today_key, logger: nil)
@@ -2201,6 +2201,8 @@ module TradingLogic
 
       if result[:ok] == true || result[:category].to_s == 'filled'
         entry.merge!('lots_executed' => lots, 'executed_at' => entry['ts'], 'executed_at_source' => 'order_response')
+        key = broker_order_id || pending_client_order_id(result) || "#{ticker}@#{entry['ts']}"
+        record_sell_execution!(state, key, entry.merge('ticker' => ticker, 'broker_order_id' => broker_order_id))
         return nil
       end
 
@@ -2226,6 +2228,7 @@ module TradingLogic
       end
       key = broker_order_id || client_order_id || "#{ticker}@#{info['ts']}"
       state['pending_sells'][key] = info
+      record_sell_execution!(state, key, info)
       log_sell_order_lifecycle(logger, key: key, info: info, event: 'submitted')
       info
     end
@@ -2249,11 +2252,12 @@ module TradingLogic
       state['pending_sells'].to_a.each do |key, info|
         active = find_active_pending_order(info, snapshot)
         if active
-          track_active_sell!(state, info, active, logger: logger, now: now)
+          track_active_sell!(state, key, info, active, logger: logger, now: now)
         else
           resolve_missing_sell!(client, account_id, state, key, info, logger: logger, now: now)
         end
       end
+      prune_sell_orders!(state, now: now)
       true
     end
 
@@ -2302,15 +2306,37 @@ module TradingLogic
       observe_sell_execution!(info, order, lots_executed: executed, now: now)
       sync_last_sell_execution!(state['last_sell'][ticker], info)
       state['pending_sells'][broker_order_id] = info
+      record_sell_execution!(state, broker_order_id, info)
       logger&.info("SELL order adopted from broker #{ticker} order_id=#{broker_order_id} lots=#{executed}/#{requested}")
       log_sell_order_lifecycle(logger, key: broker_order_id, info: info, event: 'adopted')
     end
 
-    def track_active_sell!(state, info, order, logger: nil, now: Time.now.utc)
+    def track_active_sell!(state, key, info, order, logger: nil, now: Time.now.utc)
       observe_sell_execution!(info, order, lots_executed: order_lots_executed(order), now: now)
       info['status'] = pending_status_for_order(order) || info['status']
       sync_last_sell_execution!(owned_last_sell_entry(state, info), info)
+      record_sell_execution!(state, key, info)
       alert_long_pending_sell!(logger, info, now: now)
+    end
+
+    SELL_ORDER_FIELDS = %w[
+      ticker figi reason broker_order_id ts lots_requested lots_executed lots_remaining executed_at executed_at_source
+    ].freeze
+    SELL_ORDERS_RETENTION_DAYS = 7
+
+    # Журнал исполненных SELL по заявкам: из него сверка считает продажи дня.
+    def record_sell_execution!(state, key, info)
+      return unless info['lots_executed'].to_i.positive?
+
+      state['sell_orders'][key] = info.slice(*SELL_ORDER_FIELDS)
+    end
+
+    def prune_sell_orders!(state, now: Time.now.utc)
+      cutoff = now - (SELL_ORDERS_RETENTION_DAYS * 24 * 3600)
+      state['sell_orders'].delete_if do |_key, order|
+        time = pending_order_ts({ 'ts' => order['executed_at'] || order['ts'] })
+        time.nil? || time < cutoff
+      end
     end
 
     def sync_last_sell_execution!(entry, info)
@@ -2436,6 +2462,7 @@ module TradingLogic
       entry = owned_last_sell_entry(state, info)
       tail = "order_id=#{info['broker_order_id']} status=#{status} reason=#{info['reason']}"
       if outcome == :cancelled
+        state['sell_orders'].delete(key)
         restore_previous_last_sell!(state, info) if entry
         relink_previous_last_sell!(state, info) { info['previous_last_sell'] }
         logger&.warn(
@@ -2447,6 +2474,7 @@ module TradingLogic
         result = { 'lots_requested' => lots_requested, 'lots_executed' => lots_executed }
         result['lots_remaining'] = remaining if outcome == :partially_executed
         result.merge!(info.slice('executed_at', 'executed_at_source'))
+        record_sell_execution!(state, key, info.merge(result))
         entry&.merge!(result)
         relink_previous_last_sell!(state, info) { |previous| previous.merge(result) }
         if outcome == :partially_executed
