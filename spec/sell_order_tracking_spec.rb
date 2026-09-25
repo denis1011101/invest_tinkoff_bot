@@ -401,6 +401,38 @@ RSpec.describe TradingLogic::StrategyHelpers do
       expect(described_class.state_last_sell_count_for_day(state)).to eq(0)
     end
 
+    it 'dates a partial fill seen on an active order today, even without stages' do
+      place_yesterday
+      partial = active_sell(order_id: 'sell-1', requested: 3, executed: 1, status: 'PARTIALLYFILL')
+
+      reconcile(broker(active_orders: [partial]), now: today)
+
+      expect(state['last_sell']['AAA']).to include('executed_at' => today.iso8601, 'executed_at_source' => 'observed')
+      expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+    end
+
+    it 'keeps a known execution time when the remainder is cancelled without new fills' do
+      allow(Time).to receive(:now).and_return(yesterday)
+      place_sell(lots: 3)
+      partial = active_sell(order_id: 'sell-1', requested: 3, executed: 1, status: 'PARTIALLYFILL')
+      partial.stages = [{ 'executionTime' => yesterday.iso8601 }]
+      reconcile(broker(active_orders: [partial]), now: yesterday)
+      allow(Time).to receive(:now).and_return(today)
+
+      reconcile(broker(order_states: { 'sell-1' => order_state('CANCELLED', requested: 3, executed: 1) }), now: today)
+
+      expect(state['last_sell']['AAA']).to include('executed_at' => yesterday.utc.iso8601,
+                                                   'executed_at_source' => 'order_stages', 'lots_remaining' => 2)
+      expect(described_class.acted_today?(state, 'last_sell', 'AAA')).to be false
+    end
+
+    it 'dates a partial fill already reported by PostOrder at submission' do
+      place_sell(lots: 3, executed: 1)
+
+      expect(state['pending_sells']['sell-1']).to include('executed_at_source' => 'order_response')
+      expect(state['last_sell']['AAA']).to include('executed_at_source' => 'order_response')
+    end
+
     it 'falls back to the SELL operation time for the instrument' do
       place_yesterday
       operations = [
@@ -412,6 +444,42 @@ RSpec.describe TradingLogic::StrategyHelpers do
 
       expect(state['last_sell']['AAA']).to include('executed_at' => (today - 600).utc.iso8601,
                                                    'executed_at_source' => 'operations')
+    end
+  end
+
+  describe 'binding an operation to the order' do
+    let(:submitted) { Time.utc(2026, 9, 26, 0, 0, 30) }
+    let(:observed) { Time.utc(2026, 9, 26, 0, 5) }
+
+    def sell_op(time, figi: 'F1')
+      OpenStruct.new(type: 'OPERATION_TYPE_SELL', figi: figi, quantity_done: 1, date: time.iso8601)
+    end
+
+    def fill_with(operations)
+      allow(Time).to receive(:now).and_return(submitted)
+      place_sell
+      allow(Time).to receive(:now).and_return(observed)
+      reconcile(broker(order_states: { 'sell-1' => order_state('FILL') }, operations: operations), now: observed)
+      state['last_sell']['AAA']
+    end
+
+    it 'ignores a sale of the same instrument executed before the order was submitted' do
+      entry = fill_with([sell_op(Time.utc(2026, 9, 25, 23, 59, 30))])
+
+      expect(entry).to include('executed_at' => observed.iso8601, 'executed_at_source' => 'observed')
+      expect(described_class.state_last_sell_count_for_day(state, day: '2026-09-25')).to eq(0)
+    end
+
+    it 'uses the only matching operation after submission' do
+      entry = fill_with([sell_op(submitted + 60)])
+
+      expect(entry).to include('executed_at' => (submitted + 60).iso8601, 'executed_at_source' => 'operations')
+    end
+
+    it 'falls back to observed when two sales of the instrument could be this order' do
+      entry = fill_with([sell_op(submitted + 60), sell_op(submitted + 120)])
+
+      expect(entry).to include('executed_at' => observed.iso8601, 'executed_at_source' => 'observed')
     end
   end
 
