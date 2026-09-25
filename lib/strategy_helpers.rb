@@ -14,6 +14,7 @@ module TradingLogic
     BUY_FUNNEL_PREFIX = 'buy_funnel'
     BUY_FUNNEL_SCAN_PREFIX = 'buy_funnel_scan'
     BUY_ORDER_LIFECYCLE_PREFIX = 'buy_order_lifecycle'
+    SELL_ORDER_LIFECYCLE_PREFIX = 'sell_order_lifecycle'
 
     # Одна терминальная запись на (scan_id, ticker) показывает, на каком гейте
     # закончилась проверка кандидата. Для кандидатов, дошедших до брокера, stage=order
@@ -701,7 +702,8 @@ module TradingLogic
           next
         end
 
-        next if acted_today?(state, 'last_sell', ticker)
+        next if acted_today?(state, 'last_sell', ticker) ||
+                unresolved_sell_blocks?(state, figi, ticker: ticker, context: 'SELL', logger: logger)
 
         if active_sell_figis.include?(figi.to_s)
           logger&.info("SELL #{ticker} skipped — active SELL already exists for figi=#{figi}")
@@ -741,7 +743,7 @@ module TradingLogic
         if successful_buy_result?(result)
           resp = result[:response]
           logger&.info("SELL #{ticker} lots=#{sell_qty} (order_id=#{resp.order_id})")
-          mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'signal')
+          register_sell_order!(state, ticker, figi: figi, result: result, lots: sell_qty, reason: 'signal', logger: logger)
           active_sell_figis << figi.to_s
         else
           logger&.info("SELL #{ticker} skipped / not confirmed")
@@ -787,6 +789,8 @@ module TradingLogic
       return unless logic.should_force_exit?(position, figi)
 
       ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache, logger: logger) || figi
+      return false if state && unresolved_sell_blocks?(state, figi, ticker: ticker, context: 'FORCE SELL', logger: logger)
+
       if active_sell_figis.include?(figi.to_s)
         logger&.info("FORCE SELL #{ticker} skipped — active SELL already exists for figi=#{figi}")
         return false
@@ -829,7 +833,10 @@ module TradingLogic
         resp = result[:response]
         logger&.info("FORCE SELL +10% #{ticker} lots=#{lots} (#{qty_units} шт) @#{cur_price} (order_id=#{resp.order_id})")
         active_sell_figis << figi.to_s
-        mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'force_exit') if state
+        if state
+          register_sell_order!(state, ticker, figi: figi, result: result, lots: lots, reason: 'force_exit',
+                                              logger: logger)
+        end
         true
       else
         logger&.info("FORCE SELL #{ticker} skipped / not confirmed")
@@ -900,8 +907,8 @@ module TradingLogic
 
     def default_state
       {
-        'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'quarantine' => {},
-        'daily_buys' => {}, 'daily_buy_attempts' => {}
+        'last_buy' => {}, 'last_sell' => {}, 'pending_orders' => {}, 'pending_sells' => {}, 'sell_orders' => {},
+        'quarantine' => {}, 'daily_buys' => {}, 'daily_buy_attempts' => {}
       }
     end
 
@@ -910,6 +917,8 @@ module TradingLogic
       state['last_buy'] ||= {}
       state['last_sell'] ||= {}
       state['pending_orders'] ||= {}
+      state['pending_sells'] ||= {}
+      state['sell_orders'] ||= {}
       state['quarantine'] ||= {}
       state['daily_buys'] ||= {}
       state['daily_buy_attempts'] ||= {}
@@ -2034,12 +2043,26 @@ module TradingLogic
         state['last_buy'][day] ||= {}
         state['last_buy'][day][ticker] = true
       else
-        state['last_sell'][ticker] = {
-          'figi' => figi,
-          'ts' => operation_ts_iso8601(operation),
-          'reason' => 'broker_restore'
-        }
+        restore_broker_sell!(state, ticker, figi, operation)
       end
+    end
+
+    # Несколько продаж одной бумаги за день перезаписывают друг друга в last_sell,
+    # поэтому каждая восстановленная продажа сразу попадает в журнал под ключом
+    # операции; ledger_key в last_sell не даёт посчитать её второй раз.
+    def restore_broker_sell!(state, ticker, figi, operation)
+      ensure_state_defaults!(state)
+      ts = operation_ts_iso8601(operation)
+      operation_id = structured_value(operation, :id).to_s
+      key = "operation:#{operation_id.empty? ? "#{figi}:#{ts}" : operation_id}"
+      trade_ids = operation_trade_ids(operation)
+      state['sell_orders'][key] = {
+        'ticker' => ticker, 'figi' => figi, 'reason' => 'broker_restore', 'ts' => ts,
+        'lots_executed' => 1, 'executed_at' => ts, 'executed_at_source' => 'operations',
+        'trade_ids' => (trade_ids unless trade_ids.empty?)
+      }.compact
+      ledger_untracked_last_sell!(state, ticker)
+      state['last_sell'][ticker] = { 'figi' => figi, 'ts' => ts, 'reason' => 'broker_restore', 'ledger_key' => key }
     end
 
     def today_key
@@ -2051,7 +2074,7 @@ module TradingLogic
       if action.to_s == 'last_sell'
         sell = state[action] || {}
         entry = sell[ticker]
-        return true if entry.is_a?(Hash) && entry['ts'].to_s.start_with?(day)
+        return true if entry.is_a?(Hash) && [entry['ts'], entry['executed_at']].any? { |t| t.to_s.start_with?(day) }
 
         # backward compatibility with legacy format { day => { ticker => true } }
         return (sell[day] || {})[ticker] == true
@@ -2060,7 +2083,7 @@ module TradingLogic
       ((state[action] || {})[day] || {})[ticker] == true
     end
 
-    def mark_action!(state, action, ticker, figi: nil, reason: nil, ts: Time.now.utc.iso8601)
+    def mark_action!(state, action, ticker, figi: nil, reason: nil, ts: Time.now.utc.iso8601, order_id: nil)
       day = today_key
       state[action] ||= {}
 
@@ -2070,6 +2093,7 @@ module TradingLogic
           'ts' => ts,
           'reason' => reason || 'signal'
         }
+        state[action][ticker]['order_id'] = order_id if order_id
         return
       end
 
@@ -2077,11 +2101,42 @@ module TradingLogic
       state[action][day][ticker] = true
     end
 
+    # Продажи дня по версии state — по заявкам, а не по бумагам: last_sell держит
+    # одну запись на тикер, и сигнальная продажа плюс force exit остатка в тот же
+    # день выглядели бы как одна. Считаем заявки из sell_orders, исполненные в этот
+    # день; неисполненная заявка туда не попадает, иначе висящий лимитник выглядит
+    # как расхождение (122 ERROR за 15.09.2026 по одной заявке CNRU). Записи
+    # last_sell без order_id — восстановленные из операций брокера или поставленные
+    # кодом до учёта заявок — считаем по старому, по времени записи.
     def state_last_sell_count_for_day(state, day: today_key)
       sell = state['last_sell'] || {}
       return (sell[day] || {}).keys.size if sell[day].is_a?(Hash) && sell.values.none? { |v| v.is_a?(Hash) && v['ts'] }
 
-      sell.values.count { |v| v.is_a?(Hash) && v['ts'].to_s.start_with?(day) }
+      tracked = (state['sell_orders'] || {}).values.count do |order|
+        order['lots_executed'].to_i.positive? && order['executed_at'].to_s.start_with?(day)
+      end
+      untracked = sell.values.count do |v|
+        v.is_a?(Hash) && !v.key?('order_id') && !v.key?('ledger_key') && v['ts'].to_s.start_with?(day)
+      end
+      tracked + untracked
+    end
+
+    # last_sell без order_id — продажа, известная только по этой записи
+    # (поставлена кодом до журнала заявок). Перед перезаписью переносим её в
+    # sell_orders. Ключ детерминирован, а ledger_key на самой записи защищает от
+    # повторного переноса и от двойного счёта, если запись вернётся в last_sell
+    # из previous_last_sell при отмене более новой заявки.
+    def ledger_untracked_last_sell!(state, ticker)
+      entry = state['last_sell'][ticker]
+      return unless entry.is_a?(Hash) && !entry.key?('order_id') && !entry.key?('ledger_key')
+
+      key = "last_sell:#{ticker}:#{entry['ts']}"
+      entry['ledger_key'] = key
+      state['sell_orders'][key] ||= {
+        'ticker' => ticker, 'figi' => entry['figi'], 'reason' => entry['reason'], 'ts' => entry['ts'],
+        'lots_executed' => [entry['lots_executed'].to_i, 1].max,
+        'executed_at' => entry['executed_at'] || entry['ts'], 'executed_at_source' => 'last_sell'
+      }.compact
     end
 
     def broker_sell_orders_count_for_day(client, account_id, day: today_key, logger: nil)
@@ -2110,14 +2165,510 @@ module TradingLogic
       nil
     end
 
-    def check_sell_consistency!(client, account_id, state, logger: nil)
+    # Короткое расхождение нормально: исполненная заявка появляется в операциях
+    # не мгновенно. Поэтому ERROR — один раз на расхождение, и только если оно
+    # держится SELL_MISMATCH_ALERT_MIN минут; остальные прогоны пишут DEBUG.
+    def check_sell_consistency!(client, account_id, state, logger: nil, now: Time.now.utc)
       broker_count = broker_sell_orders_count_for_day(client, account_id, logger: logger)
       return if broker_count.nil?
 
+      ensure_state_defaults!(state)
       state_count = state_last_sell_count_for_day(state)
-      return if broker_count == state_count
+      tracker = state['sell_consistency'] || {}
+      if broker_count == state_count
+        logger&.info("sell consistency restored broker=#{broker_count} state_last_sell=#{state_count}") if tracker['alerted']
+        state.delete('sell_consistency')
+        return
+      end
 
-      logger&.error("sell consistency mismatch broker=#{broker_count} state_last_sell=#{state_count}")
+      signature = "#{today_key}:#{broker_count}:#{state_count}"
+      tracker = { 'signature' => signature, 'since' => now.iso8601 } unless tracker['signature'] == signature
+      state['sell_consistency'] = tracker
+      since = pending_order_ts({ 'ts' => tracker['since'] }) || now
+      age_min = ((now - since) / 60).round(1)
+      message = "sell consistency mismatch broker=#{broker_count} state_last_sell=#{state_count} age_min=#{age_min}"
+      if tracker['alerted'] || age_min < sell_mismatch_alert_minutes
+        logger&.debug(message)
+        return
+      end
+
+      tracker['alerted'] = true
+      ambiguous = ambiguous_sell_orders_for_day(state)
+      message += " ambiguous_restored=#{ambiguous.join(',')}" unless ambiguous.empty?
+      logger&.error("#{message} — persisting, manual check required")
+    end
+
+    def sell_mismatch_alert_minutes
+      (ENV['SELL_MISMATCH_ALERT_MIN'] || '30').to_f
+    end
+
+    def sell_pending_alert_minutes
+      (ENV['SELL_PENDING_ALERT_MIN'] || '60').to_f
+    end
+
+    # Пока исход прежней SELL по бумаге не подтверждён, новую не ставим ни сигналом,
+    # ни force exit, и дата тут ни при чём. Пропажа заявки из GetOrders не доказывает,
+    # что она уже не исполнится: ответы API бывают противоречивы. Из зависшего
+    # состояния выводит только ручной разбор по SELL PENDING STUCK.
+    def unresolved_sell_blocks?(state, figi, ticker:, context:, logger: nil)
+      pending = (state['pending_sells'] || {}).values.find { |info| info['figi'].to_s == figi.to_s }
+      return false unless pending
+
+      logger&.debug(
+        "#{context} #{ticker} skipped — earlier SELL order_id=#{pending['broker_order_id']} " \
+        "status=#{pending['status']} outcome not confirmed"
+      )
+      true
+    end
+
+    # last_sell ставится в момент размещения SELL: он же не даёт продать бумагу
+    # второй раз за день. Но размещение ещё не продажа — лимитник по последней цене
+    # может провисеть всю сессию и сгореть (CNRU, 15.09.2026). Поэтому заявка, не
+    # исполненная сразу, живёт в pending_sells до явного терминального статуса из
+    # GetOrderState. Ключ — broker order_id: две заявки по одной бумаге (сигнал и
+    # force exit) не должны затирать друг друга.
+    def register_sell_order!(state, ticker, figi:, result:, lots:, reason:, logger: nil)
+      ensure_state_defaults!(state)
+      ledger_untracked_last_sell!(state, ticker)
+      previous = state['last_sell'][ticker]
+      broker_order_id = pending_broker_order_id(result)
+      mark_action!(state, 'last_sell', ticker, figi: figi, reason: reason, order_id: broker_order_id)
+      entry = state['last_sell'][ticker]
+      entry['lots_requested'] = lots
+
+      if result[:ok] == true || result[:category].to_s == 'filled'
+        entry.merge!('lots_executed' => lots, 'executed_at' => entry['ts'], 'executed_at_source' => 'order_response')
+        key = broker_order_id || pending_client_order_id(result) || "#{ticker}@#{entry['ts']}"
+        record_sell_execution!(state, key, entry.merge('ticker' => ticker, 'broker_order_id' => broker_order_id),
+                               logger: logger)
+        return nil
+      end
+
+      executed = order_lots_executed(result[:response]) || 0
+      entry['lots_executed'] = executed
+      client_order_id = pending_client_order_id(result)
+      info = {
+        'ticker' => ticker,
+        'figi' => figi,
+        'reason' => reason,
+        'broker_order_id' => broker_order_id,
+        'client_order_id' => client_order_id,
+        'ts' => pending_submitted_at(result) || entry['ts'],
+        'status' => result[:category].to_s,
+        'lots_requested' => lots,
+        'lots_executed' => executed,
+        'previous_last_sell' => previous
+      }.compact
+      if executed.positive?
+        stamp = { 'executed_at' => entry['ts'], 'executed_at_source' => 'order_response' }
+        info.merge!(stamp)
+        entry.merge!(stamp)
+      end
+      key = broker_order_id || client_order_id || "#{ticker}@#{info['ts']}"
+      state['pending_sells'][key] = info
+      record_sell_execution!(state, key, info, logger: logger)
+      log_sell_order_lifecycle(logger, key: key, info: info, event: 'submitted')
+      info
+    end
+
+    # Исчезновение заявки из GetOrders и ошибки API отменой НЕ считаются: судьбу
+    # заявки решает только терминальный статус GetOrderState. Без снимка активных
+    # заявок ничего не трогаем — pending_sells и last_sell остаются как есть.
+    def reconcile_pending_sells!(client, account_id, state, figi_cache: {}, logger: nil, now: Time.now.utc)
+      ensure_state_defaults!(state)
+      snapshot = fetch_active_orders(client, account_id, logger: logger)
+      unless snapshot[:ok]
+        logger&.warn(
+          "SELL reconciliation skipped — active orders unavailable (reason=#{snapshot[:reason].inspect}); " \
+          'pending SELLs kept'
+        )
+        return false
+      end
+
+      adopt_untracked_sell_orders!(client, state, snapshot, figi_cache: figi_cache, logger: logger, now: now)
+      # Снимок: финализация удаляет записи прямо во время обхода.
+      state['pending_sells'].to_a.each do |key, info|
+        active = find_active_pending_order(info, snapshot)
+        if active
+          track_active_sell!(state, key, info, active, logger: logger, now: now)
+        else
+          resolve_missing_sell!(client, account_id, state, key, info, logger: logger, now: now)
+        end
+      end
+      prune_sell_orders!(state, now: now)
+      true
+    end
+
+    # Активная SELL у брокера, о которой state не знает: state потерян, процесс
+    # упал между заявкой и save_state, или заявку выставили руками. Берём её на
+    # учёт, чтобы отмена или частичное исполнение не прошли незамеченными.
+    def adopt_untracked_sell_orders!(client, state, snapshot, figi_cache: {}, logger: nil, now: Time.now.utc)
+      tracked = state['pending_sells'].values.flat_map { |i| [i['broker_order_id'], i['client_order_id']] }.compact.to_set
+      Array(snapshot[:orders]).each do |order|
+        next unless order_direction(order).include?('SELL')
+
+        broker_order_id = order_broker_id(order)
+        next unless broker_order_id
+        next if tracked.include?(broker_order_id) || tracked.include?(order_request_id(order))
+
+        figi = order_figi(order)
+        next if figi.empty?
+
+        ticker = resolve_ticker_for_sell(client, figi: figi, figi_cache: figi_cache, logger: logger)
+        next unless ticker
+
+        adopt_sell_order!(state, ticker, figi, order, logger: logger, now: now)
+      end
+    end
+
+    def adopt_sell_order!(state, ticker, figi, order, logger: nil, now: Time.now.utc)
+      broker_order_id = order_broker_id(order)
+      submitted_at = order_submitted_at(order) || Time.now.utc.iso8601
+      ledger_untracked_last_sell!(state, ticker)
+      previous = state['last_sell'][ticker]
+      mark_action!(state, 'last_sell', ticker, figi: figi, reason: 'broker_restore', ts: submitted_at,
+                                               order_id: broker_order_id)
+      requested = order_numeric_field(order, :lots_requested).to_i
+      executed = order_lots_executed(order) || 0
+      info = {
+        'ticker' => ticker,
+        'figi' => figi,
+        'reason' => 'broker_restore',
+        'broker_order_id' => broker_order_id,
+        'client_order_id' => order_request_id(order),
+        'ts' => submitted_at,
+        'status' => pending_status_for_order(order) || 'sent_not_filled',
+        'lots_requested' => requested,
+        'lots_executed' => 0,
+        'previous_last_sell' => previous
+      }.compact
+      observe_sell_execution!(info, order, lots_executed: executed, now: now)
+      sync_last_sell_execution!(state['last_sell'][ticker], info)
+      state['pending_sells'][broker_order_id] = info
+      record_sell_execution!(state, broker_order_id, info, logger: logger)
+      logger&.info("SELL order adopted from broker #{ticker} order_id=#{broker_order_id} lots=#{executed}/#{requested}")
+      log_sell_order_lifecycle(logger, key: broker_order_id, info: info, event: 'adopted')
+    end
+
+    def track_active_sell!(state, key, info, order, logger: nil, now: Time.now.utc)
+      observe_sell_execution!(info, order, lots_executed: order_lots_executed(order), now: now)
+      info['status'] = pending_status_for_order(order) || info['status']
+      sync_last_sell_execution!(owned_last_sell_entry(state, info), info)
+      record_sell_execution!(state, key, info, logger: logger)
+      alert_long_pending_sell!(logger, info, now: now)
+    end
+
+    SELL_ORDER_FIELDS = %w[
+      ticker figi reason broker_order_id ts lots_requested lots_executed lots_remaining executed_at executed_at_source
+      trade_ids
+    ].freeze
+    SELL_ORDERS_RETENTION_DAYS = 7
+
+    # Журнал исполненных SELL по заявкам: из него сверка считает продажи дня.
+    def record_sell_execution!(state, key, info, logger: nil)
+      return unless info['lots_executed'].to_i.positive?
+
+      previous = state['sell_orders'][key] || {}
+      state['sell_orders'][key] = info.slice(*SELL_ORDER_FIELDS)
+      linked = Array(previous['linked_trade_ids'])
+      state['sell_orders'][key]['linked_trade_ids'] = linked unless linked.empty?
+      absorb_restored_operations!(state, key, info, previous_ambiguity: previous['ambiguous_with'], logger: logger)
+    end
+
+    # При потерянном state одна и та же продажа приходит дважды: из операций
+    # (restore, ключ operation:*) и из подхваченной активной заявки (ключ order_id).
+    # В операциях нет order_id, поэтому связь доказывают только номера сделок:
+    # OperationItemTrade.num против OrderStage.trade_id. Совпали — операция и есть
+    # исполнение заявки, её запись уходит. Без такого доказательства ничего не
+    # удаляем: операция без номеров остаётся отдельной продажей, а если она может
+    # оказаться сделкой этой заявки (у заявки нет stages или есть сделки, не
+    # найденные в операциях), заявка помечается ambiguous_with до подтверждения.
+    # Номера уже связанных сделок живут в linked_trade_ids: поглощённой операции в
+    # журнале больше нет, и без этой памяти следующий проход снова счёл бы сделку
+    # заявки непокрытой.
+    def absorb_restored_operations!(state, key, info, previous_ambiguity: nil, logger: nil)
+      submitted_at = pending_order_ts(info)
+      candidates = state['sell_orders'].select do |candidate_key, order|
+        next false unless candidate_key.start_with?('operation:') && order['figi'] == info['figi']
+
+        executed_at = pending_order_ts({ 'ts' => order['executed_at'] })
+        submitted_at && executed_at && executed_at >= submitted_at
+      end
+      entry = state['sell_orders'][key]
+      order_trades = Array(info['trade_ids'])
+      matched = candidates.select { |_key, op| Array(op['trade_ids']).intersect?(order_trades) }
+      matched.each_key { |matched_key| state['sell_orders'].delete(matched_key) }
+      linked = (Array(entry['linked_trade_ids']) | matched.values.flat_map { |op| Array(op['trade_ids']) }).sort
+      entry['linked_trade_ids'] = linked unless linked.empty?
+
+      unmatched = candidates.reject { |candidate_key, _op| matched.key?(candidate_key) }
+      # Без номеров у заявки её сделкой может оказаться любая операция; с номерами —
+      # только операция без номеров, и лишь пока не все сделки заявки связаны.
+      ambiguous = if order_trades.empty? then unmatched.keys
+                  elsif (order_trades - linked).any? then unmatched.select { |_k, op| Array(op['trade_ids']).empty? }.keys
+                  else []
+                  end.sort
+      entry['ambiguous_with'] = ambiguous unless ambiguous.empty?
+      return if ambiguous.empty? || ambiguous == previous_ambiguity
+
+      logger&.warn(
+        "SELL LEDGER AMBIGUOUS #{info['ticker']} order_id=#{info['broker_order_id']} " \
+        "restored=#{ambiguous.join(',')} — counted separately until trade numbers link them"
+      )
+    end
+
+    # Для ERROR сверки: неоднозначные записи журнала за день объясняют расхождение.
+    def ambiguous_sell_orders_for_day(state, day: today_key)
+      (state['sell_orders'] || {}).filter_map do |key, order|
+        next unless order['ambiguous_with'] && order['executed_at'].to_s.start_with?(day)
+
+        "#{key}~#{Array(order['ambiguous_with']).join('+')}"
+      end
+    end
+
+    def prune_sell_orders!(state, now: Time.now.utc)
+      cutoff = now - (SELL_ORDERS_RETENTION_DAYS * 24 * 3600)
+      state['sell_orders'].delete_if do |_key, order|
+        time = pending_order_ts({ 'ts' => order['executed_at'] || order['ts'] })
+        time.nil? || time < cutoff
+      end
+    end
+
+    def sync_last_sell_execution!(entry, info)
+      return unless entry
+
+      entry.merge!(info.slice('lots_requested', 'lots_executed', 'executed_at', 'executed_at_source'))
+    end
+
+    def alert_long_pending_sell!(logger, info, now: Time.now.utc)
+      threshold = sell_pending_alert_minutes
+      return false if info['long_pending_alerted'] || !threshold.positive?
+
+      submitted_at = pending_order_ts(info)
+      return false unless submitted_at
+
+      age_min = (now - submitted_at) / 60
+      return false if age_min < threshold
+
+      info['long_pending_alerted'] = true
+      logger&.warn(
+        "SELL PENDING LONG #{info['ticker']} order_id=#{info['broker_order_id']} age_min=#{age_min.round} " \
+        "lots_executed=#{info['lots_executed'].to_i}/#{info['lots_requested'].to_i} — limit order still active"
+      )
+      true
+    end
+
+    def resolve_missing_sell!(client, account_id, state, key, info, logger: nil, now: Time.now.utc)
+      order = fetch_sell_order_state(client, account_id, info, logger: logger)
+      return unresolved_pending_sell!(logger, info) unless order
+
+      status = order_status(order)
+      requested = order_numeric_field(order, :lots_requested).to_i
+      requested = info['lots_requested'].to_i unless requested.positive?
+      executed = [order_lots_executed(order).to_i, info['lots_executed'].to_i].max
+      outcome = if status.include?('FILL') && !status.include?('PARTIAL') then :executed
+                elsif %w[CANCEL REJECT EXPIRE].none? { |s| status.include?(s) } then nil
+                elsif executed.zero? then :cancelled
+                else :partially_executed
+                end
+      return unresolved_pending_sell!(logger, info, status: status) unless outcome
+
+      executed = requested if outcome == :executed
+      observe_sell_execution!(info, order, lots_executed: executed, now: now) if executed.positive?
+      finalize_pending_sell!(state, key, info, outcome: outcome, status: status,
+                                               lots_executed: executed, lots_requested: requested, logger: logger)
+    end
+
+    # День продажи — день исполнения, а не размещения: вчерашняя заявка, исполненная
+    # сегодня, — сегодняшняя продажа. Точное время — только сделки самой заявки
+    # (OrderState.stages). Без них время трогаем лишь когда прибавились лоты, и
+    # ставим момент, когда прирост увидели (source=observed: исполнение было не
+    # позже). Операции брокера для этого не годятся: в них нет order_id, а FIGI,
+    # окно и единственность не отличают вчерашний лот этой же заявки от сегодняшнего.
+    # Если лотов не прибавилось, известное время остаётся: отмена остатка его не
+    # сдвигает.
+    def observe_sell_execution!(info, order, lots_executed:, now: Time.now.utc)
+      seen = info['lots_executed'].to_i
+      info['lots_executed'] = [seen, lots_executed.to_i].max
+      return if info['lots_executed'].zero?
+
+      trade_ids = order_stage_trade_ids(order)
+      info['trade_ids'] = (Array(info['trade_ids']) | trade_ids).sort unless trade_ids.empty?
+      from_stages = order_stage_execution_time(order)
+      time, source =
+        if from_stages
+          [from_stages, 'order_stages']
+        elsif info['lots_executed'] > seen || info['executed_at'].to_s.empty?
+          [now, 'observed']
+        end
+      info.merge!('executed_at' => time.utc.iso8601, 'executed_at_source' => source) if time
+    end
+
+    def order_stage_trade_ids(order)
+      stages = structured_order_value(order, :stages)
+      return [] unless stages.respond_to?(:to_a)
+
+      stages.to_a.filter_map { |stage| structured_value(stage, :trade_id, :tradeId).to_s.then { |id| id unless id.empty? } }
+    rescue StandardError
+      []
+    end
+
+    def operation_trade_ids(operation)
+      Array(operation_trades(operation)).filter_map do |trade|
+        structured_value(trade, :num, :trade_id).to_s.then { |id| id unless id.empty? }
+      end.sort
+    rescue StandardError
+      []
+    end
+
+    def order_stage_execution_time(order)
+      stages = structured_order_value(order, :stages)
+      return nil unless stages.respond_to?(:to_a)
+
+      stages.to_a.filter_map do |stage|
+        raw = structured_value(stage, :execution_time, :executionTime)
+        time = raw && parse_time_candidate(raw)
+        time if time&.to_i&.positive?
+      end.max
+    rescue StandardError
+      nil
+    end
+
+    def fetch_sell_order_state(client, account_id, info, logger: nil)
+      broker_order_id = info['broker_order_id'].to_s
+      return nil if broker_order_id.empty? || !client.respond_to?(:order_state)
+
+      response = client.order_state(account_id: account_id, order_id: broker_order_id)
+      return nil if response.respond_to?(:success?) && !response.success?
+
+      response.respond_to?(:payload) ? response.payload : response
+    rescue StandardError => e
+      logger&.warn("SELL terminal status lookup failed for #{info['ticker']}: #{e.class}: #{e.message}")
+      nil
+    end
+
+    # Отметка last_sell остаётся, пока исход неизвестен: лишний день без продажи
+    # безопаснее, чем повторная SELL поверх возможно исполненной.
+    def unresolved_pending_sell!(logger, info, status: nil)
+      attempts = increment_terminal_confirm_attempts!(info)
+      logger&.debug(
+        "SELL terminal status not confirmed for #{info['ticker']} order_id=#{info['broker_order_id']} " \
+        "status=#{status.to_s.empty? ? 'unavailable' : status} attempt=#{attempts} — last_sell kept"
+      )
+      return :unknown if info['stuck_alerted'] || attempts < sell_terminal_max_attempts
+
+      info['stuck_alerted'] = true
+      logger&.error(
+        "SELL PENDING STUCK #{info['ticker']} order_id=#{info['broker_order_id']} " \
+        "terminal_confirm_attempts=#{attempts} — outcome unknown, last_sell kept, manual check required"
+      )
+      :unknown
+    end
+
+    def sell_terminal_max_attempts
+      value = (ENV['SELL_TERMINAL_MAX_ATTEMPTS'] || '5').to_i
+      value.positive? ? value : 5
+    end
+
+    def finalize_pending_sell!(state, key, info, outcome:, status:, lots_executed:, lots_requested:, logger: nil)
+      ticker = info['ticker']
+      state['pending_sells'].delete(key)
+      entry = owned_last_sell_entry(state, info)
+      tail = "order_id=#{info['broker_order_id']} status=#{status} reason=#{info['reason']}"
+      if outcome == :cancelled
+        state['sell_orders'].delete(key)
+        restore_previous_last_sell!(state, info) if entry
+        relink_previous_last_sell!(state, info) { info['previous_last_sell'] }
+        logger&.warn(
+          "SELL CANCELLED #{ticker} #{tail} lots_executed=0/#{lots_requested} — nothing sold, " \
+          'last_sell cleared, signal will be re-evaluated'
+        )
+      else
+        remaining = [lots_requested - lots_executed, 0].max
+        result = { 'lots_requested' => lots_requested, 'lots_executed' => lots_executed }
+        result['lots_remaining'] = remaining if outcome == :partially_executed
+        result.merge!(info.slice('executed_at', 'executed_at_source'))
+        record_sell_execution!(state, key, info.merge(result), logger: logger)
+        entry&.merge!(result)
+        relink_previous_last_sell!(state, info) { |previous| previous.merge(result) }
+        if outcome == :partially_executed
+          logger&.warn(
+            "SELL PARTIAL #{ticker} #{tail} lots_executed=#{lots_executed}/#{lots_requested} " \
+            "remaining=#{remaining} executed_at=#{result['executed_at']} — sale recorded, remainder stays in the position"
+          )
+        else
+          logger&.info("SELL executed #{ticker} #{tail} lots=#{lots_executed} executed_at=#{result['executed_at']}")
+        end
+      end
+      log_sell_order_lifecycle(
+        logger, key: key, info: info, event: 'terminal', outcome: outcome, status: status,
+                lots_executed: lots_executed, lots_requested: lots_requested,
+                executed_at: info['executed_at'], executed_at_source: info['executed_at_source']
+      )
+      outcome
+    end
+
+    # Другие pending-заявки по бумаге хранят снимок last_sell на момент своего
+    # размещения, и там может лежать только что финализированная заявка. Снимок
+    # обязан отражать её исход: отменённая вырезается из цепочки (на её место
+    # встаёт её собственный previous), исполненная получает итоговые лоты и дату.
+    # Иначе отмена второй заявки вернула бы в last_sell уже отменённую первую.
+    def relink_previous_last_sell!(state, info)
+      order_id = info['broker_order_id']
+      return unless order_id
+
+      state['pending_sells'].each_value do |other|
+        previous = other['previous_last_sell']
+        next unless previous.is_a?(Hash) && previous['order_id'] == order_id
+
+        replacement = yield(previous)
+        if replacement.is_a?(Hash)
+          other['previous_last_sell'] = replacement
+        else
+          other.delete('previous_last_sell')
+        end
+      end
+    end
+
+    # last_sell может уже принадлежать другой, более поздней заявке — её не трогаем.
+    def owned_last_sell_entry(state, info)
+      entry = state['last_sell'][info['ticker']]
+      order_id = info['broker_order_id']
+      entry if entry.is_a?(Hash) && order_id && entry['order_id'] == order_id
+    end
+
+    def restore_previous_last_sell!(state, info)
+      previous = info['previous_last_sell']
+      if previous.is_a?(Hash)
+        state['last_sell'][info['ticker']] = previous
+      else
+        state['last_sell'].delete(info['ticker'])
+      end
+    end
+
+    def order_lots_executed(order)
+      return nil if order.nil?
+
+      value = order_numeric_field(order, :lots_executed)
+      value = order_numeric_field(order, :executed_order_lots) if value.nil?
+      value&.to_i
+    end
+
+    def log_sell_order_lifecycle(logger, key:, info:, event:, **details)
+      payload = {
+        key: key.to_s,
+        ticker: info['ticker'].to_s,
+        event: event.to_s,
+        reason: info['reason'],
+        broker_order_id: info['broker_order_id'],
+        client_order_id: info['client_order_id'],
+        lots_requested: info['lots_requested'],
+        lots_executed: info['lots_executed']
+      }
+      details.each { |k, v| payload[k] = v unless v.nil? }
+      logger&.debug("#{SELL_ORDER_LIFECYCLE_PREFIX} #{JSON.generate(payload.compact)}")
+    rescue StandardError
+      nil
     end
 
     def restore_pending_buy_orders!(client, account_id, state, logger: nil)

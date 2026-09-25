@@ -85,6 +85,11 @@ bundle exec rake state:restore
 
 # restore strategy state for a specific day
 DAY=2026-02-14 bundle exec rake state:restore
+
+# after SELL PENDING STUCK: check pending SELLs against the broker, show what would change
+bundle exec rake state:resolve_sell
+# apply the broker-confirmed outcome for one order (takes the strategy cron lock)
+ORDER_ID=<broker order id> APPLY=1 bundle exec rake state:resolve_sell
 ```
 
 ## Important files
@@ -94,6 +99,7 @@ DAY=2026-02-14 bundle exec rake state:restore
 - `lib/strategy_heartbeat_monitor.rb` — strategy liveness watchdog: log silence, hung run detection, alert suppression/recovery state
 - `lib/trading_logic.rb` — main Runner and strategy methods (should_buy?, should_sell?, trend, etc.)
 - `lib/strategy_helpers.rb` — helpers, momentum routine, position limit check, and state helpers
+- `lib/sell_order_recovery.rb` — manual resolution of pending SELL orders (`rake state:resolve_sell`)
 - `lib/market_cache.rb` — instruments + price caching
 - `lib/telegram_confirm.rb` — Telegram confirm/send helpers
 - `lib/broker_tls.rb` — attaches the extra broker CA bundle to the T-Invest REST client alone (see Broker TLS below)

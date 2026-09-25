@@ -173,6 +173,11 @@ begin
   if ENV.fetch('RESTORE_STATE_FROM_BROKER', '1').to_s.strip.downcase != '0'
     TradingLogic::StrategyHelpers.restore_state_from_broker_if_empty!(client, account_id, state, logger: LOGGER)
   end
+  # После restore: подхваченная у брокера SELL сама делает state непустым и
+  # иначе отключила бы восстановление дневных покупок.
+  TradingLogic::StrategyHelpers.reconcile_pending_sells!(
+    client, account_id, state, figi_cache: figi_cache, logger: LOGGER
+  )
 
   # Принудительная продажа всех лотов при профите >= +10% (до основной логики)
   begin

@@ -7,6 +7,21 @@ module TradingLogic
   # Operational warnings only; executed trades still come from the broker.
   class StrategyLogSummary
     INSTRUMENT_REASONS = { instrument_unresolved: 'инструмент не найден', invalid_lot: 'некорректный лот' }.freeze
+    # Судьба SELL-заявок: каждое событие пишется в лог один раз на заявку.
+    SELL_ORDER_EVENTS = {
+      'CANCELLED' => :cancelled, 'PARTIAL' => :partial,
+      'PENDING LONG' => :pending_long, 'PENDING STUCK' => :pending_stuck,
+      'LEDGER AMBIGUOUS' => :ledger_ambiguous
+    }.freeze
+    SELL_ORDER_LABELS = {
+      cancelled: 'SELL не исполнена, заявка снята',
+      partial: 'SELL исполнена частично',
+      pending_long: 'SELL висит дольше порога',
+      pending_stuck: 'SELL с неизвестным исходом, нужна ручная проверка',
+      ledger_ambiguous: 'SELL не удалось связать с восстановленной операцией, учтены отдельно'
+    }.freeze
+    SELL_ORDER_EVENT = /\A(\S+) (?:WARN|ERROR): SELL (#{SELL_ORDER_EVENTS.keys.join('|')}) (\S+) /
+    SELL_MISMATCH_EVENT = /\A(\S+) ERROR: sell consistency mismatch /
 
     def initialize(path:, logger: nil)
       @path = path
@@ -14,12 +29,15 @@ module TradingLogic
     end
 
     def build(from:, to:)
-      result = { ok: true, unknown_session_count: 0, instrument_unresolved: Hash.new(0), invalid_lot: Hash.new(0) }
+      result = { ok: true, unknown_session_count: 0, instrument_unresolved: Hash.new(0), invalid_lot: Hash.new(0),
+                 sell_orders: Hash.new { |h, k| h[k] = Hash.new(0) }, sell_mismatch_count: 0 }
       log_paths.each do |path|
         # Rotations last written before the window cannot contain its events.
         next if path != @path && File.mtime(path) < from
 
         each_line(path) do |line|
+          next if count_sell_order_event(result, line, from, to)
+
           event = warning_event(line)
           next unless event && from <= event[:time] && event[:time] < to
 
@@ -50,6 +68,18 @@ module TradingLogic
         lines << "⚠️ SELL: #{label}. Пропусков за 24ч: #{counts.values.sum}."
         counts.sort.each { |figi, total| lines << "#{figi}: #{total}" }
       end
+      lines + format_sell_orders(summary)
+    end
+
+    def self.format_sell_orders(summary)
+      lines = SELL_ORDER_LABELS.filter_map do |kind, label|
+        counts = summary.fetch(:sell_orders, {}).fetch(kind, {})
+        next if counts.empty?
+
+        "⚠️ #{label}: #{counts.sort.map { |ticker, total| "#{ticker} (#{total})" }.join(', ')}."
+      end
+      mismatches = summary.fetch(:sell_mismatch_count, 0)
+      lines << "⚠️ Продажи расходятся с брокером дольше порога: #{mismatches}." if mismatches.positive?
       lines
     end
 
@@ -67,6 +97,29 @@ module TradingLogic
       else
         File.foreach(path, &)
       end
+    end
+
+    def count_sell_order_event(result, line, from, to)
+      # В логе почти одни DEBUG-строки: регэкспы только для WARN/ERROR.
+      return false unless line.include?(' WARN: ') || line.include?(' ERROR: ')
+
+      if (match = line.match(SELL_ORDER_EVENT))
+        return true unless in_window?(match[1], from, to)
+
+        result[:sell_orders][SELL_ORDER_EVENTS.fetch(match[2])][match[3]] += 1
+      elsif (match = line.match(SELL_MISMATCH_EVENT))
+        result[:sell_mismatch_count] += 1 if in_window?(match[1], from, to)
+      else
+        return false
+      end
+      true
+    end
+
+    def in_window?(timestamp, from, to)
+      time = Time.iso8601(timestamp)
+      from <= time && time < to
+    rescue ArgumentError
+      false
     end
 
     def warning_event(line)
