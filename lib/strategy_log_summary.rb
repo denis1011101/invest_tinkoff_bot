@@ -10,13 +10,15 @@ module TradingLogic
     # Судьба SELL-заявок: каждое событие пишется в лог один раз на заявку.
     SELL_ORDER_EVENTS = {
       'CANCELLED' => :cancelled, 'PARTIAL' => :partial,
-      'PENDING LONG' => :pending_long, 'PENDING STUCK' => :pending_stuck
+      'PENDING LONG' => :pending_long, 'PENDING STUCK' => :pending_stuck,
+      'LEDGER AMBIGUOUS' => :ledger_ambiguous
     }.freeze
     SELL_ORDER_LABELS = {
       cancelled: 'SELL не исполнена, заявка снята',
       partial: 'SELL исполнена частично',
       pending_long: 'SELL висит дольше порога',
-      pending_stuck: 'SELL с неизвестным исходом, нужна ручная проверка'
+      pending_stuck: 'SELL с неизвестным исходом, нужна ручная проверка',
+      ledger_ambiguous: 'SELL не удалось связать с восстановленной операцией, учтены отдельно'
     }.freeze
     SELL_ORDER_EVENT = /\A(\S+) (?:WARN|ERROR): SELL (#{SELL_ORDER_EVENTS.keys.join('|')}) (\S+) /
     SELL_MISMATCH_EVENT = /\A(\S+) ERROR: sell consistency mismatch /

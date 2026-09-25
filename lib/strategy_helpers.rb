@@ -2193,6 +2193,8 @@ module TradingLogic
       end
 
       tracker['alerted'] = true
+      ambiguous = ambiguous_sell_orders_for_day(state)
+      message += " ambiguous_restored=#{ambiguous.join(',')}" unless ambiguous.empty?
       logger&.error("#{message} — persisting, manual check required")
     end
 
@@ -2237,7 +2239,8 @@ module TradingLogic
       if result[:ok] == true || result[:category].to_s == 'filled'
         entry.merge!('lots_executed' => lots, 'executed_at' => entry['ts'], 'executed_at_source' => 'order_response')
         key = broker_order_id || pending_client_order_id(result) || "#{ticker}@#{entry['ts']}"
-        record_sell_execution!(state, key, entry.merge('ticker' => ticker, 'broker_order_id' => broker_order_id))
+        record_sell_execution!(state, key, entry.merge('ticker' => ticker, 'broker_order_id' => broker_order_id),
+                               logger: logger)
         return nil
       end
 
@@ -2263,7 +2266,7 @@ module TradingLogic
       end
       key = broker_order_id || client_order_id || "#{ticker}@#{info['ts']}"
       state['pending_sells'][key] = info
-      record_sell_execution!(state, key, info)
+      record_sell_execution!(state, key, info, logger: logger)
       log_sell_order_lifecycle(logger, key: key, info: info, event: 'submitted')
       info
     end
@@ -2342,7 +2345,7 @@ module TradingLogic
       observe_sell_execution!(info, order, lots_executed: executed, now: now)
       sync_last_sell_execution!(state['last_sell'][ticker], info)
       state['pending_sells'][broker_order_id] = info
-      record_sell_execution!(state, broker_order_id, info)
+      record_sell_execution!(state, broker_order_id, info, logger: logger)
       logger&.info("SELL order adopted from broker #{ticker} order_id=#{broker_order_id} lots=#{executed}/#{requested}")
       log_sell_order_lifecycle(logger, key: broker_order_id, info: info, event: 'adopted')
     end
@@ -2351,7 +2354,7 @@ module TradingLogic
       observe_sell_execution!(info, order, lots_executed: order_lots_executed(order), now: now)
       info['status'] = pending_status_for_order(order) || info['status']
       sync_last_sell_execution!(owned_last_sell_entry(state, info), info)
-      record_sell_execution!(state, key, info)
+      record_sell_execution!(state, key, info, logger: logger)
       alert_long_pending_sell!(logger, info, now: now)
     end
 
@@ -2362,35 +2365,65 @@ module TradingLogic
     SELL_ORDERS_RETENTION_DAYS = 7
 
     # Журнал исполненных SELL по заявкам: из него сверка считает продажи дня.
-    def record_sell_execution!(state, key, info)
+    def record_sell_execution!(state, key, info, logger: nil)
       return unless info['lots_executed'].to_i.positive?
 
+      previous = state['sell_orders'][key] || {}
       state['sell_orders'][key] = info.slice(*SELL_ORDER_FIELDS)
-      absorb_restored_operations!(state, info)
+      linked = Array(previous['linked_trade_ids'])
+      state['sell_orders'][key]['linked_trade_ids'] = linked unless linked.empty?
+      absorb_restored_operations!(state, key, info, previous_ambiguity: previous['ambiguous_with'], logger: logger)
     end
 
     # При потерянном state одна и та же продажа приходит дважды: из операций
     # (restore, ключ operation:*) и из подхваченной активной заявки (ключ order_id).
-    # В операциях нет order_id, поэтому связь — номера сделок: OperationItemTrade.num
-    # против OrderStage.trade_id. Совпали — операция и есть исполнение этой заявки,
-    # её запись уходит. Если номеров сделок у одной из сторон нет, сливаем только
-    # единственную восстановленную операцию по FIGI после размещения заявки; две и
-    # больше — неоднозначность, и лучше ложная тревога сверки, чем скрытая продажа.
-    def absorb_restored_operations!(state, info)
+    # В операциях нет order_id, поэтому связь доказывают только номера сделок:
+    # OperationItemTrade.num против OrderStage.trade_id. Совпали — операция и есть
+    # исполнение заявки, её запись уходит. Без такого доказательства ничего не
+    # удаляем: операция без номеров остаётся отдельной продажей, а если она может
+    # оказаться сделкой этой заявки (у заявки нет stages или есть сделки, не
+    # найденные в операциях), заявка помечается ambiguous_with до подтверждения.
+    # Номера уже связанных сделок живут в linked_trade_ids: поглощённой операции в
+    # журнале больше нет, и без этой памяти следующий проход снова счёл бы сделку
+    # заявки непокрытой.
+    def absorb_restored_operations!(state, key, info, previous_ambiguity: nil, logger: nil)
       submitted_at = pending_order_ts(info)
-      candidates = state['sell_orders'].select do |key, order|
-        next false unless key.start_with?('operation:') && order['figi'] == info['figi']
+      candidates = state['sell_orders'].select do |candidate_key, order|
+        next false unless candidate_key.start_with?('operation:') && order['figi'] == info['figi']
 
         executed_at = pending_order_ts({ 'ts' => order['executed_at'] })
         submitted_at && executed_at && executed_at >= submitted_at
       end
+      entry = state['sell_orders'][key]
       order_trades = Array(info['trade_ids'])
       matched = candidates.select { |_key, op| Array(op['trade_ids']).intersect?(order_trades) }
-      if matched.empty? && candidates.size == 1
-        op = candidates.values.first
-        matched = candidates if order_trades.empty? || Array(op['trade_ids']).empty?
+      matched.each_key { |matched_key| state['sell_orders'].delete(matched_key) }
+      linked = (Array(entry['linked_trade_ids']) | matched.values.flat_map { |op| Array(op['trade_ids']) }).sort
+      entry['linked_trade_ids'] = linked unless linked.empty?
+
+      unmatched = candidates.reject { |candidate_key, _op| matched.key?(candidate_key) }
+      # Без номеров у заявки её сделкой может оказаться любая операция; с номерами —
+      # только операция без номеров, и лишь пока не все сделки заявки связаны.
+      ambiguous = if order_trades.empty? then unmatched.keys
+                  elsif (order_trades - linked).any? then unmatched.select { |_k, op| Array(op['trade_ids']).empty? }.keys
+                  else []
+                  end.sort
+      entry['ambiguous_with'] = ambiguous unless ambiguous.empty?
+      return if ambiguous.empty? || ambiguous == previous_ambiguity
+
+      logger&.warn(
+        "SELL LEDGER AMBIGUOUS #{info['ticker']} order_id=#{info['broker_order_id']} " \
+        "restored=#{ambiguous.join(',')} — counted separately until trade numbers link them"
+      )
+    end
+
+    # Для ERROR сверки: неоднозначные записи журнала за день объясняют расхождение.
+    def ambiguous_sell_orders_for_day(state, day: today_key)
+      (state['sell_orders'] || {}).filter_map do |key, order|
+        next unless order['ambiguous_with'] && order['executed_at'].to_s.start_with?(day)
+
+        "#{key}~#{Array(order['ambiguous_with']).join('+')}"
       end
-      matched.each_key { |key| state['sell_orders'].delete(key) }
     end
 
     def prune_sell_orders!(state, now: Time.now.utc)
@@ -2555,7 +2588,7 @@ module TradingLogic
         result = { 'lots_requested' => lots_requested, 'lots_executed' => lots_executed }
         result['lots_remaining'] = remaining if outcome == :partially_executed
         result.merge!(info.slice('executed_at', 'executed_at_source'))
-        record_sell_execution!(state, key, info.merge(result))
+        record_sell_execution!(state, key, info.merge(result), logger: logger)
         entry&.merge!(result)
         relink_previous_last_sell!(state, info) { |previous| previous.merge(result) }
         if outcome == :partially_executed

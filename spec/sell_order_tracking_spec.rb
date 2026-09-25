@@ -570,11 +570,57 @@ RSpec.describe TradingLogic::StrategyHelpers do
         reconcile(client, now: now)
       end
 
-      it 'counts the partially filled order once' do
+      it 'keeps both entries and flags the ambiguity when nothing links the operation to the order' do
         restore_then_adopt([sell_operation('op-1', at: submitted + 60)])
 
+        expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:op-1')
+        expect(state['sell_orders']['sell-1']['ambiguous_with']).to eq(['operation:op-1'])
+        expect(log_lines(/WARN: SELL LEDGER AMBIGUOUS AAA order_id=sell-1 restored=operation:op-1/).size).to eq(1)
+
+        reconcile(broker(active_orders: [active_sell(order_id: 'sell-1', requested: 3, executed: 1,
+                                                     status: 'PARTIALLYFILL', submitted_at: submitted)]), now: now + 300)
+        expect(log_lines(/SELL LEDGER AMBIGUOUS/).size).to eq(1)
+      end
+
+      it 'names the ambiguous entries in the persisting mismatch ERROR' do
+        restore_then_adopt([sell_operation('op-1', at: submitted + 60)])
+        ops = double('ops', operations_by_cursor: OpenStruct.new(items: [OpenStruct.new(type: 'OPERATION_TYPE_SELL')]))
+        client = double('client', grpc_operations: ops)
+
+        [0, 31].each do |minutes|
+          described_class.check_sell_consistency!(client, 'acc', state, logger: logger, now: now + (minutes * 60))
+        end
+
+        expect(log_lines(/ERROR: sell consistency mismatch broker=1 state_last_sell=2 .* ambiguous_restored=sell-1~operation:op-1/).size)
+          .to eq(1)
+      end
+
+      it 'links them once the order reports trade numbers, clearing the ambiguity' do
+        restore_then_adopt([sell_operation('op-1', at: submitted + 60, trades: ['T1'])])
+        expect(state['sell_orders']['sell-1']['ambiguous_with']).to eq(['operation:op-1'])
+
+        active = active_sell(order_id: 'sell-1', requested: 3, executed: 1, status: 'PARTIALLYFILL', submitted_at: submitted)
+        active.stages = [{ 'tradeId' => 'T1', 'executionTime' => (submitted + 60).iso8601 }]
+        reconcile(broker(active_orders: [active]), now: now + 300)
+
         expect(state['sell_orders'].keys).to eq(['sell-1'])
+        expect(state['sell_orders']['sell-1']).not_to have_key('ambiguous_with')
         expect(described_class.state_last_sell_count_for_day(state)).to eq(1)
+      end
+
+      it 'keeps an unrelated operation without trade numbers once the order\'s own trade is matched, across passes' do
+        operations = [sell_operation('matching', at: submitted + 60, trades: ['T1']),
+                      sell_operation('other', at: submitted + 120)]
+        restore_then_adopt(operations, stages: ['T1'])
+        expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:other')
+
+        active = active_sell(order_id: 'sell-1', requested: 3, executed: 1, status: 'PARTIALLYFILL', submitted_at: submitted)
+        active.stages = [{ 'tradeId' => 'T1', 'executionTime' => (submitted + 60).iso8601 }]
+        reconcile(broker(active_orders: [active]), now: now + 300)
+
+        expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:other')
+        expect(state['sell_orders']['sell-1']).not_to have_key('ambiguous_with')
+        expect(described_class.state_last_sell_count_for_day(state)).to eq(2)
       end
 
       it 'matches by trade number and keeps another sale of the same instrument' do
@@ -592,10 +638,11 @@ RSpec.describe TradingLogic::StrategyHelpers do
         expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:op-1')
       end
 
-      it 'keeps both sales when two operations without trade numbers could be this order' do
+      it 'keeps both sales and flags both when two operations without trade numbers could be this order' do
         restore_then_adopt([sell_operation('op-1', at: submitted + 60), sell_operation('op-2', at: submitted + 120)])
 
         expect(state['sell_orders'].keys).to contain_exactly('sell-1', 'operation:op-1', 'operation:op-2')
+        expect(state['sell_orders']['sell-1']['ambiguous_with']).to eq(%w[operation:op-1 operation:op-2])
       end
 
       it 'never merges a sale executed before the order was submitted' do

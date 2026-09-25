@@ -108,11 +108,13 @@ RSpec.describe TradingLogic::StrategyLogSummary do
     result = summarize(<<~LOG)
       #{output.string}#{(from - 1).iso8601} WARN: SELL CANCELLED OLD order_id=x status=CANCELLED — before the window
       #{from.iso8601} ERROR: sell consistency mismatch broker=0 state_last_sell=1 age_min=31.0 — persisting
+      #{from.iso8601} WARN: SELL LEDGER AMBIGUOUS SBER order_id=o1 restored=operation:op-1 — counted separately
       #{to.iso8601} ERROR: sell consistency mismatch broker=0 state_last_sell=1 age_min=31.0 — after the window
     LOG
 
     expect(result[:sell_orders]).to eq(
-      cancelled: { 'CNRU' => 1 }, partial: { 'TATN' => 1 }, pending_long: { 'VTBR' => 1 }, pending_stuck: { 'VTBR' => 1 }
+      cancelled: { 'CNRU' => 1 }, partial: { 'TATN' => 1 }, pending_long: { 'VTBR' => 1 }, pending_stuck: { 'VTBR' => 1 },
+      ledger_ambiguous: { 'SBER' => 1 }
     )
     expect(result[:sell_mismatch_count]).to eq(1)
     expect(result[:unknown_session_count]).to eq(0)
@@ -121,7 +123,8 @@ RSpec.describe TradingLogic::StrategyLogSummary do
       '⚠️ SELL исполнена частично: TATN (1).',
       '⚠️ SELL висит дольше порога: VTBR (1).',
       '⚠️ SELL с неизвестным исходом, нужна ручная проверка: VTBR (1).',
-      '⚠️ Продажи расходятся с брокером дольше порога: 1.'
+      '⚠️ Продажи расходятся с брокером дольше порога: 1.',
+      '⚠️ SELL не удалось связать с восстановленной операцией, учтены отдельно: SBER (1).'
     )
   end
 
