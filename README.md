@@ -106,6 +106,7 @@ ORDER_ID=<broker order id> APPLY=1 bundle exec rake state:resolve_sell
 - `bin/current_strategy.rb` — main strategy runner
 - `bin/example.rb` — basic gRPC examples and helpers
 - `bin/sync_moex_cache` — command-line wrapper around the MOEX push sync flow
+- `tools/backtest/` — Python portfolio backtest of the strategy on a fixed MOEX ISS snapshot (see its README for the model and its limits)
 - `systemd/` — sample systemd services, timers, and environment file templates for local/server automation
 
 ## Broker TLS
