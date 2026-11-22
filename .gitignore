@@ -6,3 +6,4 @@ logs/
 systemd/invest_tinkoff_bot.env
 systemd/*.env
 analysis/
+__pycache__/
