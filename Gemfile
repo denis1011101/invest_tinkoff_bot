@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 source 'https://rubygems.org'
-ruby '4.0.6'
+ruby '4.0.10'
 
 gem 'dotenv', '~> 3.0'
 gem 'invest_tinkoff_grpc', git: 'https://github.com/denis1011101/invest_tinkoff.git'
