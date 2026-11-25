@@ -1,0 +1,171 @@
+[1/431] ABBN
+  candidates=0 base_signals=0 requests=15
+[2/431] ABIO
+  candidates=84 base_signals=3 requests=391
+[3/431] ABRD
+  candidates=14 base_signals=3 requests=473
+[4/431] ACKO
+  candidates=0 base_signals=3 requests=474
+[5/431] AESL
+  candidates=0 base_signals=3 requests=475
+[6/431] AFKS
+  candidates=168 base_signals=6 requests=1178
+[7/431] AFLT
+  candidates=150 base_signals=9 requests=1999
+[8/431] AKRN
+  candidates=0 base_signals=9 requests=2001
+[9/431] ALBK
+  candidates=0 base_signals=9 requests=2002
+[10/431] ALNU
+  candidates=0 base_signals=9 requests=2003
+[11/431] ALRS
+  candidates=136 base_signals=11 requests=2826
+[12/431] AMEZ
+  candidates=26 base_signals=11 requests=2965
+[13/431] APRI
+  candidates=0 base_signals=11 requests=2967
+[14/431] APTK
+  candidates=27 base_signals=12 requests=3205
+[15/431] AQUA
+  candidates=72 base_signals=13 requests=3852
+[16/431] ARMD
+  candidates=0 base_signals=13 requests=3853
+[17/431] ARSA
+  candidates=0 base_signals=13 requests=3855
+[18/431] ASSB
+  candidates=0 base_signals=13 requests=3857
+[19/431] ASTR
+  candidates=103 base_signals=14 requests=4669
+[20/431] AVAN
+  candidates=0 base_signals=14 requests=4671
+[21/431] AVAZ
+  candidates=0 base_signals=14 requests=4672
+[22/431] AVAZP
+  candidates=0 base_signals=14 requests=4673
+[23/431] BANE
+  candidates=135 base_signals=15 requests=5253
+[24/431] BANEP
+  candidates=79 base_signals=16 requests=6014
+[25/431] BAZA
+  candidates=0 base_signals=16 requests=6015
+[26/431] BELU
+  candidates=107 base_signals=19 requests=6832
+[27/431] BISV
+  candidates=0 base_signals=19 requests=6833
+[28/431] BISVP
+  candidates=0 base_signals=19 requests=6835
+[29/431] BLNG
+  candidates=0 base_signals=19 requests=6837
+[30/431] BRZL
+  candidates=0 base_signals=19 requests=6839
+[31/431] BSPB
+  candidates=84 base_signals=21 requests=7642
+[32/431] BSPBP
+  candidates=20 base_signals=21 requests=7730
+[33/431] BTBR
+  candidates=0 base_signals=21 requests=7731
+[34/431] CARM
+  candidates=0 base_signals=21 requests=7733
+[35/431] CBOM
+  candidates=195 base_signals=23 requests=8513
+[36/431] CHEP
+  candidates=0 base_signals=23 requests=8514
+[37/431] CHGZ
+  candidates=0 base_signals=23 requests=8516
+[38/431] CHKZ
+  candidates=0 base_signals=23 requests=8518
+[39/431] CHMF
+  candidates=141 base_signals=24 requests=9339
+[40/431] CHMK
+  candidates=0 base_signals=24 requests=9341
+[41/431] CHZN
+  candidates=0 base_signals=24 requests=9342
+[42/431] CLSB
+  candidates=0 base_signals=24 requests=9343
+[43/431] CLSBP
+  candidates=0 base_signals=24 requests=9344
+[44/431] CNRU
+  candidates=70 base_signals=26 requests=9711
+[45/431] CNTL
+  candidates=0 base_signals=26 requests=9713
+[46/431] CNTLP
+  candidates=0 base_signals=26 requests=9715
+[47/431] DALM
+  candidates=0 base_signals=26 requests=9716
+[48/431] DASB
+  candidates=0 base_signals=26 requests=9717
+[49/431] DATA
+  candidates=93 base_signals=29 requests=10323
+[50/431] DELI
+  candidates=49 base_signals=31 requests=10689
+[51/431] DERZP
+  candidates=0 base_signals=31 requests=10690
+[52/431] DGBZ
+  candidates=0 base_signals=31 requests=10691
+[53/431] DGBZP
+  candidates=0 base_signals=31 requests=10692
+[54/431] DIAS
+  candidates=68 base_signals=31 requests=11152
+[55/431] DIOD
+  candidates=0 base_signals=31 requests=11154
+[56/431] DIXY
+  candidates=0 base_signals=31 requests=11155
+[57/431] DNKOP
+  candidates=0 base_signals=31 requests=11156
+[58/431] DOMRF
+  candidates=0 base_signals=31 requests=11157
+[59/431] DSKY
+  candidates=0 base_signals=31 requests=11158
+[60/431] DVEC
+  candidates=0 base_signals=31 requests=11160
+[61/431] DZRD
+  candidates=0 base_signals=31 requests=11162
+[62/431] DZRDP
+  candidates=0 base_signals=31 requests=11164
+[63/431] EELT
+  candidates=0 base_signals=31 requests=11166
+[64/431] ELFV
+  candidates=8 base_signals=31 requests=11308
+[65/431] ELMT
+  candidates=0 base_signals=31 requests=11310
+[66/431] ELTZ
+  candidates=0 base_signals=31 requests=11311
+[67/431] ENPG
+  candidates=167 base_signals=34 requests=12135
+[68/431] ENRU
+  candidates=0 base_signals=34 requests=12136
+[69/431] EONR
+  candidates=0 base_signals=34 requests=12137
+[70/431] EPLN
+  candidates=0 base_signals=34 requests=12138
+[71/431] EPLN-002D
+  candidates=0 base_signals=34 requests=12139
+[72/431] ERCO
+  candidates=0 base_signals=34 requests=12140
+[73/431] ETLN
+  candidates=37 base_signals=35 requests=12344
+[74/431] EUTR
+  candidates=101 base_signals=40 requests=13167
+[75/431] EVRZ
+  candidates=0 base_signals=40 requests=13168
+[76/431] FEES
+  candidates=125 base_signals=42 requests=13983
+[77/431] FESH
+  candidates=191 base_signals=54 requests=14795
+[78/431] FIAI
+  candidates=0 base_signals=54 requests=14796
+[79/431] FIXR
+  candidates=13 base_signals=54 requests=14905
+[80/431] FLOT
+  candidates=160 base_signals=56 requests=15726
+[81/431] FORTP
+  candidates=0 base_signals=56 requests=15727
+[82/431] FTRE
+  candidates=0 base_signals=56 requests=15728
+[83/431] GAZA
+  candidates=0 base_signals=56 requests=15730
+[84/431] GAZAP
+  candidates=0 base_signals=56 requests=15732
+[85/431] GAZC
+  candidates=0 base_signals=56 requests=15733
+[86/431] GAZP
