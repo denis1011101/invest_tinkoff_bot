@@ -13,9 +13,9 @@
 #
 # Очевидная починка — SSL_CERT_FILE или установка корня в системный стор —
 # сделала бы государственный CA доверенным для ВСЕХ TLS-пиров процесса:
-# Telegram, MOEX ISS, investing.com. Вместо этого бандл вешается на
-# HTTParty-класс брокерского клиента; остальные вызовы идут голым Net::HTTP и
-# продолжают проверяться по системному стору.
+# Telegram, investing.com и т.д. Вместо этого бандл вешается точечно на
+# HTTParty-класс брокерского клиента (и при необходимости на MoexISS); остальные
+# вызовы идут голым Net::HTTP и продолжают проверяться по системному стору.
 #
 # ssl_ca_file ставится именно на V2::Client, а не на ClientBase: HTTParty
 # копирует default_options в подкласс в момент его объявления, поэтому
@@ -30,8 +30,17 @@ module TradingLogic
 
     module_function
 
-    def bundle_path(env = ENV)
-      ENV_KEYS.filter_map { |key| env[key]&.strip }.reject(&:empty?).first
+    def bundle_path(env = ENV, keys: ENV_KEYS)
+      keys.filter_map { |key| env[key]&.strip }.reject(&:empty?).first
+    end
+
+    def readable_bundle_path(path = bundle_path, warn_io: $stderr, label: 'broker_tls')
+      return nil if path.nil? || path.to_s.strip.empty?
+
+      return path if File.readable?(path)
+
+      warn_io&.puts("#{label}: bundle #{path} unreadable, TLS left on the system store")
+      nil
     end
 
     def default_client_class
@@ -45,15 +54,12 @@ module TradingLogic
     # худший исход это отказ от покупок, а не покупка вслепую.
     def apply!(client_class = default_client_class, path: bundle_path, warn_io: $stderr)
       return nil if client_class.nil? || !client_class.respond_to?(:ssl_ca_file)
-      return nil if path.nil?
 
-      unless File.readable?(path)
-        warn_io&.puts("broker_tls: bundle #{path} unreadable, broker TLS left on the system store")
-        return nil
-      end
+      readable = readable_bundle_path(path, warn_io: warn_io, label: 'broker_tls')
+      return nil if readable.nil?
 
-      client_class.ssl_ca_file(path)
-      path
+      client_class.ssl_ca_file(readable)
+      readable
     end
   end
 end

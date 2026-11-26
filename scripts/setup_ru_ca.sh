@@ -9,8 +9,8 @@
 # The fix deliberately does NOT touch the system store: a national CA installed
 # there could sign a valid certificate for any host this machine talks to. The
 # bundle below is fed to grpc-core alone via GRPC_DEFAULT_SSL_ROOTS_FILE_PATH,
-# which OpenSSL (and therefore every Net::HTTP call to Telegram and MOEX ISS)
-# ignores. The extra root stays confined to the broker channel.
+# which plain OpenSSL (e.g. Net::HTTP calls to Telegram) ignores. The extra root
+# stays confined to the broker channel and MoexISS (which opts in explicitly).
 #
 # gRPC is only half of the client: TradingSchedules and the rest of the REST
 # surface go through HTTParty over plain OpenSSL, which that variable does not
