@@ -47,6 +47,11 @@ RSpec.describe TradingLogic::BrokerTls do
     it 'returns nil when nothing is configured' do
       expect(described_class.bundle_path({})).to be_nil
     end
+
+    it 'accepts custom keys in precedence order' do
+      env = { 'MOEX_CA_BUNDLE' => '/moex.pem', 'BROKER_CA_BUNDLE' => '/broker.pem' }
+      expect(described_class.bundle_path(env, keys: %w[MOEX_CA_BUNDLE BROKER_CA_BUNDLE])).to eq('/moex.pem')
+    end
   end
 
   describe '.apply!' do

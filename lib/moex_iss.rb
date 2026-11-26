@@ -5,11 +5,13 @@ require 'uri'
 require 'json'
 require 'time'
 require 'fileutils'
+require_relative 'broker_tls'
 
 module TradingLogic
   class MoexISS
     BASE = 'https://iss.moex.com/iss'
     CACHE_PATH = File.expand_path('../tmp/moex_index_cache.json', __dir__)
+    CA_ENV_KEYS = (['MOEX_CA_BUNDLE'] + TradingLogic::BrokerTls::ENV_KEYS).freeze
     FileUtils.mkdir_p(File.dirname(CACHE_PATH))
 
     # options:
@@ -17,11 +19,17 @@ module TradingLogic
     #  :market  (default 'shares')
     #  :boards  (Array or nil) boards to consider as trading (default ['TQBR','TQTF'])
     #  :timeout (seconds)
+    #  :ca_file (optional CA bundle path; defaults to MOEX_CA_BUNDLE / BROKER_CA_BUNDLE / GRPC_DEFAULT_SSL_ROOTS_FILE_PATH)
+    #  :env     (optional env hash for CA bundle lookup, defaults to ENV)
     def initialize(options = {})
       @engine  = options.fetch(:engine, 'stock')
       @market  = options.fetch(:market, 'shares')
       @boards  = options.fetch(:boards, %w[TQBR TQTF])
       @timeout = options.fetch(:timeout, 10)
+      env      = options.fetch(:env, ENV)
+      warn_io  = options.fetch(:warn_io, $stderr)
+      raw_ca   = options.fetch(:ca_file) { TradingLogic::BrokerTls.bundle_path(env, keys: CA_ENV_KEYS) }
+      @ca_file = TradingLogic::BrokerTls.readable_bundle_path(raw_ca, warn_io: warn_io, label: 'moex_iss')
     end
 
     private
@@ -190,6 +198,7 @@ module TradingLogic
       uri = URI(url)
       http = Net::HTTP.new(uri.host, uri.port)
       http.use_ssl = uri.scheme == 'https'
+      http.ca_file = @ca_file if http.use_ssl? && @ca_file
       http.open_timeout = @timeout
       http.read_timeout = @timeout
       req = Net::HTTP::Get.new(uri.request_uri, { 'Accept' => 'application/json' })
