@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'csv'
 require 'date'
 require 'json'
 require 'net/http'
@@ -11,6 +12,8 @@ require_relative 'moex_iss'
 module TradingLogic
   class PublicMarketQuotes
     CBR_URL = 'https://www.cbr.ru/scripts/XML_daily.asp'
+    FRED_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv'
+    FRED_INDICES = %w[SP500 DJIA].freeze
     GOLD_API_URL = 'https://api.gold-api.com/price'
     MOEX_CA_FILE = '/etc/ssl/invest_bot/roots_with_ru.pem'
     MSK_OFFSET = '+03:00'
@@ -29,6 +32,7 @@ module TradingLogic
               when :moex_index then index_quote(symbol)
               when :moex_future then futures_quote(symbol)
               when :gold_api then metal_quote(symbol)
+              when :fred then fred_quote(symbol)
               end
       raise Unavailable, "no price for #{symbol}" unless quote && positive_number?(quote[:price])
 
@@ -80,6 +84,44 @@ module TradingLogic
       return unless data['symbol'] == symbol
 
       { price: data['price'], as_of: Time.iso8601(data.fetch('updatedAt')) }
+    end
+
+    def fred_quote(symbol)
+      closes = fred_daily_closes.fetch(symbol, [])
+      current, previous = closes.last(2).reverse
+      return unless current
+
+      date, price = current
+      { price: price, as_of: date, **change_from_reference(price, previous&.last) }
+    end
+
+    def fred_daily_closes
+      @fred_daily_closes ||= load_fred_daily_closes
+    end
+
+    def load_fred_daily_closes
+      query = URI.encode_www_form(id: FRED_INDICES.join(','), cosd: (@today_msk - 14).iso8601)
+      csv = CSV.parse(get("#{FRED_URL}?#{query}"), headers: true)
+      date_column = csv.headers.find { |header| %w[date observation_date].include?(header.to_s.downcase) }
+      raise Unavailable, 'FRED CSV has no observation date column' unless date_column
+
+      dated_rows = csv.filter_map do |row|
+        date = Date.iso8601(row[date_column].to_s)
+        [date, row] if date <= @today_msk
+      rescue Date::Error
+        nil
+      end
+      dated_rows.sort_by!(&:first)
+      FRED_INDICES.to_h do |symbol|
+        closes = dated_rows.filter_map do |date, row|
+          price = Float(row[symbol].to_s, exception: false)
+          [date, price] if positive_number?(price)
+        end
+        [symbol, closes]
+      end
+    rescue StandardError => e
+      warn "PriceMonitor: FRED closes unavailable: #{e.class}: #{e.message}"
+      {}
     end
 
     def index_quote(symbol)
