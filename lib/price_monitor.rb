@@ -53,6 +53,16 @@ module TradingLogic
       results
     end
 
+    def format_log_result(result)
+      label = result[:label]
+      price = result[:price]
+      return "#{label}: #{result[:link] || 'data unavailable'}" unless price
+
+      delta = result[:delta]
+      change = " (#{'+' if delta.positive?}#{delta.round(2)})" if delta
+      "#{label}: #{price.round(2)}#{change}"
+    end
+
     def notify_telegram(results, bot_token:, chat_id:, header: nil)
       config = load_config
       header ||= config['telegram_header'] || 'Котировки'
