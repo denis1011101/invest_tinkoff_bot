@@ -7,10 +7,12 @@ RSpec.describe TradingLogic::InvestingParser, :integration do
   it 'parses a live quote page from ru.investing.com' do
     skip 'set INVESTING_INTEGRATION=1 to run live investing smoke test' unless ENV['INVESTING_INTEGRATION'] == '1'
 
-    parser = described_class.new
+    parser = described_class.new(browser_path: TradingLogic::InvestingBrowser.path)
     quote = parser.fetch_quote('/currencies/usd-rub')
 
     expect(quote[:price]).to be_a(Float)
     expect(quote[:price]).to be > 0
+  ensure
+    parser&.close
   end
 end

@@ -54,4 +54,20 @@ RSpec.describe TradingLogic::MarketCache do
       expect(described_class.new(client).refresh_market_cache(force: true)).to be false
     end
   end
+
+  describe '#load_market_cache' do
+    it 'filters out stale and future snapshots only when freshness is requested' do
+      rows = [{ 'ticker' => 'SBER', 'figi' => 'FIGI_SBER', 'class_code' => 'TQBR' }]
+      now = Time.utc(2026, 11, 28)
+      allow(Time).to receive(:now).and_return(now)
+      [now - 1, now - (described_class::CACHE_TTL_HOURS * 3600), now + 60].each_with_index do |updated_at, index|
+        allow(File).to receive(:read).with(described_class::CACHE_PATH).and_return(
+          JSON.generate('updated_at' => updated_at.iso8601, 'instruments' => rows)
+        )
+
+        expect(mc.load_market_cache).to eq(rows)
+        expect(mc.load_market_cache(fresh_only: true)).to eq(index.zero? ? rows : [])
+      end
+    end
+  end
 end

@@ -63,6 +63,21 @@ module TradingLogic
       end
     end
 
+    def board_data(board:, columns:, secid: nil)
+      url = "#{BASE}/engines/#{enc(@engine)}/markets/#{enc(@market)}/boards/#{enc(board)}/securities"
+      url += "/#{enc(secid)}" if secid
+      params = { 'iss.meta' => 'off', 'iss.only' => columns.keys.join(',') }
+      columns.each { |table, fields| params["#{table}.columns"] = fields.join(',') }
+      body = http_get_json("#{url}.json?#{URI.encode_www_form(params)}")
+      return {} unless body
+
+      columns.keys.to_h do |table|
+        fields = body.dig(table.to_s, 'columns')&.map { |field| field.downcase.to_sym } || []
+        rows = body.dig(table.to_s, 'data') || []
+        [table, rows.map { |row| fields.zip(row).to_h }]
+      end
+    end
+
     # Возвращает массив хэшей компонентов индекса (например 'IMOEX').
     # Пробует несколько известных URL-форматов ISS и парсит таблицы analytics/constituents/securities.
     def index_constituents(index_id, cache_path: CACHE_PATH) # rubocop:disable Metrics

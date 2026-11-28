@@ -156,14 +156,7 @@ namespace :price_monitor do
       next
     end
 
-    results.each do |r|
-      delta_str = if r[:delta]
-                    " (#{'+' if r[:delta].positive?}#{r[:delta].round(2)})"
-                  else
-                    ''
-                  end
-      puts "#{r[:label]}: #{r[:price].round(2)}#{delta_str}"
-    end
+    results.each { |result| puts monitor.format_log_result(result) }
 
     bot_token = ENV['WISHLIST_TELEGRAM_BOT_TOKEN'] || ENV.fetch('TELEGRAM_BOT_TOKEN', nil)
     chat_id = ENV['WISHLIST_TELEGRAM_CHAT_ID'] || ENV.fetch('TELEGRAM_CHAT_ID', nil)

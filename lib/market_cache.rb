@@ -111,32 +111,35 @@ module TradingLogic
     end
 
     # Возвращает массив инструментов из кеша
-    def load_market_cache
-      return [] unless File.exist?(CACHE_PATH)
-
-      data = begin
-        JSON.parse(File.read(CACHE_PATH))
-      rescue StandardError
-        nil
-      end
+    def load_market_cache(fresh_only: false)
+      data = read_cache
       return [] unless data && data['instruments'].is_a?(Array)
+      return [] if fresh_only && !fresh_cache?(data)
 
       data['instruments']
     end
 
     private
 
-    # Свежесть по updated_at внутри файла кеша (в часах), не по mtime.
     def cache_fresh_by_updated_at?
-      return false unless File.exist?(CACHE_PATH)
+      fresh_cache?(read_cache)
+    end
 
+    def read_cache
       data = JSON.parse(File.read(CACHE_PATH))
-      ts = data['updated_at']
+      data if data.is_a?(Hash)
+    rescue SystemCallError, IOError, JSON::ParserError
+      nil
+    end
+
+    # Свежесть по updated_at внутри файла кеша (в часах), не по mtime.
+    def fresh_cache?(data)
+      ts = data&.fetch('updated_at', nil)
       return false unless ts
 
       age_hours = (Time.now.utc - Time.parse(ts.to_s).utc) / 3600.0
-      age_hours < CACHE_TTL_HOURS
-    rescue StandardError
+      age_hours >= 0 && age_hours < CACHE_TTL_HOURS
+    rescue ArgumentError
       false
     end
 
