@@ -19,14 +19,14 @@ module TradingLogic
     YEK_OFFSET  = '+05:00'
     STATIC_REPLACEMENTS = {
       '/currencies/usd-rub' => { source: :cbr, symbol: 'USD', label: 'USD/RUB ЦБ' },
-      '/indices/mcx' => { source: :moex_index, symbol: 'IMOEX2', label: 'IMOEX2' },
-      '/commodities/brent-oil' => { source: :moex_future, symbol: 'BR', label: 'Brent фьюч.' },
-      '/commodities/nickel' => { source: :moex_future, symbol: 'NICKEL', label: 'Никель фьюч.' },
+      '/indices/mcx' => { source: :moex_index, symbol: 'IMOEX2', label: 'IMOEX2 (все сессии)' },
+      '/commodities/brent-oil' => { source: :moex_future, symbol: 'BR', label: 'Нефть Brent, фьючерс' },
+      '/commodities/nickel' => { source: :moex_future, symbol: 'NICKEL', label: 'Никель, фьючерс' },
       '/commodities/gold' => { source: :gold_api, symbol: 'XAU' },
       '/commodities/palladium' => { source: :gold_api, symbol: 'XPD' },
       '/commodities/platinum' => { source: :gold_api, symbol: 'XPT' },
-      '/indices/us-spx-500' => { source: :fred, symbol: 'SP500', label: 'S&P 500 закр.' },
-      '/indices/us-30' => { source: :fred, symbol: 'DJIA', label: 'Dow Jones закр.' }
+      '/indices/us-spx-500' => { link: 'https://fred.stlouisfed.org/series/SP500' },
+      '/indices/us-30' => { link: 'https://fred.stlouisfed.org/series/DJIA' }
     }.freeze
     INVESTING_HOSTS = %w[investing.com ru.investing.com www.investing.com].freeze
 
@@ -104,6 +104,8 @@ module TradingLogic
     def fetch_static_result(inst, previous, parser, public_quotes)
       result = { label: inst[:label], query: inst[:url], group: :static, sort_index: inst[:sort_index] }
       replacement = inst[:replacement]
+      return result.merge(link: replacement[:link]) if replacement&.key?(:link)
+
       key = inst.fetch(:state_key)
       if replacement
         source, symbol = replacement.values_at(:source, :symbol)
@@ -322,7 +324,6 @@ module TradingLogic
 
     def format_monitor_message(header, results)
       now = yek_now
-      report_date = now.to_date
       date_str = escape_md(now.strftime('%Y-%m-%d %H:%M'))
       lines = ["*#{escape_md(header)}*", "#{date_str} \\(Екб\\)", '']
 
@@ -333,36 +334,30 @@ module TradingLogic
         results.each do |r|
           lines << '' if prev_group && prev_group != r[:group]
           prev_group = r[:group]
-          lines << format_result(r, report_date)
+          lines << format_result(r)
         end
       end
 
       lines.join("\n")
     end
 
-    def format_result(result, report_date)
+    def format_result(result)
       return "[#{escape_md(result[:label])}](#{result[:link]})" if result[:link]
 
-      contract_month = result[:contract]&.split('-', 2)&.last
-      label = [result[:label], contract_month].compact.join(' ').delete('`')
+      label = [result[:label], result[:contract]].compact.join(' · ').delete('`')
       return "`#{label}` — данные недоступны" if result[:unavailable]
 
       price = escape_md(format_price(result[:price]))
       change = format_delta(result[:delta], result[:delta_pct])
       change = '—' if change.empty? && result[:as_of]
-      time = format_as_of(result[:as_of], report_date)
+      time = format_as_of(result[:as_of])
       ["`#{label}`", price, change, time].reject(&:empty?).join(' ')
     end
 
-    def format_as_of(value, report_date)
+    def format_as_of(value)
       case value
-      when Time
-        observed = value.getlocal(YEK_OFFSET)
-        format = observed.to_date == report_date ? '%H:%M' : '%d.%m %H:%M'
-        "· #{escape_md(observed.strftime(format))}"
-      when Date
-        format = value.year == report_date.year ? '%d.%m' : '%d.%m.%Y'
-        "· на #{escape_md(value.strftime(format))}"
+      when Time then "· #{escape_md(value.getlocal(YEK_OFFSET).strftime('%d.%m %H:%M'))}"
+      when Date then "· на #{escape_md(value.strftime('%d.%m.%Y'))}"
       else ''
       end
     end
@@ -392,6 +387,7 @@ module TradingLogic
 
     def state_key_for_static(url, replacement)
       return "investing:#{url}" unless replacement
+      return if replacement[:link]
 
       "#{replacement[:source]}:#{replacement[:symbol]}"
     end

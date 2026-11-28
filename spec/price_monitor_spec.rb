@@ -214,7 +214,7 @@ RSpec.describe TradingLogic::PriceMonitor do
       expect(investing_parser).not_to have_received(:fetch_quote)
     end
 
-    it 'renders compact current quotes, older timestamps, numeric US closes and source failures' do
+    it 'migrates the production URL list and renders source dates, failures and index links' do
       legacy_instruments = [
         ['USD/RUB', 'https://ru.investing.com/currencies/usd-rub'],
         ['IMOEX', '/indices/mcx'],
@@ -233,19 +233,12 @@ RSpec.describe TradingLogic::PriceMonitor do
       public_quotes = instance_double(TradingLogic::PublicMarketQuotes)
       monitor = described_class.new(client, investing_parser: investing_parser, public_quotes: public_quotes)
       as_of = Time.iso8601('2026-11-27T19:30:09+03:00')
-      allow(monitor).to receive(:yek_now).and_return(Time.iso8601('2026-11-28T16:00:00+05:00'))
       allow(public_quotes).to receive(:fetch).with(:cbr, 'USD').and_return(price: 80.6273, as_of: Date.new(2026, 11, 28))
       allow(public_quotes).to receive(:fetch).with(:moex_index, 'IMOEX2').and_return(price: 2364.5, as_of: as_of)
       allow(public_quotes).to receive(:fetch).with(:moex_future, 'BR').and_return(
-        price: 91.0, as_of: Time.iso8601('2026-11-27T23:49:00+03:00'), contract: 'BR-1.27', state_symbol: 'BRF7'
+        price: 91.0, as_of: as_of, contract: 'BR-1.27', state_symbol: 'BRF7'
       )
       allow(public_quotes).to receive(:fetch).with(:moex_future, 'NICKEL').and_raise(TradingLogic::PublicMarketQuotes::Unavailable)
-      allow(public_quotes).to receive(:fetch).with(:fred, 'SP500').and_return(
-        price: 7050.0, as_of: Date.new(2026, 11, 27), delta: 15.0, delta_pct: 0.21
-      )
-      allow(public_quotes).to receive(:fetch).with(:fred, 'DJIA').and_return(
-        price: 49_900.0, as_of: Date.new(2026, 11, 27), delta: -100.0, delta_pct: -0.2
-      )
       %w[XAU XPD XPT].each do |symbol|
         allow(public_quotes).to receive(:fetch).with(:gold_api, symbol).and_return(price: 1234.0, as_of: as_of)
       end
@@ -256,15 +249,14 @@ RSpec.describe TradingLogic::PriceMonitor do
       expect(results.length).to eq(9)
       expect(results[2]).to include(price: 91.0, prev_price: nil, delta: nil, state_key: 'moex_future:BR', state_symbol: 'BRF7')
       expect(message).to include(
-        '`USD/RUB ЦБ` 80\.63 — · на 28\.11',
-        '`IMOEX2` 2364\.5 — · 27\.11 21:30',
-        '`Brent фьюч. 1.27` 91\.0 — · 01:49',
-        '`Никель фьюч.` — данные недоступны',
-        '`S&P 500 закр.` 7050\.0 ↗ \+15\.0 \(\+0\.21%\) · на 27\.11',
-        '`Dow Jones закр.` 49900\.0 ↘ \-100\.0 \(\-0\.2%\) · на 27\.11'
+        '`USD/RUB ЦБ` 80\.63 — · на 28\.11\.2026',
+        '`Нефть Brent, фьючерс · BR-1.27` 91\.0 — · 27\.11 21:30',
+        '`Никель, фьючерс` — данные недоступны',
+        '[S&P 500](https://fred.stlouisfed.org/series/SP500)',
+        '[Dow Jones](https://fred.stlouisfed.org/series/DJIA)'
       )
       saved = JSON.parse(File.read(described_class::STATE_PATH))
-      expect(saved.fetch('prices')).to include('moex_future:BR' => 91.0, 'fred:SP500' => 7050.0, 'fred:DJIA' => 49_900.0)
+      expect(saved.fetch('prices')).to include('moex_future:BR' => 91.0)
       expect(saved.fetch('future_contracts')).to eq('moex_future:BR' => 'BRF7')
     end
 
@@ -331,7 +323,6 @@ RSpec.describe TradingLogic::PriceMonitor do
       public_quotes = instance_double(TradingLogic::PublicMarketQuotes)
       monitor = described_class.new(client, public_quotes: public_quotes)
       first_time = Time.iso8601('2026-11-27T12:00:00+05:00')
-      allow(monitor).to receive(:yek_now).and_return(first_time)
       metals.each do |_, _, symbol, first_price, next_price|
         allow(public_quotes).to receive(:fetch).with(:gold_api, symbol).and_return(
           { price: first_price, as_of: first_time },
@@ -342,7 +333,7 @@ RSpec.describe TradingLogic::PriceMonitor do
       first = monitor.send(:format_monitor_message, 'Котировки', monitor.fetch_all)
       second = monitor.send(:format_monitor_message, 'Котировки', monitor.fetch_all)
 
-      expect(first).to include('`Золото` 4000\.0 — · 12:00')
+      expect(first).to include('`Золото` 4000\.0 — · 27\.11 12:00')
       expect(second).to include(
         '`Золото` 4020\.0 ↗ \+20\.0 \(\+0\.5%\)',
         '`Палладий` 990\.0 ↘ \-10\.0 \(\-1\.0%\)',

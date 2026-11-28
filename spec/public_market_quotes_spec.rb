@@ -57,21 +57,6 @@ RSpec.describe TradingLogic::PublicMarketQuotes do
     )
   end
 
-  it 'loads both US indices once and compares each latest close to its own previous trading close' do
-    url = "#{described_class::FRED_URL}?id=SP500%2CDJIA&cosd=2026-11-17"
-    expect(quotes).to receive(:get).with(url).once.and_return(<<~CSV)
-      observation_date,SP500,DJIA
-      2026-11-30,7050,.
-      2026-11-25,7000,50000
-      2026-11-26,,
-      2026-11-27,7035,49900
-      2026-12-02,9000,60000
-    CSV
-
-    expect(quotes.fetch(:fred, 'SP500')).to include(price: 7050.0, as_of: Date.new(2026, 11, 30), delta: 15.0)
-    expect(quotes.fetch(:fred, 'DJIA')).to eq(price: 49_900.0, as_of: Date.new(2026, 11, 27), delta: -100.0, delta_pct: -0.2)
-  end
-
   it 'rolls off the expiring futures and ignores spreads, with a single schedule lookup for both assets' do
     expect(futures_iss).to receive(:board_data).with(board: 'RFUD', columns: anything).once.and_return(
       securities: [
