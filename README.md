@@ -57,7 +57,7 @@ bundle exec ruby bin/example.rb
   The monitor uses the nearest contract until its final trading date begins in Moscow. It tracks prices per contract.
   Set `MOEX_CA_BUNDLE` for ISS if needed. The monitor can reuse the bundle created by `scripts/setup_ru_ca.sh` at its default path.
 - Gold, platinum, and palladium spot prices in USD per troy ounce from [Gold API](https://gold-api.com/docs), with the provider's timestamp.
-- S&P 500 and Dow Jones link to the daily close series at FRED.
+- S&P 500 and Dow Jones use the latest available daily closes from FRED, dated to the US session, with the change from the prior trading close.
 
 For stock prices, exact TQBR ticker matches can reuse FIGIs from the fresh market instruments cache.
 Uncached tickers still go through broker instrument lookup, and the monitor requests current prices as a batch.
