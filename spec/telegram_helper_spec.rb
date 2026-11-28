@@ -32,4 +32,15 @@ RSpec.describe TradingLogic::TelegramHelper do
 
     expect(helper.send_telegram(bot_token: 'token', chat_id: '123', text: 'hello')).to be false
   end
+
+  it 'can disable previews for inline links' do
+    response = instance_double(Net::HTTPOK, code: '200', body: '{"ok":true}')
+    allow(Net::HTTP).to receive(:post).and_return(response)
+
+    helper.send_telegram(bot_token: 'token', chat_id: '123', text: '[FRED](https://fred.stlouisfed.org)', disable_link_preview: true)
+
+    expect(Net::HTTP).to have_received(:post).with(anything, satisfy do |json|
+      JSON.parse(json)['link_preview_options'] == { 'is_disabled' => true }
+    end, anything)
+  end
 end

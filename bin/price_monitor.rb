@@ -19,6 +19,11 @@ if results.empty?
 end
 
 results.each do |r|
+  if r[:link] || r[:unavailable]
+    puts "#{r[:label]}: #{r[:link] || 'data unavailable'}"
+    next
+  end
+
   delta_str = if r[:delta]
                 " (#{'+' if r[:delta].positive?}#{r[:delta].round(2)})"
               else

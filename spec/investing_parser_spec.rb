@@ -200,6 +200,36 @@ RSpec.describe TradingLogic::InvestingParser do
     expect(received_cookies).to include('session_id=xyz')
   end
 
+  it 'reuses a headless browser for multiple quotes and closes it' do
+    network = instance_double(Ferrum::Network, status: 200)
+    browser = instance_double(Ferrum::Browser, network: network)
+    html = '<div data-test="instrument-price-last">92,45</div>'
+    parser = described_class.new(browser_path: '/bin/chrome-headless-shell', sleep_proc: sleep_proc)
+
+    expect(Ferrum::Browser).to receive(:new).with(hash_including(browser_path: '/bin/chrome-headless-shell')).once.and_return(browser)
+    expect(network).to receive(:clear).with(:traffic).twice
+    expect(browser).to receive(:goto).with('https://ru.investing.com/currencies/usd-rub')
+    expect(browser).to receive(:goto).with('https://ru.investing.com/commodities/brent-oil')
+    allow(browser).to receive(:at_css).with(described_class::BROWSER_PRICE_SELECTOR).and_return(true)
+    allow(browser).to receive(:body).and_return(html)
+    expect(browser).to receive(:quit).once
+
+    expect(parser.fetch_quote('/currencies/usd-rub')[:price]).to eq(92.45)
+    expect(parser.fetch_quote('/commodities/brent-oil')[:price]).to eq(92.45)
+    parser.close
+  end
+
+  it 'rejects browser HTTP errors before parsing the DOM' do
+    network = instance_double(Ferrum::Network, status: 403, clear: true)
+    browser = instance_double(Ferrum::Browser, network: network, goto: nil, quit: nil)
+    parser = described_class.new(browser_path: '/bin/chrome-headless-shell')
+    allow(Ferrum::Browser).to receive(:new).and_return(browser)
+
+    expect { parser.fetch_quote('/currencies/usd-rub') }.to raise_error(TradingLogic::InvestingBrowser::HttpError, /HTTP 403/)
+  ensure
+    parser&.close
+  end
+
   it 'fetches default HTTP transport through curl and exposes response headers' do
     captured_cmd = nil
     status = double('status', success?: true, exitstatus: 0)

@@ -10,10 +10,11 @@ module TradingLogic
       text.to_s.gsub(/([_*\[\]()~`>#+\-=|{}.!])/, '\\\\\1')
     end
 
-    def send_telegram(bot_token:, chat_id:, text:)
+    def send_telegram(bot_token:, chat_id:, text:, disable_link_preview: false)
       uri = URI("https://api.telegram.org/bot#{bot_token}/sendMessage")
-      body = { chat_id: chat_id.to_s, text: text, parse_mode: 'MarkdownV2' }.to_json
-      response = Net::HTTP.post(uri, body, 'Content-Type' => 'application/json')
+      body = { chat_id: chat_id.to_s, text: text, parse_mode: 'MarkdownV2' }
+      body[:link_preview_options] = { is_disabled: true } if disable_link_preview
+      response = Net::HTTP.post(uri, body.to_json, 'Content-Type' => 'application/json')
       return false unless response.code.to_i == 200
 
       payload = JSON.parse(response.body)

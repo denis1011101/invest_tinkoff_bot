@@ -5,6 +5,7 @@ require 'open3'
 require 'tempfile'
 require 'time'
 require 'uri'
+require_relative 'investing_browser'
 
 begin
   require 'nokogiri'
@@ -18,6 +19,12 @@ module TradingLogic
     BASE_URL = 'https://ru.investing.com'
     DEFAULT_SLEEP_RANGE = 1.0..2.0
     MAX_ATTEMPTS = 3
+    PRICE_SELECTORS = [
+      '[data-test="instrument-price-last"]',
+      '[data-test="instrument-last-price"]',
+      '[data-test*="instrument-price-last"]'
+    ].freeze
+    BROWSER_PRICE_SELECTOR = PRICE_SELECTORS.join(', ').freeze
 
     RETRIABLE_ERRORS = [
       Timeout::Error,
@@ -49,28 +56,39 @@ module TradingLogic
     end
     private_constant :CurlResponse
 
-    def initialize(sleep_range: DEFAULT_SLEEP_RANGE, http_getter: nil, now_proc: nil,
+    def initialize(sleep_range: DEFAULT_SLEEP_RANGE, http_getter: nil, browser_path: nil, now_proc: nil,
                    sleep_proc: nil, warn_proc: nil)
       @sleep_range = sleep_range
       @http_getter = http_getter || method(:default_http_get)
       @now_proc = now_proc || -> { Time.now }
       @sleep_proc = sleep_proc || ->(seconds) { sleep(seconds) }
       @warn_proc = warn_proc || ->(message) { warn(message) }
+      @browser = InvestingBrowser.new(browser_path, sleep_proc: @sleep_proc, warn_proc: @warn_proc) if browser_path
       @last_fetch_at = nil
       @cookies = {}
     end
 
     def fetch_quote(path)
       normalized_path = normalize_path(path)
-      warm_up_session! if @cookies.empty?
+      warm_up_session! if !@browser && @cookies.empty?
       throttle_requests!
 
-      quote = fetch_quote_uncached(normalized_path)
+      quote = @browser ? fetch_browser_quote(normalized_path) : fetch_quote_uncached(normalized_path)
       @last_fetch_at = now
       quote
     end
 
+    def close
+      @browser&.close
+    end
+
     private
+
+    def fetch_browser_quote(path)
+      uri = URI.join(BASE_URL, path)
+      html = @browser.fetch_html(uri, price_selector: BROWSER_PRICE_SELECTOR)
+      parse_quote(html).merge(path: path, fetched_at: now.iso8601)
+    end
 
     def fetch_quote_uncached(path)
       uri = URI.join(BASE_URL, path)
@@ -97,12 +115,11 @@ module TradingLogic
 
     def parse_quote(html)
       document = build_document(html)
-      lines = extract_lines(document, html)
-
-      selector_quote = parse_from_selectors(document)
-      warn_once('selectors not found, falling back to text parsing') unless selector_quote
-      line_quote = parse_from_lines(lines)
-      quote = selector_quote || line_quote
+      quote = parse_from_selectors(document)
+      unless quote
+        warn_once('selectors not found, falling back to text parsing')
+        quote = parse_from_lines(extract_lines(document, html))
+      end
 
       raise ParseError, 'price not found in investing page' unless quote && quote[:price]
 
@@ -118,11 +135,7 @@ module TradingLogic
     def parse_from_selectors(document)
       return nil unless document
 
-      price_text = first_selector_text(document, [
-                                         '[data-test="instrument-price-last"]',
-                                         '[data-test="instrument-last-price"]',
-                                         '[data-test*="instrument-price-last"]'
-                                       ])
+      price_text = first_selector_text(document, PRICE_SELECTORS)
 
       delta_text = first_selector_text(document, [
                                          '[data-test="instrument-price-change"]',

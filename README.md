@@ -48,6 +48,31 @@ Exits are intentionally asymmetric by trend. In an **UP** trend the bot holds po
 bundle exec ruby bin/example.rb
 ```
 
+## Price monitor
+
+`bin/price_monitor.rb` maps the standard Investing.com URLs in `tmp/price_monitor.json` to public data sources:
+
+- USD/RUB from [Bank of Russia XML](https://cbr.ru/development/sxml/), with the official rate's effective date.
+- IMOEX2, Brent futures and nickel futures from [MOEX ISS](https://www.moex.com/a2920), with exchange timestamps in Yekaterinburg time.
+  The monitor uses the nearest contract until its final trading date begins in Moscow. It tracks prices per contract.
+  Set `MOEX_CA_BUNDLE` for ISS if needed. The monitor can reuse the bundle created by `scripts/setup_ru_ca.sh` at its default path.
+- Gold, platinum, and palladium spot prices in USD per troy ounce from [Gold API](https://gold-api.com/docs), with the provider's timestamp.
+- S&P 500 and Dow Jones link to the daily close series at FRED.
+
+For stock prices, exact TQBR ticker matches can reuse FIGIs from the fresh market instruments cache.
+Uncached tickers still go through broker instrument lookup, and the monitor requests current prices as a batch.
+An unavailable quote keeps its last successful price for the next comparison. Futures retain the contract ID with that price.
+The upper block compares the CBR rate with the rate effective the previous day, and MOEX quotes with their daily
+reference. Spot metals compare with the last successful observation. The first spot observation shows a dash until
+the monitor has a price to compare against.
+
+Other Investing.com URLs in `static_instruments` can use one browser session per run.
+Download [chrome-headless-shell from Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/),
+keep its extracted directory together, and set `BROWSER_PATH=/path/to/chrome-headless-shell`
+in the monitor's environment or put the binary on the job's `PATH`. Update the standalone binary with browser security releases.
+The monitor uses curl when no browser path is configured or found. The browser sandbox is enabled by default.
+Run browser-enabled jobs as an unprivileged user. `BROWSER_NO_SANDBOX=1` is available for an already isolated runtime.
+
 ## Rake tasks:
 ```bash
 # generate both caches (default)

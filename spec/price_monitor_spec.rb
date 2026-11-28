@@ -3,7 +3,7 @@
 require_relative 'spec_helper'
 require 'ostruct'
 require 'json'
-require 'fileutils'
+require 'tmpdir'
 require_relative '../lib/price_monitor'
 
 RSpec.describe TradingLogic::PriceMonitor do
@@ -24,19 +24,30 @@ RSpec.describe TradingLogic::PriceMonitor do
   end
 
   describe '#fetch_all' do
+    around do |example|
+      Dir.mktmpdir('price-monitor-test-') do |directory|
+        @state_path = File.join(directory, 'state.json')
+        example.run
+      end
+    end
+
     before do
+      stub_const('TradingLogic::PriceMonitor::STATE_PATH', @state_path)
       allow(File).to receive(:exist?).and_call_original
       allow(File).to receive(:read).and_call_original
-      allow(File).to receive(:write).and_return(nil)
-      allow(FileUtils).to receive(:mkdir_p)
+      allow(File).to receive(:read).with(TradingLogic::MarketCache::CACHE_PATH).and_raise(Errno::ENOENT)
       allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(true)
+    end
+
+    def saved_state
+      JSON.parse(File.read(described_class::STATE_PATH))
     end
 
     it 'fetches static instruments from investing and dynamic instruments from Tinkoff' do
       config = {
         'telegram_header' => 'Test',
         'static_instruments' => [
-          { 'label' => 'USD/RUB', 'url' => '/currencies/usd-rub' }
+          { 'label' => 'EUR/RUB', 'url' => '/currencies/eur-rub' }
         ],
         'dynamic_instruments' => [
           { 'label' => 'Сбер', 'query' => 'SBER' }
@@ -44,9 +55,8 @@ RSpec.describe TradingLogic::PriceMonitor do
       }
 
       allow(File).to receive(:read).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(JSON.generate(config))
-      allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(false)
       allow(investing_parser).to receive(:fetch_quote)
-        .with('/currencies/usd-rub')
+        .with('/currencies/eur-rub')
         .and_return(price: 92.45, delta: 0.45, delta_pct: 0.49)
 
       allow(instruments_svc).to receive(:find_instrument)
@@ -67,7 +77,7 @@ RSpec.describe TradingLogic::PriceMonitor do
       results = monitor.fetch_all
 
       expect(results.size).to eq(2)
-      expect(results[0]).to include(label: 'USD/RUB', group: :static, price: 92.45)
+      expect(results[0]).to include(label: 'EUR/RUB', group: :static, price: 92.45)
       expect(results[0][:delta_pct]).to eq(0.49)
       expect(results[1]).to include(label: 'Сбер', group: :dynamic)
       expect(results[1][:price]).to be_within(0.01).of(245.3)
@@ -77,7 +87,7 @@ RSpec.describe TradingLogic::PriceMonitor do
       config = {
         'telegram_header' => 'Test',
         'static_instruments' => [
-          { 'label' => 'USD/RUB', 'url' => '/currencies/usd-rub' }
+          { 'label' => 'EUR/RUB', 'url' => '/currencies/eur-rub' }
         ],
         'dynamic_instruments' => [
           { 'label' => 'Сбер', 'query' => 'SBER' }
@@ -85,17 +95,16 @@ RSpec.describe TradingLogic::PriceMonitor do
       }
       prev_state = {
         'prices' => {
-          'investing:/currencies/usd-rub' => 92.0,
+          'investing:/currencies/eur-rub' => 92.0,
           'tinkoff:SBER' => 240.0
         }
       }
 
       allow(File).to receive(:read).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(JSON.generate(config))
-      allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(true)
-      allow(File).to receive(:read).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(JSON.generate(prev_state))
+      File.write(described_class::STATE_PATH, JSON.generate(prev_state))
 
       allow(investing_parser).to receive(:fetch_quote)
-        .with('/currencies/usd-rub')
+        .with('/currencies/eur-rub')
         .and_return(price: 92.45, delta: nil, delta_pct: nil)
 
       allow(instruments_svc).to receive(:find_instrument)
@@ -125,7 +134,7 @@ RSpec.describe TradingLogic::PriceMonitor do
       config = {
         'telegram_header' => 'Test',
         'static_instruments' => [
-          { 'label' => 'USD/RUB', 'url' => '/currencies/usd-rub' }
+          { 'label' => 'EUR/RUB', 'url' => '/currencies/eur-rub' }
         ],
         'dynamic_instruments' => [
           { 'label' => 'Лукойл', 'query' => 'LKOH' },
@@ -134,17 +143,16 @@ RSpec.describe TradingLogic::PriceMonitor do
       }
       prev_state = {
         'prices' => {
-          'investing:/currencies/usd-rub' => 92.0,
+          'investing:/currencies/eur-rub' => 92.0,
           'tinkoff:LKOH' => 10_000.0,
           'tinkoff:SBER' => 100.0
         }
       }
 
       allow(File).to receive(:read).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(JSON.generate(config))
-      allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(true)
-      allow(File).to receive(:read).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(JSON.generate(prev_state))
+      File.write(described_class::STATE_PATH, JSON.generate(prev_state))
       allow(investing_parser).to receive(:fetch_quote)
-        .with('/currencies/usd-rub')
+        .with('/currencies/eur-rub')
         .and_return(price: 92.45, delta: 0.45, delta_pct: 0.49)
 
       allow(instruments_svc).to receive(:find_instrument)
@@ -172,7 +180,7 @@ RSpec.describe TradingLogic::PriceMonitor do
 
       results = monitor.fetch_all
 
-      expect(results.map { |r| r[:label] }).to eq(['USD/RUB', 'Сбер', 'Лукойл'])
+      expect(results.map { |r| r[:label] }).to eq(['EUR/RUB', 'Сбер', 'Лукойл'])
     end
 
     it 'supports legacy single instruments list as dynamic Tinkoff instruments' do
@@ -185,7 +193,6 @@ RSpec.describe TradingLogic::PriceMonitor do
 
       allow(investing_parser).to receive(:fetch_quote)
       allow(File).to receive(:read).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(JSON.generate(legacy_config))
-      allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(false)
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'USD000UTSTOM')
         .and_return(
@@ -207,6 +214,155 @@ RSpec.describe TradingLogic::PriceMonitor do
       expect(investing_parser).not_to have_received(:fetch_quote)
     end
 
+    it 'migrates the production URL list and renders source dates, failures and index links' do
+      legacy_instruments = [
+        ['USD/RUB', 'https://ru.investing.com/currencies/usd-rub'],
+        ['IMOEX', '/indices/mcx'],
+        ['Нефть Brent', '/commodities/brent-oil'],
+        ['Золото $', '/commodities/gold'],
+        ['S&P 500', '/indices/us-spx-500'],
+        ['Dow Jones', '/indices/us-30'],
+        ['Никель', '/commodities/nickel'],
+        ['Палладий', '/commodities/palladium'],
+        ['Платина', '/commodities/platinum']
+      ].map { |label, url| { 'label' => label, 'url' => url } }
+      config = { 'static_instruments' => legacy_instruments }
+      previous = { 'prices' => { 'moex_future:BRZ6' => 95.0, 'investing:/commodities/brent-oil' => 87.0 } }
+      allow(File).to receive(:read).with(described_class::CONFIG_PATH).and_return(JSON.generate(config))
+      File.write(described_class::STATE_PATH, JSON.generate(previous))
+      public_quotes = instance_double(TradingLogic::PublicMarketQuotes)
+      monitor = described_class.new(client, investing_parser: investing_parser, public_quotes: public_quotes)
+      as_of = Time.iso8601('2026-11-27T19:30:09+03:00')
+      allow(public_quotes).to receive(:fetch).with(:cbr, 'USD').and_return(price: 80.6273, as_of: Date.new(2026, 11, 28))
+      allow(public_quotes).to receive(:fetch).with(:moex_index, 'IMOEX2').and_return(price: 2364.5, as_of: as_of)
+      allow(public_quotes).to receive(:fetch).with(:moex_future, 'BR').and_return(
+        price: 91.0, as_of: as_of, contract: 'BR-1.27', state_symbol: 'BRF7'
+      )
+      allow(public_quotes).to receive(:fetch).with(:moex_future, 'NICKEL').and_raise(TradingLogic::PublicMarketQuotes::Unavailable)
+      %w[XAU XPD XPT].each do |symbol|
+        allow(public_quotes).to receive(:fetch).with(:gold_api, symbol).and_return(price: 1234.0, as_of: as_of)
+      end
+
+      results = monitor.fetch_all
+      message = monitor.send(:format_monitor_message, 'Котировки', results)
+
+      expect(results.length).to eq(9)
+      expect(results[2]).to include(price: 91.0, prev_price: nil, delta: nil, state_key: 'moex_future:BR', state_symbol: 'BRF7')
+      expect(message).to include(
+        '`USD/RUB ЦБ` 80\.63 — · на 28\.11\.2026',
+        '`Нефть Brent, фьючерс · BR-1.27` 91\.0 — · 27\.11 21:30',
+        '`Никель, фьючерс` — данные недоступны',
+        '[S&P 500](https://fred.stlouisfed.org/series/SP500)',
+        '[Dow Jones](https://fred.stlouisfed.org/series/DJIA)'
+      )
+      saved = JSON.parse(File.read(described_class::STATE_PATH))
+      expect(saved.fetch('prices')).to include('moex_future:BR' => 91.0)
+      expect(saved.fetch('future_contracts')).to eq('moex_future:BR' => 'BRF7')
+    end
+
+    it 'uses exact TQBR cache hits and keeps broker lookup for missing, ambiguous or non-TQBR tickers' do
+      config = { 'dynamic_instruments' => %w[sber GAZP LKOH].map { |ticker| { 'query' => ticker } } }
+      instruments_cache = {
+        'updated_at' => Time.now.utc.iso8601,
+        'instruments' => [
+          { 'ticker' => 'SBER', 'figi' => 'SBER_MAIN', 'class_code' => 'TQBR' },
+          { 'ticker' => 'SBER', 'figi' => 'SBER_OTHER', 'class_code' => 'OTHER' },
+          { 'ticker' => 'GAZP', 'figi' => 'GAZP_OTHER', 'class_code' => 'OTHER' },
+          { 'ticker' => 'LKOH', 'figi' => 'LKOH_FIRST', 'class_code' => 'TQBR' },
+          { 'ticker' => 'LKOH', 'figi' => 'LKOH_SECOND', 'class_code' => 'TQBR' }
+        ]
+      }
+      allow(File).to receive(:read).with(described_class::CONFIG_PATH).and_return(JSON.generate(config))
+      allow(File).to receive(:read).with(TradingLogic::MarketCache::CACHE_PATH).and_return(JSON.generate(instruments_cache))
+      %w[GAZP LKOH].each do |ticker|
+        expect(instruments_svc).to receive(:find_instrument).with(query: ticker).and_return(
+          OpenStruct.new(instruments: [OpenStruct.new(ticker: ticker, figi: "#{ticker}_LOOKUP", class_code: 'TQBR')])
+        )
+      end
+      expect(market_data).to receive(:last_prices).with(figis: %w[SBER_MAIN GAZP_LOOKUP LKOH_LOOKUP]).and_return(
+        OpenStruct.new(last_prices: %w[SBER_MAIN GAZP_LOOKUP LKOH_LOOKUP].map { |figi| OpenStruct.new(figi: figi, price: q(100)) })
+      )
+
+      expect(monitor.fetch_all.map { |result| result[:query] }).to eq(%w[sber GAZP LKOH])
+    end
+
+    it 'retains last successful prices of configured instruments through a failed run' do
+      config = {
+        'static_instruments' => [{ 'label' => 'Gold', 'url' => '/commodities/gold' }],
+        'dynamic_instruments' => [{ 'query' => 'SBER' }]
+      }
+      previous = { 'prices' => { 'gold_api:XAU' => 4000.0, 'tinkoff:SBER' => 100.0, 'tinkoff:REMOVED' => 99.0 } }
+      File.write(described_class::STATE_PATH, JSON.generate(previous))
+      allow(File).to receive(:read).with(described_class::CONFIG_PATH).and_return(JSON.generate(config))
+      public_quotes = instance_double(TradingLogic::PublicMarketQuotes)
+      monitor = described_class.new(client, public_quotes: public_quotes)
+      config_ticker = OpenStruct.new(ticker: 'SBER', figi: 'FIGI_SBER', class_code: 'TQBR')
+      allow(instruments_svc).to receive(:find_instrument).with(query: 'SBER').and_return(OpenStruct.new(instruments: [config_ticker]))
+      allow(public_quotes).to receive(:fetch).with(:gold_api, 'XAU').and_raise(TradingLogic::PublicMarketQuotes::Unavailable)
+      allow(market_data).to receive(:last_prices).with(figis: ['FIGI_SBER']).and_raise(StandardError, 'broker unavailable')
+
+      expect(monitor.fetch_all).to contain_exactly(hash_including(unavailable: true, label: 'Gold'))
+      expect(saved_state.fetch('prices')).to eq('gold_api:XAU' => 4000.0, 'tinkoff:SBER' => 100.0)
+
+      allow(public_quotes).to receive(:fetch).with(:gold_api, 'XAU').and_return(price: 4020.0)
+      allow(market_data).to receive(:last_prices).with(figis: ['FIGI_SBER']).and_return(
+        OpenStruct.new(last_prices: [OpenStruct.new(figi: 'FIGI_SBER', price: q(104))])
+      )
+
+      expect(monitor.fetch_all.map { |result| result.values_at(:label, :delta) }).to eq([['Gold', 20.0], ['SBER', 4.0]])
+    end
+
+    it 'formats upward, downward and unchanged spot metal prices in the upper block' do
+      metals = [
+        ['Золото', 'gold', 'XAU', 4000.0, 4020.0],
+        ['Палладий', 'palladium', 'XPD', 1000.0, 990.0],
+        ['Платина', 'platinum', 'XPT', 1200.0, 1200.0]
+      ]
+      instruments = metals.map { |label, url, *| { 'label' => label, 'url' => "/commodities/#{url}" } }
+      allow(File).to receive(:read).with(described_class::CONFIG_PATH).and_return(JSON.generate('static_instruments' => instruments))
+      public_quotes = instance_double(TradingLogic::PublicMarketQuotes)
+      monitor = described_class.new(client, public_quotes: public_quotes)
+      first_time = Time.iso8601('2026-11-27T12:00:00+05:00')
+      metals.each do |_, _, symbol, first_price, next_price|
+        allow(public_quotes).to receive(:fetch).with(:gold_api, symbol).and_return(
+          { price: first_price, as_of: first_time },
+          { price: next_price, as_of: first_time + 3600 }
+        )
+      end
+
+      first = monitor.send(:format_monitor_message, 'Котировки', monitor.fetch_all)
+      second = monitor.send(:format_monitor_message, 'Котировки', monitor.fetch_all)
+
+      expect(first).to include('`Золото` 4000\.0 — · 27\.11 12:00')
+      expect(second).to include(
+        '`Золото` 4020\.0 ↗ \+20\.0 \(\+0\.5%\)',
+        '`Палладий` 990\.0 ↘ \-10\.0 \(\-1\.0%\)',
+        '`Платина` 1200\.0 — 0\.0 \(0\.0%\)'
+      )
+    end
+
+    it 'uses a previous futures price only from the same contract, including legacy state' do
+      config = { 'static_instruments' => [{ 'label' => 'Brent', 'url' => '/commodities/brent-oil' }] }
+      File.write(described_class::STATE_PATH, JSON.generate('prices' => { 'moex_future:BRZ6' => 95.0 }))
+      allow(File).to receive(:read).with(described_class::CONFIG_PATH).and_return(JSON.generate(config))
+      public_quotes = instance_double(TradingLogic::PublicMarketQuotes)
+      monitor = described_class.new(client, public_quotes: public_quotes)
+      allow(public_quotes).to receive(:fetch).with(:moex_future, 'BR').and_raise(TradingLogic::PublicMarketQuotes::Unavailable)
+
+      monitor.fetch_all
+      expect(saved_state.fetch('prices')).to eq('moex_future:BRZ6' => 95.0)
+
+      allow(public_quotes).to receive(:fetch).with(:moex_future, 'BR').and_return(
+        { price: 96.0, state_symbol: 'BRZ6' },
+        { price: 90.0, state_symbol: 'BRF7' }
+      )
+
+      expect(monitor.fetch_all.first[:delta]).to eq(1.0)
+      expect(saved_state.fetch('prices')).to eq('moex_future:BR' => 96.0)
+      expect(monitor.fetch_all.first[:delta]).to be_nil
+      expect(saved_state.fetch('future_contracts')).to eq('moex_future:BR' => 'BRF7')
+    end
+
     it 'skips static instruments without url and dynamic instruments not found via find_instrument' do
       config = {
         'telegram_header' => 'Test',
@@ -219,7 +375,6 @@ RSpec.describe TradingLogic::PriceMonitor do
       }
 
       allow(File).to receive(:read).with(TradingLogic::PriceMonitor::CONFIG_PATH).and_return(JSON.generate(config))
-      allow(File).to receive(:exist?).with(TradingLogic::PriceMonitor::STATE_PATH).and_return(false)
       allow(instruments_svc).to receive(:find_instrument)
         .with(query: 'NOPE')
         .and_return(OpenStruct.new(instruments: []))
